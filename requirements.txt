@@ -1,0 +1,6 @@
+polars==0.20.31
+pandas==2.2.2
+pandera==0.20.4
+gspread==6.1.2
+google-auth==2.30.0
+pyarrow
