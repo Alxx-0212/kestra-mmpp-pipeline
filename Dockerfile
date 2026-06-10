@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Python deps
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt kestra
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Bake the pipeline module into the image
 COPY pipeline_refactored.py ./pipeline.py

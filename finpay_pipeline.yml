@@ -5,8 +5,8 @@ namespace: finance.finpay
 inputs:
   - id: csv_file
     type: FILE
-    displayName: "CSV file to process"
-    description: "Upload the Alfred-finpay CSV directly. Kestra stores it in internal storage."
+    displayName: "CSV or XLSX file to process"
+    description: "Upload the Alfred-finpay CSV or XLSX directly. Kestra stores it in internal storage."
     required: true
 
   - id: cluster_id
@@ -16,7 +16,7 @@ inputs:
     values:
       - "421306"
       - "421307"
-      - "421311"
+      - "411311"
       - "421315"
       - "421318"
       - "421320"
@@ -67,7 +67,7 @@ tasks:
               "starting_balance_date":    "2026-05-31",
               "default_starting_balance": 0,
           },
-          "421311": {
+          "411311": {
               "target_spreadsheet":       "MONITORING FINPAY",
               "target_worksheet":         "PKY",
               "starting_balance_date":    "2026-05-31",
@@ -120,7 +120,7 @@ tasks:
       # date_override = os.environ.get("DATE_OVERRIDE", "").strip()
 
       PATTERN = re.compile(
-          r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.csv$"
+          r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx|xls)$"
       )
 
       filename = os.path.basename(file_path)
@@ -150,7 +150,7 @@ tasks:
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
     inputFiles:
-      source.csv: "{{ inputs.csv_file }}"
+      source_file: "{{ inputs.csv_file }}"
     outputFiles:
       - validated.parquet
     script: |
@@ -159,11 +159,11 @@ tasks:
       from pipeline import load_and_validate_schema
       from kestra import Kestra
 
-      file_path = "source.csv"  # Kestra places inputFiles in working dir
-      print(f"📂 Loading: {file_path}")
+      source_file = "source_file"
+      print(f"📂 Loading: {source_file}")
 
       try:
-          df = load_and_validate_schema(file_path)
+          df = load_and_validate_schema(source_file)
       except ValueError as e:
           print(f"❌ Schema validation failed:\n{e}", file=sys.stderr)
           sys.exit(1)
