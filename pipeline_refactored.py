@@ -312,9 +312,10 @@ def append_daily_to_gsheet(
     sh = gspread_client.open(target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
 
-    # # Duplicate guard
-    # if target_date_str in ws.col_values(1):
-    #     return None, None
+    # Duplicate guard — col A stores dates as DD/MM/YYYY, so compare using formatted_date
+    if formatted_date in ws.col_values(1):
+        print(f"⚠️  {formatted_date} already exists in sheet — skipping.")
+        return None, None
 
     # Build value map
     val_map = {

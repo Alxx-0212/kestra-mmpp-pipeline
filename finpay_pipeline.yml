@@ -2,57 +2,56 @@ id: finpay_daily_pipeline
 namespace: finance.finpay
 
 # ── MANUAL RUN WITH FILE UPLOAD ─────────────────────────────────────────────────
+# cluster_id is auto-extracted from the filename (finpay-<cluster_id>(...).csv)
 inputs:
   - id: csv_file
     type: FILE
     displayName: "CSV or XLSX file to process"
-    description: "Upload the Alfred-finpay CSV or XLSX directly. Kestra stores it in internal storage."
+    description: "Upload the Alfred-finpay CSV or XLSX directly. Filename must match: finpay-<cluster_id>(<DD-MM-YYYY>to<DD-MM-YYYY>).csv|xlsx"
     required: true
-
-  - id: cluster_id
-    type: SELECT
-    displayName: "Cluster"
-    description: "Which Finpay cluster to process"
-    values:
-      - "421306"
-      - "421307"
-      - "411311"
-      - "421315"
-      - "421318"
-      - "421320"
-    required: true
-
-  # - id: date_override
-  #   type: STRING
-  #   displayName: "Date override (DD-MM-YYYY)"
-  #   description: "Leave blank to auto-detect from the uploaded filename."
-  #   defaults: ""
-  #   required: true
 
   - id: dry_run
     type: BOOLEAN
     displayName: "Dry run?"
     description: "true → validate + summarize only. false → full production run."
     defaults: false
-    # required: true
-
-variables: {}
 
 tasks:
+  # ── PERFORMANCE NOTE ─────────────────────────────────────────────────────────
+  # parse_and_resolve (task 1) and load_and_validate (task 2) are fully independent
+  # — both only need inputs.csv_file. Wrap them in io.kestra.core.tasks.flows.Parallel
+  # once you verify output reference syntax matches your Kestra server version.
+  # ─────────────────────────────────────────────────────────────────────────────
 
-  # ── TASK 1 ─ Resolve config ──────────────────────────────────────────────────
-  - id: resolve_cluster_config
+  # ── TASK 1 ─ Parse filename + resolve cluster config ─────────────────────────
+  # cluster_id is extracted from the filename — no manual input needed.
+  - id: parse_and_resolve
     type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    beforeCommands:
-      - pip install kestra
+    containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT2M
     env:
-      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      CSV_PATH: "{{ inputs.csv_file }}"
     script: |
+      import re, os, sys
       from kestra import Kestra
-      import os, json
 
-      cluster_id = os.environ["CLUSTER_ID"]
+      file_path = os.environ["CSV_PATH"]
+
+      PATTERN = re.compile(
+          r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx|xls)$"
+      )
+
+      filename = os.path.basename(file_path)
+      m = PATTERN.match(filename)
+      if not m:
+          print(f"ERROR: Filename doesn't match expected pattern: {filename}", file=sys.stderr)
+          print("Expected: finpay-<cluster_id>(<DD-MM-YYYY>to<DD-MM-YYYY>).<csv|xlsx|xls>", file=sys.stderr)
+          sys.exit(1)
+
+      cluster_id = m.group(1)
+      raw        = m.group(2)
+      d, mo, y   = raw.split("-")
 
       CLUSTERS = {
           "421306": {
@@ -95,60 +94,31 @@ tasks:
 
       config = CLUSTERS.get(cluster_id)
       if not config:
-          raise ValueError(f"Unknown cluster_id: {cluster_id}")
-
-      Kestra.outputs({"cluster_id": cluster_id, **config})
-      print(f"✅ Config resolved for cluster {cluster_id}.")
-
-
-  # ── TASK 2 ─ Parse metadata from uploaded file ───────────────────────────────
-  - id: find_file
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    beforeCommands:
-      - pip install kestra
-    env:
-      CSV_PATH:      "{{ inputs.csv_file }}"
-      CLUSTER_ID:    "{{ inputs.cluster_id }}"
-      # DATE_OVERRIDE: "{{ inputs.date_override }}"
-    script: |
-      import re, os, sys
-      from kestra import Kestra
-
-      file_path     = os.environ["CSV_PATH"]
-      cluster_id    = os.environ["CLUSTER_ID"]
-      # date_override = os.environ.get("DATE_OVERRIDE", "").strip()
-
-      PATTERN = re.compile(
-          r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx|xls)$"
-      )
-
-      filename = os.path.basename(file_path)
-      m = PATTERN.match(filename)
-      if not m:
-          print(f"ERROR: Filename doesn't match pattern: {filename}", file=sys.stderr)
+          print(f"ERROR: cluster_id '{cluster_id}' extracted from filename is not configured.", file=sys.stderr)
           sys.exit(1)
 
-      raw = m.group(2)
-      d, mo, y = raw.split("-")
-      meta = {
-          "cluster_id": m.group(1),
+      outputs = {
+          "cluster_id": cluster_id,
           "raw_date":   raw,
           "iso_date":   f"{y}-{mo}-{d}",
           "file_path":  file_path,
           "filename":   filename,
+          **config,
       }
 
-      print(f"📄 File    : {meta['filename']}")
-      print(f"🗂  Cluster : {meta['cluster_id']}")
-      print(f"📅 Date    : {meta['raw_date']}  (iso: {meta['iso_date']})")
-      Kestra.outputs(meta)
+      print(f"📄 File       : {filename}")
+      print(f"🗂  Cluster    : {cluster_id}")
+      print(f"📅 Date       : {raw}  (iso: {y}-{mo}-{d})")
+      print(f"📊 Worksheet  : {config['target_worksheet']}")
+      Kestra.outputs(outputs)
 
 
-  # ── TASK 4 ─ Load & validate schema ──────────────────────────────────────────
+  # ── TASK 2 ─ Load & validate schema ──────────────────────────────────────────
   - id: load_and_validate
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT5M
     inputFiles:
       source_file: "{{ inputs.csv_file }}"
     outputFiles:
@@ -174,10 +144,12 @@ tasks:
       Kestra.outputs({"rows": len(df), "columns": list(df.columns)})
 
 
-  # ── TASK 5 ─ Validate debit/credit integrity ──────────────────────────────────
+  # ── TASK 3 ─ Validate debit/credit integrity ──────────────────────────────────
   - id: validate_integrity
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT3M
     inputFiles:
       validated.parquet: "{{ outputs.load_and_validate.outputFiles['validated.parquet'] }}"
     outputFiles:
@@ -205,17 +177,19 @@ tasks:
       Kestra.outputs({"rows": len(df), "amount_min": amount_min, "amount_max": amount_max})
 
 
-  # ── TASK 6 ─ Summarize by transaction ────────────────────────────────────────
+  # ── TASK 4 ─ Summarize by transaction ────────────────────────────────────────
   - id: summarize
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT3M
     inputFiles:
       with_amount.parquet: "{{ outputs.validate_integrity.outputFiles['with_amount.parquet'] }}"
     outputFiles:
       - summary.parquet
     env:
-      CLUSTER_ID: "{{ outputs.find_file.vars.cluster_id }}"
-      ISO_DATE:   "{{ outputs.find_file.vars.iso_date }}"
+      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+      ISO_DATE:   "{{ outputs.parse_and_resolve.vars.iso_date }}"
       DRY_RUN:    "{{ inputs.dry_run }}"
     script: |
       import os, sys, pandas as pd
@@ -238,7 +212,7 @@ tasks:
       print(summary_df.to_string(index=False))
       print(f"{'='*60}\n")
 
-      total_credit = float(summary_df["Sum_of_Credit"].sum())
+      total_credit = float(summary_df["Sum_of_Kredit"].sum())
       total_debet  = float(summary_df["Sum_of_Debet"].sum())
 
       summary_df.to_parquet("summary.parquet", index=False)
@@ -250,18 +224,25 @@ tasks:
       })
 
 
-  # ── TASK 7 ─ Upload to Google Sheets ─────────────────────────────────────────
+  # ── TASK 5 ─ Upload to Google Sheets ─────────────────────────────────────────
   - id: upload_to_sheets
     type: io.kestra.plugin.scripts.python.Script
     runIf: "{{ inputs.dry_run == false }}"
     containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT10M
+    retry:
+      type: exponential
+      interval: PT15S
+      maxInterval: PT60S
+      maxAttempts: 3
     inputFiles:
       summary.parquet: "{{ outputs.summarize.outputFiles['summary.parquet'] }}"
     env:
-      TARGET_SPREADSHEET:       "{{ outputs.resolve_cluster_config.vars.target_spreadsheet }}"
-      TARGET_WORKSHEET:         "{{ outputs.resolve_cluster_config.vars.target_worksheet }}"
-      STARTING_BALANCE_DATE:    "{{ outputs.resolve_cluster_config.vars.starting_balance_date }}"
-      DEFAULT_STARTING_BALANCE: "{{ outputs.resolve_cluster_config.vars.default_starting_balance }}"
+      TARGET_SPREADSHEET:       "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
+      TARGET_WORKSHEET:         "{{ outputs.parse_and_resolve.vars.target_worksheet }}"
+      STARTING_BALANCE_DATE:    "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
+      DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
       SECRET_GCP_SA_KEY:        "{{ secret('GCP_SA_KEY') }}"
     script: |
       import os, sys, json, tempfile, pandas as pd
@@ -274,11 +255,12 @@ tasks:
           print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
           sys.exit(1)
 
-      with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-          f.write(sa_key_json)
-          sa_key_path = f.name
-
+      sa_key_path = None
       try:
+          with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+              f.write(sa_key_json)
+              sa_key_path = f.name
+
           summary_df = pd.read_parquet("summary.parquet")
           client     = make_gspread_client(sa_key_path)
 
@@ -298,13 +280,29 @@ tasks:
               print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
               Kestra.outputs({"status": "success", "insert_row": insert_row, "footer_end": footer_end})
       finally:
-          os.unlink(sa_key_path)
+          if sa_key_path and os.path.exists(sa_key_path):
+              os.unlink(sa_key_path)
 
 errors:
+  # ── TODO: replace with a real notification plugin once your channel is ready ──
+  # e.g. io.kestra.plugin.notifications.slack.SlackIncomingWebhook
+  #      io.kestra.plugin.notifications.mail.SendMail
+  #      io.kestra.plugin.notifications.teams.TeamsIncomingWebhook
+  # ────────────────────────────────────────────────────────────────────────────
   - id: notify_on_failure
     type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    beforeCommands:
-      - pip install kestra
+    containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    env:
+      EXECUTION_ID: "{{ execution.id }}"
+      FLOW_ID:      "{{ flow.id }}"
+      NAMESPACE:    "{{ flow.namespace }}"
     script: |
-      print("❌ Pipeline failed — check task logs for details.")
+      import os
+      execution_id = os.environ.get("EXECUTION_ID", "unknown")
+      flow_id      = os.environ.get("FLOW_ID",      "unknown")
+      namespace    = os.environ.get("NAMESPACE",    "unknown")
+      print("❌ Pipeline failed!")
+      print(f"   Flow      : {namespace}.{flow_id}")
+      print(f"   Execution : {execution_id}")
+      print(f"   Logs      : /ui/executions/{execution_id}")
