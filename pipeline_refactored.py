@@ -337,7 +337,7 @@ def append_daily_to_gsheet(
         ("PPOB",                       "FeeTransaksi"),
         ("NGRS",                       "RECHARGE"),
         ("BIAYA FEE NGRS",             "RECHARGEFEE"),
-        ("RESERVAL",                   "Reversal"),
+        ("REVERSAL",                   "Reversal"),
         ("ST",                         "SELLTHRU"),
         ("BIAYA FEE ST",               "SELLTHRUFEE"),
         ("BIAYA FEE BAR A. ST",        "SELLTHRUSALESFEE"),
