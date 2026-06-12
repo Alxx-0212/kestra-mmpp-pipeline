@@ -357,25 +357,32 @@ def append_daily_to_gsheet(
             rows_to_append.append(["", label, kredit, debet, f"=E{r - 1}+C{r}-D{r}"])
         r += 1
 
-    def _net(*keys):
-        return sum(
-            float(val_map.get(k, {}).get("kredit", 0)) -
-            float(val_map.get(k, {}).get("debet",  0))
-            for k in keys
-        )
-
-    footer_values = [
-        _net("RECHARGE", "RECHARGEFEE", "Reversal"),
-        _net("FeeTransaksi"),
-        _net("SELLTHRU", "SELLTHRUFEE", "SELLTHRUSALESFEE"),
-        _net("DISBURSEMENT"),
-        _net("QRISDUWIT")
+    # Row offsets from insert_row (matches KETERANGAN order):
+    #  +1 QRISDUWIT  +2 DISBURSEMENT  +3 FeeTransaksi
+    #  +4 RECHARGE   +5 RECHARGEFEE   +6 Reversal
+    #  +7 SELLTHRU   +8 SELLTHRUFEE   +9 SELLTHRUSALESFEE
+    ir = insert_row
+    n  = len(KETERANGAN)   # = 10  -> footer rows start at ir + n
+    footer_formulas = [
+        # NGRS  = net(RECHARGE + RECHARGEFEE + Reversal)
+        f"=C{ir+4}-D{ir+4}+C{ir+5}-D{ir+5}+C{ir+6}-D{ir+6}",
+        # PPOB  = net(FeeTransaksi)
+        f"=C{ir+3}-D{ir+3}",
+        # ST    = net(SELLTHRU + SELLTHRUFEE + SELLTHRUSALESFEE)
+        f"=C{ir+7}-D{ir+7}+C{ir+8}-D{ir+8}+C{ir+9}-D{ir+9}",
+        # DISBURSEMENT
+        f"=C{ir+2}-D{ir+2}",
+        # QRISDUWIT
+        f"=C{ir+1}-D{ir+1}",
     ]
-    footer_values.append(sum(footer_values))
+    # Total = sum of the five footer C-cells above
+    footer_formulas.append(
+        "=" + "+".join(f"C{ir + n + j}" for j in range(len(footer_formulas)))
+    )
 
-    FOOTER_LABELS = ["NGRS", "PPOB", "ST","DISBURSEMENT", "QRISDUWIT", "Total"]
+    FOOTER_LABELS = ["NGRS", "PPOB", "ST", "DISBURSEMENT", "QRISDUWIT", "Total"]
     for i, f_label in enumerate(FOOTER_LABELS):
-        rows_to_append.append([formatted_date if i == 0 else "", f_label, footer_values[i], "", ""])
+        rows_to_append.append([formatted_date if i == 0 else "", f_label, footer_formulas[i], "", ""])
         r += 1
 
     ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
