@@ -369,10 +369,11 @@ def append_daily_to_gsheet(
         _net("FeeTransaksi"),
         _net("SELLTHRU", "SELLTHRUFEE", "SELLTHRUSALESFEE"),
         _net("DISBURSEMENT"),
+        _net("QRISDUWIT")
     ]
     footer_values.append(sum(footer_values))
 
-    FOOTER_LABELS = ["NGRS", "PPOB", "ST","DISBURSEMENT", "Total"]
+    FOOTER_LABELS = ["NGRS", "PPOB", "ST","DISBURSEMENT", "QRISDUWIT", "Total"]
     for i, f_label in enumerate(FOOTER_LABELS):
         rows_to_append.append([formatted_date if i == 0 else "", f_label, footer_values[i], "", ""])
         r += 1
