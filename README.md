@@ -140,16 +140,16 @@ Each daily run appends two sections to the worksheet:
 
 **Data rows** — one row per transaction type with kredit/debet values and a running balance formula in column E.
 
-**Footer rows** — aggregated net values by category, calculated via Excel formulas referencing the data rows above:
+**Footer rows** — aggregated net values by category. Each footer cell contains a live spreadsheet formula that references the fixed-offset data rows above (e.g. `=C4-D4+C5-D5+C6-D6`), so no Python calculation is involved:
 
-| Label | Calculation |
-|-------|-------------|
-| NGRS | net(RECHARGE + RECHARGEFEE + Reversal) |
-| PPOB | net(FeeTransaksi) |
-| ST | net(SELLTHRU + SELLTHRUFEE + SELLTHRUSALESFEE) |
-| DISBURSEMENT | net(DISBURSEMENT) |
-| QRISDUWIT | net(QRISDUWIT) |
-| Total | Sum of all footer lines |
+| Label | Excel Formula (C = Kredit, D = Debet) |
+|-------|--------------------------------------|
+| NGRS | `=C{+4}-D{+4}+C{+5}-D{+5}+C{+6}-D{+6}` → RECHARGE + RECHARGEFEE + Reversal |
+| PPOB | `=C{+3}-D{+3}` → FeeTransaksi |
+| ST | `=C{+7}-D{+7}+C{+8}-D{+8}+C{+9}-D{+9}` → SELLTHRU + SELLTHRUFEE + SELLTHRUSALESFEE |
+| DISBURSEMENT | `=C{+2}-D{+2}` → DISBURSEMENT |
+| QRISDUWIT | `=C{+1}-D{+1}` → QRISDUWIT |
+| Total | `=C{+10}+C{+11}+C{+12}+C{+13}+C{+14}` → sum of all footer lines |
 
 A duplicate-date guard prevents the same date from being written twice.
 
@@ -175,5 +175,5 @@ A duplicate-date guard prevents the same date from being written twice.
 - **Pure function module** — `pipeline_refactored.py` contains only data logic. All orchestration lives in the Kestra YAML flow.
 - **Auto header detection** — the loader scans the first 10 rows to find the real header regardless of leading metadata rows in the export.
 - **Parquet inter-task handoff** — tasks exchange data via `.parquet` files rather than environment variables to handle large row counts efficiently.
-- **Excel formulas for footer** — footer totals use spreadsheet formulas (not Python-computed values) so they stay correct if the sheet is manually edited.
+- **Excel formulas for footer** — footer totals are written as live cell formulas (e.g. `=C4-D4+C5-D5`) rather than Python-computed values. The `_net()` helper was removed entirely; the formulas reference rows at fixed offsets from `insert_row`, so they remain correct even if the sheet is manually edited.
 - **Dry run flag** — task 5 is skipped entirely when `dry_run=true`, making validation safe to run in production.
