@@ -218,14 +218,45 @@ tasks:
       Kestra.outputs({"rows": len(df), "amount_min": amount_min, "amount_max": amount_max})
 
 
-  # ── TASK 5 ─ Flag unusual transaction groups from pre-relabel data ──────────
-  - id: flag_unusual_transactions
+  # ── TASK 5 ─ Drop duplicate rows using minute-level datetime ────────────────
+  - id: deduplicate_transactions
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
     pythonVersion: "3.11"
     timeout: PT3M
     inputFiles:
       with_amount.parquet: "{{ outputs.validate_integrity.outputFiles['with_amount.parquet'] }}"
+    outputFiles:
+      - deduplicated.parquet
+    script: |
+      import sys, pandas as pd
+      sys.path.insert(0, "/app")
+      from pipeline import drop_duplicate_rows_by_minute
+      from kestra import Kestra
+
+      df = pd.read_parquet("with_amount.parquet")
+      before_rows = len(df)
+      df = drop_duplicate_rows_by_minute(df)
+      after_rows = len(df)
+
+      df.to_parquet("deduplicated.parquet", index=False)
+
+      print(f"✅ Deduplication complete. Rows: {before_rows} → {after_rows}")
+      Kestra.outputs({
+          "before_rows": before_rows,
+          "after_rows": after_rows,
+          "dropped_rows": before_rows - after_rows,
+      })
+
+
+  # ── TASK 6 ─ Flag unusual transaction groups from pre-relabel data ──────────
+  - id: flag_unusual_transactions
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT3M
+    inputFiles:
+      deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
     outputFiles:
       - unusual.parquet
     env:
@@ -242,7 +273,7 @@ tasks:
       iso_date   = os.environ["ISO_DATE"]
       dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-      df = pd.read_parquet("with_amount.parquet")
+      df = pd.read_parquet("deduplicated.parquet")
       unusual_df = flag_unusual_transactions(df)
       unusual_df.to_parquet("unusual.parquet", index=False)
 
@@ -272,7 +303,7 @@ tasks:
       })
 
 
-  # ── TASK 6 ─ Split unusual upload from summary path ─────────────────────────
+  # ── TASK 7 ─ Split unusual upload from summary path ─────────────────────────
   - id: branch_after_unusual_flag
     type: io.kestra.plugin.core.flow.Parallel
     tasks:
@@ -343,7 +374,7 @@ tasks:
             pythonVersion: "3.11"
             timeout: PT3M
             inputFiles:
-              with_amount.parquet: "{{ outputs.validate_integrity.outputFiles['with_amount.parquet'] }}"
+              deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
             outputFiles:
               - relabeled.parquet
             script: |
@@ -352,7 +383,7 @@ tasks:
               from pipeline import relabel_out_cluster_transactions
               from kestra import Kestra
 
-              df = pd.read_parquet("with_amount.parquet")
+              df = pd.read_parquet("deduplicated.parquet")
               before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
 
               df = relabel_out_cluster_transactions(df)

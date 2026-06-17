@@ -35,12 +35,17 @@ Upload CSV/XLS/XLSX
       - add Amount
       |
       v
-[5] flag_unusual_transactions
+[5] deduplicate_transactions
+      - drop duplicate rows using all columns
+      - compare Transaction Date at date + hour + minute precision only
+      |
+      v
+[6] flag_unusual_transactions
       - run on pre-relabel data
       - write unusual.parquet
       |
       v
-[6] branch_after_unusual_flag
+[7] branch_after_unusual_flag
       +-- upload_unusual_to_sheets
       |     - writes to one unusual worksheet per cluster
       |
@@ -199,13 +204,14 @@ The initial balance date for a new monthly summary worksheet is computed as the 
 | 2 | `determine_current_date` | Computes the `Asia/Makassar` run date and monthly summary worksheet name. |
 | 3 | `load_and_validate` | Loads CSV/XLS/XLSX, auto-detects the header row, coerces dtypes, and validates `FINPAY_SCHEMA`. |
 | 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero; adds `Amount`. |
-| 5 | `flag_unusual_transactions` | Runs fee-rule validation on pre-relabel data and writes `unusual.parquet`. |
-| 6 | `branch_after_unusual_flag` | Runs unusual upload and summary upload path in parallel. |
-| 6a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
-| 6b | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
-| 6b.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups. |
-| 6b.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
-| 6b.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
+| 5 | `deduplicate_transactions` | Drops duplicate rows using all columns, with `Transaction Date` compared at minute precision. |
+| 6 | `flag_unusual_transactions` | Runs fee-rule validation on deduplicated, pre-relabel data and writes `unusual.parquet`. |
+| 7 | `branch_after_unusual_flag` | Runs unusual upload and summary upload path in parallel. |
+| 7a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
+| 7b | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
+| 7b.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups after deduplication. |
+| 7b.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
+| 7b.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
 
 On failure, `notify_on_failure` currently logs the flow ID, execution ID, and UI log path.
 
@@ -302,7 +308,28 @@ Example:
 PKY - Unusual
 ```
 
-The worksheet is created if missing. Headers are written on first use. If there are no unusual rows, no rows are appended. Duplicate-date guard checks whether the report date already exists in the unusual sheet.
+The worksheet is created if missing. Headers are written on first use. If the sheet already exists with an older layout, the next write adds a separator row and a new formatted header before appending the readable rows. If there are no unusual rows, no rows are appended. Duplicate-date guard checks whether the report date already exists in the unusual sheet.
+
+Current unusual report columns:
+
+| Column | Description |
+|---|---|
+| REPORT DATE | Date of the FinPay report being checked. |
+| NO | Source row number. |
+| TRANSACTION DATE | Source transaction timestamp. |
+| TRANSACTION ID | Original transaction ID. |
+| BASE ID | Grouping key used for fee validation. |
+| TRANSACTION | Transaction label. |
+| KREDIT | Source kredit amount. |
+| DEBET | Source debet amount. |
+| AMOUNT | Computed `Kredit - Debet`. |
+| SALDO AWAL | Source starting balance. |
+| SALDO AKHIR | Source ending balance. |
+| NOMOR RS | Source RS number. |
+| REMARKS | Source remarks text. |
+| UNUSUAL REASON | Fee-rule validation reason. |
+
+Formatting includes fixed column widths, bold colored headers, date and number formats, wrapped remarks/reason columns, and a top border on each appended daily block.
 
 ---
 
@@ -325,6 +352,7 @@ python - <<'PY'
 from pipeline_refactored import (
     load_and_validate_schema,
     validate_and_add_amount,
+    drop_duplicate_rows_by_minute,
     flag_unusual_transactions,
     relabel_out_cluster_transactions,
     summarize_by_transaction,
@@ -333,11 +361,13 @@ from pipeline_refactored import (
 path = "data/finpay-411311(04-06-2026to04-06-2026).csv"
 df = load_and_validate_schema(path)
 with_amount = validate_and_add_amount(df)
-unusual = flag_unusual_transactions(with_amount)
-relabeled = relabel_out_cluster_transactions(with_amount)
+deduplicated = drop_duplicate_rows_by_minute(with_amount)
+unusual = flag_unusual_transactions(deduplicated)
+relabeled = relabel_out_cluster_transactions(deduplicated)
 summary = summarize_by_transaction(relabeled)
 print({
     "rows": len(with_amount),
+    "deduplicated_rows": len(deduplicated),
     "unusual_rows": len(unusual),
     "summary_rows": len(summary),
 })
@@ -366,6 +396,7 @@ PY
 - Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `pipeline_refactored.py`.
 - The summary monthly worksheet is based on the pipeline run month, not the uploaded file date.
 - The starting balance date is the last day of the previous month, computed at runtime.
+- Deduplication compares all columns, but normalizes `Transaction Date` to minute precision for duplicate detection.
 - Unusual detection runs before summary relabeling so fee checks see the original transaction labels.
 - Unusual upload and summary upload run in parallel after unusual detection.
 - Parquet files are used between Kestra tasks to avoid passing large datasets through variables.
