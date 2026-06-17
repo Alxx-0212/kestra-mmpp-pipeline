@@ -363,6 +363,34 @@ tasks:
               if sa_key_path and os.path.exists(sa_key_path):
                   os.unlink(sa_key_path)
 
+      # ── TASK 9 ─ Alert Telegram only when unusual rows exist ────────────────
+      - id: notify_unusual_telegram
+        type: io.kestra.plugin.core.http.Request
+        runIf: "{{ inputs.dry_run == false and outputs.flag_unusual_transactions.vars.unusual_rows > 0 }}"
+        uri: "https://api.telegram.org/bot{{ secret('TELEGRAM_BOT_TOKEN') }}/sendMessage"
+        method: POST
+        contentType: multipart/form-data
+        retry:
+          type: exponential
+          interval: PT15S
+          maxInterval: PT60S
+          maxAttempts: 3
+        formData:
+          chat_id: "{{ secret('TELEGRAM_CHAT_ID') }}"
+          text: |
+            🚨 FinPay unusual transactions detected
+
+            Flow: {{ flow.namespace }}.{{ flow.id }}
+            Execution: {{ execution.id }}
+            Cluster: {{ outputs.parse_and_resolve.vars.cluster_id }}
+            File date: {{ outputs.parse_and_resolve.vars.iso_date }}
+            Unusual rows: {{ outputs.flag_unusual_transactions.vars.unusual_rows }}
+            Unusual groups: {{ outputs.flag_unusual_transactions.vars.unusual_groups }}
+            Worksheet: {{ outputs.parse_and_resolve.vars.unusual_worksheet }}
+            Reasons: {{ outputs.flag_unusual_transactions.vars.reasons }}
+
+            Check the unusual worksheet for further analysis.
+
       # ── TASKS 6-7 ─ Relabel, summarize, then upload summary ─────────────────
       - id: summary_upload_branch
         type: io.kestra.plugin.core.flow.Sequential

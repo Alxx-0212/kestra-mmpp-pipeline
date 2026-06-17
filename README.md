@@ -83,6 +83,7 @@ kestra-mmpp-pipeline/
 - The service account shared as Editor on the target spreadsheet
 - The local Docker image `finpay-pipeline:3.11`
 - A Kestra secret named `GCP_SA_KEY` containing the full service-account JSON
+- Optional Telegram alerting secrets: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
 
 ---
 
@@ -124,6 +125,19 @@ GCP_SA_KEY
 ```
 
 The value must be the full JSON body of the GCP service account key. Keep local env/secret files out of git; `.env_encoded` is already ignored.
+
+### 3b. Configure Telegram unusual-row alerts
+
+Telegram alerts are sent only when `dry_run=false` and `flag_unusual_transactions` finds at least one unusual row.
+
+Create these Kestra secrets:
+
+```text
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+```
+
+The alert uses Telegram Bot API `sendMessage` through Kestra's `io.kestra.plugin.core.http.Request` task. The bot must be allowed to send messages to the target chat, group, or channel.
 
 ### 4. Deploy the flow
 
@@ -208,10 +222,11 @@ The initial balance date for a new monthly summary worksheet is computed as the 
 | 6 | `flag_unusual_transactions` | Runs fee-rule validation on deduplicated, pre-relabel data and writes `unusual.parquet`. |
 | 7 | `branch_after_unusual_flag` | Runs unusual upload and summary upload path in parallel. |
 | 7a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
-| 7b | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
-| 7b.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups after deduplication. |
-| 7b.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
-| 7b.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
+| 7b | `notify_unusual_telegram` | Sends a Telegram alert only when unusual rows exist and the run is not a dry run. |
+| 7c | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
+| 7c.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups after deduplication. |
+| 7c.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
+| 7c.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
 
 On failure, `notify_on_failure` currently logs the flow ID, execution ID, and UI log path.
 
@@ -308,7 +323,7 @@ Example:
 PKY - Unusual
 ```
 
-The worksheet is created if missing. Headers are written on first use. If the sheet already exists with an older layout, the next write adds a separator row and a new formatted header before appending the readable rows. If there are no unusual rows, no rows are appended. Duplicate-date guard checks whether the report date already exists in the unusual sheet.
+The worksheet is created if missing. Blank sheets get formatted headers in row 1 and data from row 2. Sheets that already have the expected header append data only. If there are no unusual rows, no rows are appended. Duplicate-date guard checks whether the report date already exists in the unusual sheet.
 
 Current unusual report columns:
 
@@ -398,7 +413,7 @@ PY
 - The starting balance date is the last day of the previous month, computed at runtime.
 - Deduplication compares all columns, but normalizes `Transaction Date` to minute precision for duplicate detection.
 - Unusual detection runs before summary relabeling so fee checks see the original transaction labels.
-- Unusual upload and summary upload run in parallel after unusual detection.
+- Unusual upload, Telegram unusual-row alerting, and summary upload run in parallel after unusual detection.
 - Parquet files are used between Kestra tasks to avoid passing large datasets through variables.
 - Google Sheets footer totals are live formulas, not Python-computed totals.
 - Dry runs execute all compute steps and skip only Google Sheets writes.
