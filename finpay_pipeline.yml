@@ -13,13 +13,13 @@ inputs:
   - id: dry_run
     type: BOOLEAN
     displayName: "Dry run?"
-    description: "true → validate + summarize only. false → full production run."
+    description: "true → validate + relabel + summarize + flag only. false → full production run."
     defaults: false
 
 tasks:
   # ── PERFORMANCE NOTE ─────────────────────────────────────────────────────────
   # parse_and_resolve (task 1) and load_and_validate (task 2) are fully independent
-  # — both only need inputs.csv_file. Wrap them in io.kestra.core.tasks.flows.Parallel
+  # — both only need inputs.csv_file. Wrap them in io.kestra.plugin.core.flow.Parallel
   # once you verify output reference syntax matches your Kestra server version.
   # ─────────────────────────────────────────────────────────────────────────────
 
@@ -32,11 +32,15 @@ tasks:
     timeout: PT2M
     env:
       CSV_PATH: "{{ inputs.csv_file }}"
+      RUN_TIMEZONE: "Asia/Makassar"
     script: |
       import re, os, sys
+      from datetime import datetime, timedelta
+      from zoneinfo import ZoneInfo
       from kestra import Kestra
 
       file_path = os.environ["CSV_PATH"]
+      timezone  = os.environ["RUN_TIMEZONE"]
 
       PATTERN = re.compile(
           r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx|xls)$"
@@ -52,42 +56,39 @@ tasks:
       cluster_id = m.group(1)
       raw        = m.group(2)
       d, mo, y   = raw.split("-")
+      now        = datetime.now(ZoneInfo(timezone))
+      first_day_this_month = now.replace(day=1)
+      starting_balance_date = (first_day_this_month - timedelta(days=1)).date().isoformat()
 
       CLUSTERS = {
           "421306": {
               "target_spreadsheet":       "MONITORING FINPAY",
               "target_worksheet":         "MRT",
-              "starting_balance_date":    "2026-05-31",
               "default_starting_balance": 119585556,
           },
           "421307": {
               "target_spreadsheet":       "MONITORING FINPAY",
               "target_worksheet":         "TDR",
-              "starting_balance_date":    "2026-05-31",
               "default_starting_balance": 0,
           },
           "411311": {
               "target_spreadsheet":       "MONITORING FINPAY",
               "target_worksheet":         "PKY",
-              "starting_balance_date":    "2026-05-31",
               "default_starting_balance": 0,
           },
           "421315": {
               "target_spreadsheet":       "MONITORING FINPAY",
               "target_worksheet":         "BGI",
-              "starting_balance_date":    "2026-05-31",
               "default_starting_balance": 0,
           },
           "421318": {
               "target_spreadsheet":       "MONITORING FINPAY",
               "target_worksheet":         "MRW",
-              "starting_balance_date":    "2026-05-31",
               "default_starting_balance": 0,
           },
           "421320": {
               "target_spreadsheet":       "MONITORING FINPAY",
               "target_worksheet":         "TNT",
-              "starting_balance_date":    "2026-05-31",
               "default_starting_balance": 0,
           },
       }
@@ -103,6 +104,8 @@ tasks:
           "iso_date":   f"{y}-{mo}-{d}",
           "file_path":  file_path,
           "filename":   filename,
+          "unusual_worksheet": f"{config['target_worksheet']} - Unusual",
+          "starting_balance_date": starting_balance_date,
           **config,
       }
 
@@ -110,10 +113,48 @@ tasks:
       print(f"🗂  Cluster    : {cluster_id}")
       print(f"📅 Date       : {raw}  (iso: {y}-{mo}-{d})")
       print(f"📊 Worksheet  : {config['target_worksheet']}")
+      print(f"🚩 Unusual    : {outputs['unusual_worksheet']}")
+      print(f"💰 Balance dt : {starting_balance_date}")
       Kestra.outputs(outputs)
 
 
-  # ── TASK 2 ─ Load & validate schema ──────────────────────────────────────────
+  # ── TASK 2 ─ Determine run date + monthly summary worksheet ─────────────────
+  - id: determine_current_date
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT1M
+    env:
+      BASE_WORKSHEET: "{{ outputs.parse_and_resolve.vars.target_worksheet }}"
+      RUN_TIMEZONE:   "Asia/Makassar"
+    script: |
+      import os
+      from datetime import datetime
+      from zoneinfo import ZoneInfo
+      from kestra import Kestra
+
+      timezone = os.environ["RUN_TIMEZONE"]
+      base_worksheet = os.environ["BASE_WORKSHEET"]
+      now = datetime.now(ZoneInfo(timezone))
+      month_key = now.strftime("%Y-%m")
+      summary_worksheet = f"{base_worksheet} {month_key}"
+
+      outputs = {
+          "run_date": now.date().isoformat(),
+          "run_timestamp": now.isoformat(),
+          "run_year": now.strftime("%Y"),
+          "run_month": now.strftime("%m"),
+          "run_month_key": month_key,
+          "timezone": timezone,
+          "summary_worksheet": summary_worksheet,
+      }
+
+      print(f"🕒 Run date          : {outputs['run_date']} ({timezone})")
+      print(f"📊 Summary worksheet : {summary_worksheet}")
+      Kestra.outputs(outputs)
+
+
+  # ── TASK 3 ─ Load & validate schema ──────────────────────────────────────────
   - id: load_and_validate
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
@@ -144,7 +185,7 @@ tasks:
       Kestra.outputs({"rows": len(df), "columns": list(df.columns)})
 
 
-  # ── TASK 3 ─ Validate debit/credit integrity ──────────────────────────────────
+  # ── TASK 4 ─ Validate debit/credit integrity ─────────────────────────────────
   - id: validate_integrity
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
@@ -177,8 +218,8 @@ tasks:
       Kestra.outputs({"rows": len(df), "amount_min": amount_min, "amount_max": amount_max})
 
 
-  # ── TASK 4 ─ Summarize by transaction ────────────────────────────────────────
-  - id: summarize
+  # ── TASK 5 ─ Flag unusual transaction groups from pre-relabel data ──────────
+  - id: flag_unusual_transactions
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
     pythonVersion: "3.11"
@@ -186,7 +227,7 @@ tasks:
     inputFiles:
       with_amount.parquet: "{{ outputs.validate_integrity.outputFiles['with_amount.parquet'] }}"
     outputFiles:
-      - summary.parquet
+      - unusual.parquet
     env:
       CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
       ISO_DATE:   "{{ outputs.parse_and_resolve.vars.iso_date }}"
@@ -194,94 +235,254 @@ tasks:
     script: |
       import os, sys, pandas as pd
       sys.path.insert(0, "/app")
-      from pipeline import summarize_by_transaction
+      from pipeline import flag_unusual_transactions
       from kestra import Kestra
 
       cluster_id = os.environ["CLUSTER_ID"]
       iso_date   = os.environ["ISO_DATE"]
       dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-      df         = pd.read_parquet("with_amount.parquet")
-      summary_df = summarize_by_transaction(df)
+      df = pd.read_parquet("with_amount.parquet")
+      unusual_df = flag_unusual_transactions(df)
+      unusual_df.to_parquet("unusual.parquet", index=False)
+
+      unusual_groups = int(unusual_df["base_id"].nunique()) if not unusual_df.empty else 0
+      reasons = sorted(unusual_df["unusual_reason"].dropna().unique().tolist()) if not unusual_df.empty else []
 
       print(f"\n{'='*60}")
-      print(f"SUMMARY — Cluster {cluster_id} — {iso_date}")
+      print(f"UNUSUAL TRANSACTIONS — Cluster {cluster_id} — {iso_date}")
       if dry_run:
-          print("⚠️  DRY RUN — not written to sheet")
+          print("⚠️  DRY RUN — unusual rows not written to sheet")
       print(f"{'='*60}")
-      print(summary_df.to_string(index=False))
+      if unusual_df.empty:
+          print("No unusual transactions found.")
+      else:
+          display_cols = [
+              "No", "Transaction Date", "Transaction ID", "Transaction",
+              "Kredit", "Debet", "base_id", "unusual_reason",
+          ]
+          print(unusual_df[[c for c in display_cols if c in unusual_df.columns]].to_string(index=False))
       print(f"{'='*60}\n")
 
-      total_credit = float(summary_df["Sum_of_Kredit"].sum())
-      total_debet  = float(summary_df["Sum_of_Debet"].sum())
-
-      summary_df.to_parquet("summary.parquet", index=False)
       Kestra.outputs({
-          "transaction_count": len(summary_df),
-          "transactions":      summary_df["Transaction"].tolist(),
-          "total_credit":      total_credit,
-          "total_debet":       total_debet,
+          "unusual_rows": len(unusual_df),
+          "unusual_groups": unusual_groups,
+          "has_unusual": not unusual_df.empty,
+          "reasons": reasons,
       })
 
 
-  # ── TASK 5 ─ Upload to Google Sheets ─────────────────────────────────────────
-  - id: upload_to_sheets
-    type: io.kestra.plugin.scripts.python.Script
-    runIf: "{{ inputs.dry_run == false }}"
-    containerImage: finpay-pipeline:3.11
-    pythonVersion: "3.11"
-    timeout: PT10M
-    retry:
-      type: exponential
-      interval: PT15S
-      maxInterval: PT60S
-      maxAttempts: 3
-    inputFiles:
-      summary.parquet: "{{ outputs.summarize.outputFiles['summary.parquet'] }}"
-    env:
-      TARGET_SPREADSHEET:       "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
-      TARGET_WORKSHEET:         "{{ outputs.parse_and_resolve.vars.target_worksheet }}"
-      STARTING_BALANCE_DATE:    "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
-      DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
-      SECRET_GCP_SA_KEY:        "{{ secret('GCP_SA_KEY') }}"
-    script: |
-      import os, sys, json, tempfile, pandas as pd
-      sys.path.insert(0, "/app")
-      from pipeline import process_daily_upload, make_gspread_client
-      from kestra import Kestra
+  # ── TASK 6 ─ Split unusual upload from summary path ─────────────────────────
+  - id: branch_after_unusual_flag
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      # ── TASK 8 ─ Upload unusual transactions immediately ────────────────────
+      - id: upload_unusual_to_sheets
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ inputs.dry_run == false }}"
+        containerImage: finpay-pipeline:3.11
+        pythonVersion: "3.11"
+        timeout: PT10M
+        retry:
+          type: exponential
+          interval: PT15S
+          maxInterval: PT60S
+          maxAttempts: 3
+        inputFiles:
+          unusual.parquet: "{{ outputs.flag_unusual_transactions.outputFiles['unusual.parquet'] }}"
+        env:
+          TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
+          TARGET_WORKSHEET:   "{{ outputs.parse_and_resolve.vars.unusual_worksheet }}"
+          SECRET_GCP_SA_KEY:  "{{ secret('GCP_SA_KEY') }}"
+        script: |
+          import os, sys, json, tempfile, pandas as pd
+          sys.path.insert(0, "/app")
+          from pipeline import process_unusual_upload, make_gspread_client
+          from kestra import Kestra
 
-      sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
-      if not sa_key_json or sa_key_json.strip() == "{}":
-          print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
-          sys.exit(1)
+          sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+          if not sa_key_json or sa_key_json.strip() == "{}":
+              print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
+              sys.exit(1)
 
-      sa_key_path = None
-      try:
-          with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-              f.write(sa_key_json)
-              sa_key_path = f.name
+          sa_key_path = None
+          try:
+              with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                  f.write(sa_key_json)
+                  sa_key_path = f.name
 
-          summary_df = pd.read_parquet("summary.parquet")
-          client     = make_gspread_client(sa_key_path)
+              unusual_df = pd.read_parquet("unusual.parquet")
+              client     = make_gspread_client(sa_key_path)
 
-          insert_row, footer_end = process_daily_upload(
-              target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
-              target_worksheet=os.environ["TARGET_WORKSHEET"],
-              summary_df=summary_df,
-              starting_balance_date=os.environ["STARTING_BALANCE_DATE"],
-              default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
-              gspread_client=client,
-          )
+              written = process_unusual_upload(
+                  target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+                  target_worksheet=os.environ["TARGET_WORKSHEET"],
+                  unusual_df=unusual_df,
+                  gspread_client=client,
+              )
 
-          if insert_row is None:
-              print("⚠️  Sheet duplicate guard — date already exists.")
-              Kestra.outputs({"status": "skipped_duplicate"})
-          else:
-              print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
-              Kestra.outputs({"status": "success", "insert_row": insert_row, "footer_end": footer_end})
-      finally:
-          if sa_key_path and os.path.exists(sa_key_path):
-              os.unlink(sa_key_path)
+              status = "success" if written else "skipped_duplicate"
+              print(f"✅ Unusual transaction upload status: {status}. Rows: {len(unusual_df)}")
+              Kestra.outputs({
+                  "status": status,
+                  "rows": len(unusual_df),
+                  "worksheet": os.environ["TARGET_WORKSHEET"],
+              })
+          finally:
+              if sa_key_path and os.path.exists(sa_key_path):
+                  os.unlink(sa_key_path)
+
+      # ── TASKS 6-7 ─ Relabel, summarize, then upload summary ─────────────────
+      - id: summary_upload_branch
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          # ── TASK 6a ─ Relabel out-cluster transactions for summary ──────────
+          - id: relabel_out_cluster
+            type: io.kestra.plugin.scripts.python.Script
+            containerImage: finpay-pipeline:3.11
+            pythonVersion: "3.11"
+            timeout: PT3M
+            inputFiles:
+              with_amount.parquet: "{{ outputs.validate_integrity.outputFiles['with_amount.parquet'] }}"
+            outputFiles:
+              - relabeled.parquet
+            script: |
+              import sys, pandas as pd
+              sys.path.insert(0, "/app")
+              from pipeline import relabel_out_cluster_transactions
+              from kestra import Kestra
+
+              df = pd.read_parquet("with_amount.parquet")
+              before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
+
+              df = relabel_out_cluster_transactions(df)
+              after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
+              out_cluster_rows = int(
+                  df["Transaction"].isin(["RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"]).sum()
+              )
+
+              df.to_parquet("relabeled.parquet", index=False)
+
+              print(f"✅ Relabel step complete. Out-cluster rows: {out_cluster_rows}")
+              Kestra.outputs({
+                  "rows": len(df),
+                  "out_cluster_rows": out_cluster_rows,
+                  "before_counts": before_counts,
+                  "after_counts": after_counts,
+              })
+
+          # ── TASK 6b ─ Summarize by transaction ──────────────────────────────
+          - id: summarize
+            type: io.kestra.plugin.scripts.python.Script
+            containerImage: finpay-pipeline:3.11
+            pythonVersion: "3.11"
+            timeout: PT3M
+            inputFiles:
+              relabeled.parquet: "{{ outputs.relabel_out_cluster.outputFiles['relabeled.parquet'] }}"
+            outputFiles:
+              - summary.parquet
+            env:
+              CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+              ISO_DATE:   "{{ outputs.parse_and_resolve.vars.iso_date }}"
+              DRY_RUN:    "{{ inputs.dry_run }}"
+            script: |
+              import os, sys, pandas as pd
+              sys.path.insert(0, "/app")
+              from pipeline import summarize_by_transaction
+              from kestra import Kestra
+
+              cluster_id = os.environ["CLUSTER_ID"]
+              iso_date   = os.environ["ISO_DATE"]
+              dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+              df         = pd.read_parquet("relabeled.parquet")
+              summary_df = summarize_by_transaction(df)
+
+              print(f"\n{'='*60}")
+              print(f"SUMMARY — Cluster {cluster_id} — {iso_date}")
+              if dry_run:
+                  print("⚠️  DRY RUN — not written to sheet")
+              print(f"{'='*60}")
+              print(summary_df.to_string(index=False))
+              print(f"{'='*60}\n")
+
+              total_credit = float(summary_df["Sum_of_Kredit"].sum())
+              total_debet  = float(summary_df["Sum_of_Debet"].sum())
+
+              summary_df.to_parquet("summary.parquet", index=False)
+              Kestra.outputs({
+                  "transaction_count": len(summary_df),
+                  "transactions":      summary_df["Transaction"].tolist(),
+                  "total_credit":      total_credit,
+                  "total_debet":       total_debet,
+              })
+
+          # ── TASK 7 ─ Upload summary to Google Sheets ────────────────────────
+          - id: upload_to_sheets
+            type: io.kestra.plugin.scripts.python.Script
+            runIf: "{{ inputs.dry_run == false }}"
+            containerImage: finpay-pipeline:3.11
+            pythonVersion: "3.11"
+            timeout: PT10M
+            retry:
+              type: exponential
+              interval: PT15S
+              maxInterval: PT60S
+              maxAttempts: 3
+            inputFiles:
+              summary.parquet: "{{ outputs.summarize.outputFiles['summary.parquet'] }}"
+            env:
+              TARGET_SPREADSHEET:       "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
+              TARGET_WORKSHEET:         "{{ outputs.determine_current_date.vars.summary_worksheet }}"
+              STARTING_BALANCE_DATE:    "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
+              DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
+              SECRET_GCP_SA_KEY:        "{{ secret('GCP_SA_KEY') }}"
+            script: |
+              import os, sys, json, tempfile, pandas as pd
+              sys.path.insert(0, "/app")
+              from pipeline import process_daily_upload, make_gspread_client
+              from kestra import Kestra
+
+              sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+              if not sa_key_json or sa_key_json.strip() == "{}":
+                  print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
+                  sys.exit(1)
+
+              sa_key_path = None
+              try:
+                  with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                      f.write(sa_key_json)
+                      sa_key_path = f.name
+
+                  summary_df = pd.read_parquet("summary.parquet")
+                  client     = make_gspread_client(sa_key_path)
+
+                  insert_row, footer_end = process_daily_upload(
+                      target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+                      target_worksheet=os.environ["TARGET_WORKSHEET"],
+                      summary_df=summary_df,
+                      starting_balance_date=os.environ["STARTING_BALANCE_DATE"],
+                      default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
+                      gspread_client=client,
+                  )
+
+                  if insert_row is None:
+                      print("⚠️  Sheet duplicate guard — date already exists.")
+                      Kestra.outputs({
+                          "status": "skipped_duplicate",
+                          "worksheet": os.environ["TARGET_WORKSHEET"],
+                      })
+                  else:
+                      print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
+                      Kestra.outputs({
+                          "status": "success",
+                          "worksheet": os.environ["TARGET_WORKSHEET"],
+                          "insert_row": insert_row,
+                          "footer_end": footer_end,
+                      })
+              finally:
+                  if sa_key_path and os.path.exists(sa_key_path):
+                      os.unlink(sa_key_path)
 
 errors:
   # ── TODO: replace with a real notification plugin once your channel is ready ──
