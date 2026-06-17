@@ -36,7 +36,7 @@ Upload CSV/XLS/XLSX
       |
       v
 [5] deduplicate_transactions
-      - drop duplicate rows using all columns
+      - drop duplicate rows using all columns except No
       - compare Transaction Date at date + hour + minute precision only
       |
       v
@@ -218,7 +218,7 @@ The initial balance date for a new monthly summary worksheet is computed as the 
 | 2 | `determine_current_date` | Computes the `Asia/Makassar` run date and monthly summary worksheet name. |
 | 3 | `load_and_validate` | Loads CSV/XLS/XLSX, auto-detects the header row, coerces dtypes, and validates `FINPAY_SCHEMA`. |
 | 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero; adds `Amount`. |
-| 5 | `deduplicate_transactions` | Drops duplicate rows using all columns, with `Transaction Date` compared at minute precision. |
+| 5 | `deduplicate_transactions` | Drops duplicate rows using all columns except `No`, with `Transaction Date` compared at minute precision. |
 | 6 | `flag_unusual_transactions` | Runs fee-rule validation on deduplicated, pre-relabel data and writes `unusual.parquet`. |
 | 7 | `branch_after_unusual_flag` | Runs unusual upload and summary upload path in parallel. |
 | 7a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
@@ -411,7 +411,7 @@ PY
 - Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `pipeline_refactored.py`.
 - The summary monthly worksheet is based on the pipeline run month, not the uploaded file date.
 - The starting balance date is the last day of the previous month, computed at runtime.
-- Deduplication compares all columns, but normalizes `Transaction Date` to minute precision for duplicate detection.
+- Deduplication compares all columns except `No`, and normalizes `Transaction Date` to minute precision for duplicate detection.
 - Unusual detection runs before summary relabeling so fee checks see the original transaction labels.
 - Unusual upload, Telegram unusual-row alerting, and summary upload run in parallel after unusual detection.
 - Parquet files are used between Kestra tasks to avoid passing large datasets through variables.

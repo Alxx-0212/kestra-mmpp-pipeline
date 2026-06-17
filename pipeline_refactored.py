@@ -225,12 +225,14 @@ def validate_and_add_amount(df: pd.DataFrame) -> pd.DataFrame:
 
 def drop_duplicate_rows_by_minute(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Drop duplicate rows using all columns as the comparison key, except
+    Drop duplicate rows using all columns except No as the comparison key.
     Transaction Date is compared at minute precision only.
     The original Transaction Date value is preserved in the returned rows.
     """
     result = df.copy()
     dedup_key = result.copy()
+    if "No" in dedup_key.columns:
+        dedup_key = dedup_key.drop(columns="No")
     dedup_key["Transaction Date"] = (
         pd.to_datetime(dedup_key["Transaction Date"]).dt.floor("min")
     )
