@@ -1,71 +1,106 @@
 # FinPay Daily Pipeline
 
-An automated daily data pipeline that ingests FinPay transaction exports (CSV or Excel), validates the data, and appends a formatted daily summary block to a Google Sheets monitoring spreadsheet. Orchestrated by [Kestra](https://kestra.io) running in Docker.
+Kestra flow for processing daily FinPay exports. The pipeline loads a CSV/XLS/XLSX file, validates the FinPay schema, flags unusual fee groups, summarizes transactions, and writes results to Google Sheets.
+
+The flow is currently designed for manual runs with a file upload. Runtime dates use the `Asia/Makassar` timezone.
 
 ---
 
-## Overview
+## Current Flow
 
+```text
+Upload CSV/XLS/XLSX
+      |
+      v
+[1] parse_and_resolve
+      - extract cluster_id and file date from filename
+      - resolve spreadsheet and cluster base worksheet
+      - compute starting_balance_date as the last day of the previous month
+      |
+      v
+[2] determine_current_date
+      - compute current run date
+      - compute monthly summary worksheet, e.g. PKY 2026-06
+      |
+      v
+[3] load_and_validate
+      - load CSV/XLS/XLSX
+      - auto-detect header row
+      - coerce types
+      - validate against FINPAY_SCHEMA
+      |
+      v
+[4] validate_integrity
+      - enforce Debet/Kredit mutual exclusivity
+      - add Amount
+      |
+      v
+[5] flag_unusual_transactions
+      - run on pre-relabel data
+      - write unusual.parquet
+      |
+      v
+[6] branch_after_unusual_flag
+      +-- upload_unusual_to_sheets
+      |     - writes to one unusual worksheet per cluster
+      |
+      +-- summary_upload_branch
+            - relabel out-cluster rows for summary only
+            - summarize transaction totals
+            - upload the daily summary block to the monthly worksheet
 ```
-Upload CSV/XLSX
-      │
-      ▼
-[Task 1] Parse filename → extract cluster ID + date → resolve spreadsheet config
-      │
-      ▼
-[Task 2] Load file → auto-detect header row → coerce dtypes → validate against schema
-      │
-      ▼
-[Task 3] Debet/Kredit mutual-exclusivity check → add Amount column
-      │
-      ▼
-[Task 4] Summarize by transaction type
-      │
-      ▼
-[Task 5] Upload daily block to Google Sheets (skipped on dry run)
-```
+
+`dry_run=true` still runs validation, integrity checks, unusual detection, relabeling, and summary generation. Google Sheets uploads are skipped.
 
 ---
 
 ## Project Structure
 
-```
-files/
-├── pipeline_refactored.py   # Core data logic (pure functions, no orchestration)
-├── finpay_pipeline.yml      # Kestra flow definition (5 tasks + error handler)
-├── Dockerfile               # Python 3.11-slim image — bakes pipeline.py into /app
-├── docker-compose.yml       # Kestra + PostgreSQL stack
-├── requirements.txt         # Python dependencies
-├── .env_encoded             # Kestra encoded env config (not committed)
-└── tmp/kestra-wd/
-    ├── finpay-inbox/        # Drop-off folder for input files
-    ├── finpay-archive/      # Processed files moved here after success
-    └── secrets/
-        └── gcp-sa-key.json  # GCP service account key (not committed)
+```text
+kestra-mmpp-pipeline/
+├── pipeline_refactored.py   # Core data and Google Sheets functions
+├── finpay_pipeline.yml      # Kestra flow definition
+├── Dockerfile               # Builds finpay-pipeline:3.11 and copies pipeline.py into /app
+├── docker-compose.yml       # Kestra + PostgreSQL local stack
+├── requirements.txt         # Python dependencies for the Docker image
+├── README.md
+├── .gitignore
+├── .env_encoded             # Local Kestra env/secret file, ignored by git
+└── data/                    # Local sample/input data, ignored by git
 ```
 
 ---
 
 ## Prerequisites
 
-- Docker + Docker Compose
-- A GCP service account with **Google Sheets API** and **Google Drive API** enabled
-- The service account must be shared as an **Editor** on the target spreadsheet
-- The `finpay-pipeline:3.11` Docker image built and available to the Kestra Docker runner
+- Docker and Docker Compose
+- A GCP service account with Google Sheets API and Google Drive API enabled
+- The service account shared as Editor on the target spreadsheet
+- The local Docker image `finpay-pipeline:3.11`
+- A Kestra secret named `GCP_SA_KEY` containing the full service-account JSON
 
 ---
 
 ## Setup
 
-### 1. Start the Kestra stack
+### 1. Start Kestra
 
 ```bash
-cd files/
+cd kestra-mmpp-pipeline
 docker compose up -d
 ```
 
-Kestra UI will be available at `http://localhost:8080`.  
-Default credentials: `admin@kestra.io` / `Admin1234!`
+Kestra UI:
+
+```text
+http://localhost:8080
+```
+
+Default credentials from `docker-compose.yml`:
+
+```text
+admin@kestra.io / Admin1234!
+```
 
 ### 2. Build the pipeline image
 
@@ -73,107 +108,266 @@ Default credentials: `admin@kestra.io` / `Admin1234!`
 docker build -t finpay-pipeline:3.11 .
 ```
 
-The image bakes `pipeline_refactored.py` in as `/app/pipeline.py` so all Kestra tasks can import it directly.
+The image installs `requirements.txt` and copies `pipeline_refactored.py` as `/app/pipeline.py`, which is what the Kestra Python tasks import.
 
-### 3. Configure the GCP secret
+### 3. Configure Google Sheets credentials
 
-In the Kestra UI, create a secret named `GCP_SA_KEY` containing the full JSON content of your GCP service account key file.
+Create a Kestra secret named:
+
+```text
+GCP_SA_KEY
+```
+
+The value must be the full JSON body of the GCP service account key. Keep local env/secret files out of git; `.env_encoded` is already ignored.
 
 ### 4. Deploy the flow
 
-In the Kestra UI, create a new flow under namespace `finance.finpay` and paste the contents of `finpay_pipeline.yml`.
+In the Kestra UI:
+
+1. Go to `Flows`.
+2. Create or update flow `finance.finpay.finpay_daily_pipeline`.
+3. Paste the contents of `finpay_pipeline.yml`.
 
 ---
 
-## Running the Pipeline
+## Running
 
 ### Via Kestra UI
 
-1. Open `http://localhost:8080`
-2. Navigate to **Flows → finance.finpay → finpay_daily_pipeline**
-3. Click **Execute**
-4. Upload the FinPay export file
-5. Toggle **Dry run** if you only want validation without writing to the sheet
+1. Open `http://localhost:8080`.
+2. Go to `Flows -> finance.finpay -> finpay_daily_pipeline`.
+3. Click `Execute`.
+4. Upload the FinPay export file.
+5. Set `dry_run=true` if you only want validation, unusual detection, and summary logs without sheet writes.
 
 ### Input filename format
 
-The filename must match the pattern:
+The filename must match:
 
-```
+```text
 finpay-<cluster_id>(<DD-MM-YYYY>to<DD-MM-YYYY>).<csv|xlsx|xls>
 ```
 
-Example: `finpay-421306(09-06-2026to09-06-2026).csv`
+Example:
 
-The `cluster_id` in the filename determines which worksheet to write to:
+```text
+finpay-411311(04-06-2026to04-06-2026).csv
+```
 
-| Cluster ID | Worksheet |
-|------------|-----------|
-| 421306 | MRT |
-| 421307 | TDR |
-| 411311 | PKY |
-| 421315 | BGI |
-| 421318 | MRW |
-| 421320 | TNT |
+The first date in the filename becomes the file `iso_date` output. Monthly worksheet selection and starting balance date are based on the pipeline run date, not the file date.
 
-All clusters write to the **"MONITORING FINPAY"** spreadsheet.
+---
+
+## Cluster Configuration
+
+All clusters write to the spreadsheet:
+
+```text
+MONITORING FINPAY
+```
+
+| Cluster ID | Base worksheet | Summary worksheet example for June 2026 run | Unusual worksheet | Default starting balance |
+|---|---|---|---|-------------------------:|
+| 421306 | MRT | MRT 2026-06 | MRT - Unusual |                        0 |
+| 421307 | TDR | TDR 2026-06 | TDR - Unusual |                        0 |
+| 411311 | PKY | PKY 2026-06 | PKY - Unusual |                        0 |
+| 421315 | BGI | BGI 2026-06 | BGI - Unusual |                        0 |
+| 421318 | MRW | MRW 2026-06 | MRW - Unusual |                        0 |
+| 421320 | TNT | TNT 2026-06 | TNT - Unusual |                        0 |
+
+Summary worksheets are monthly and derived from the run month:
+
+```text
+<base worksheet> <YYYY-MM>
+```
+
+Unusual worksheets are stable per cluster:
+
+```text
+<base worksheet> - Unusual
+```
+
+The initial balance date for a new monthly summary worksheet is computed as the last day of the previous month. For a run on `2026-06-17`, the starting balance date is `2026-05-31`.
 
 ---
 
 ## Pipeline Tasks
 
 | # | Task ID | Description |
-|---|---------|-------------|
-| 1 | `parse_and_resolve` | Extracts `cluster_id` and date from filename; resolves spreadsheet/worksheet config |
-| 2 | `load_and_validate` | Loads CSV or Excel with auto header-row detection; validates against FINPAY Pandera schema |
-| 3 | `validate_integrity` | Ensures Debet and Kredit are mutually exclusive per row; adds `Amount` column |
-| 4 | `summarize` | Groups by `Transaction` type and aggregates totals |
-| 5 | `upload_to_sheets` | Appends a formatted daily block to the target Google Sheet (skipped on dry run) |
+|---|---|---|
+| 1 | `parse_and_resolve` | Parses the filename, resolves cluster config, computes the previous-month-end `starting_balance_date`, and sets the unusual worksheet name. |
+| 2 | `determine_current_date` | Computes the `Asia/Makassar` run date and monthly summary worksheet name. |
+| 3 | `load_and_validate` | Loads CSV/XLS/XLSX, auto-detects the header row, coerces dtypes, and validates `FINPAY_SCHEMA`. |
+| 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero; adds `Amount`. |
+| 5 | `flag_unusual_transactions` | Runs fee-rule validation on pre-relabel data and writes `unusual.parquet`. |
+| 6 | `branch_after_unusual_flag` | Runs unusual upload and summary upload path in parallel. |
+| 6a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
+| 6b | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
+| 6b.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups. |
+| 6b.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
+| 6b.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
 
-On any task failure, the `notify_on_failure` error handler logs the execution details (extend it with Slack / email / Teams as needed).
-
----
-
-## Google Sheets Output Format
-
-Each daily run appends two sections to the worksheet:
-
-**Data rows** — one row per transaction type with kredit/debet values and a running balance formula in column E.
-
-**Footer rows** — aggregated net values by category. Each footer cell contains a live spreadsheet formula that references the fixed-offset data rows above (e.g. `=C4-D4+C5-D5+C6-D6`), so no Python calculation is involved:
-
-| Label | Excel Formula (C = Kredit, D = Debet) |
-|-------|--------------------------------------|
-| NGRS | `=C{+4}-D{+4}+C{+5}-D{+5}+C{+6}-D{+6}` → RECHARGE + RECHARGEFEE + Reversal |
-| PPOB | `=C{+3}-D{+3}` → FeeTransaksi |
-| ST | `=C{+7}-D{+7}+C{+8}-D{+8}+C{+9}-D{+9}` → SELLTHRU + SELLTHRUFEE + SELLTHRUSALESFEE |
-| DISBURSEMENT | `=C{+2}-D{+2}` → DISBURSEMENT |
-| QRISDUWIT | `=C{+1}-D{+1}` → QRISDUWIT |
-| Total | `=C{+10}+C{+11}+C{+12}+C{+13}+C{+14}` → sum of all footer lines |
-
-A duplicate-date guard prevents the same date from being written twice.
+On failure, `notify_on_failure` currently logs the flow ID, execution ID, and UI log path.
 
 ---
 
-## Python Dependencies
+## Out-Cluster and Unusual Rules
+
+The pipeline intentionally uses two different remark phrases for two different purposes:
+
+| Purpose | Phrase | Behavior |
+|---|---|---|
+| Summary relabeling | `fee pembelian recharge out cluster` | In the summary branch only, matching `RECHARGE` groups are relabeled to `RECHARGE OUT CLUSTER`, and matching fee rows are relabeled to `RECHARGE OUT CLUSTER FEE`. |
+| Unusual exemption | `biaya pembelian recharge out cluster` | In unusual detection, matching `RECHARGE` rows are exempt from the missing `RECHARGEFEE` rule. |
+
+Fee validation currently monitors:
+
+| Transaction | Expected fee rows |
+|---|---|
+| `RECHARGE` | `RECHARGEFEE` with total `Debet == 20`, unless exempt by the unusual out-cluster remark. |
+| `SELLTHRU` | `SELLTHRUFEE` with total `Debet == 100` and at least one `SELLTHRUSALESFEE` row. |
+
+Flagged rows include the original transaction rows plus:
+
+```text
+base_id
+unusual_reason
+```
+
+---
+
+## Google Sheets Outputs
+
+### Monthly summary worksheet
+
+Target:
+
+```text
+<base worksheet> <YYYY-MM>
+```
+
+Example:
+
+```text
+PKY 2026-06
+```
+
+If the monthly worksheet does not exist, it is created. If it is empty, the pipeline initializes:
+
+- Header row: `TANGGAL`, `KETERANGAN`, `DEBET`, `KREDIT`, `SALDO`
+- Opening balance row using the previous-month-end date
+- Default starting balance from the cluster config
+
+Each run appends a daily block. Duplicate-date guard checks column A for the formatted transaction date and skips if that date already exists.
+
+Daily data rows are written in this fixed order:
+
+| Label | Summary transaction key |
+|---|---|
+| TRANSFER MASUK DARI FINPAY | `CASHOUT APOLLO` |
+| QRISDUWIT | `QRISDUWIT` |
+| DISBURSEMENT | `DISBURSEMENT` |
+| PPOB | `FeeTransaksi` |
+| NGRS | `RECHARGE` |
+| BIAYA FEE NGRS | `RECHARGEFEE` |
+| RECHARGE OUT CLUSTER | `RECHARGE OUT CLUSTER` |
+| RECHARGE OUT CLUSTER FEE | `RECHARGE OUT CLUSTER FEE` |
+| REVERSAL | `Reversal` |
+| ST | `SELLTHRU` |
+| BIAYA FEE ST | `SELLTHRUFEE` |
+| BIAYA FEE BAR A. ST | `SELLTHRUSALESFEE` |
+
+Footer rows are formula-based:
+
+| Footer | Formula meaning |
+|---|---|
+| NGRS | Net of `RECHARGE`, `RECHARGEFEE`, `RECHARGE OUT CLUSTER`, `RECHARGE OUT CLUSTER FEE`, and `Reversal`. |
+| PPOB | Net of `FeeTransaksi`. |
+| ST | Net of `SELLTHRU`, `SELLTHRUFEE`, and `SELLTHRUSALESFEE`. |
+| DISBURSEMENT | Net of `DISBURSEMENT`. |
+| QRISDUWIT | Net of `QRISDUWIT`. |
+| Total | Sum of the footer rows above. |
+
+### Unusual worksheet
+
+Target:
+
+```text
+<base worksheet> - Unusual
+```
+
+Example:
+
+```text
+PKY - Unusual
+```
+
+The worksheet is created if missing. Headers are written on first use. If there are no unusual rows, no rows are appended. Duplicate-date guard checks whether the report date already exists in the unusual sheet.
+
+---
+
+## Local Validation
+
+From `kestra-mmpp-pipeline`, using the repo-level uv virtualenv:
+
+```bash
+source ../.venv/bin/activate
+python -m py_compile pipeline_refactored.py
+python -c "import pathlib, yaml; yaml.safe_load(pathlib.Path('finpay_pipeline.yml').read_text()); print('YAML OK')"
+git diff --check -- finpay_pipeline.yml pipeline_refactored.py README.md
+```
+
+Example smoke test with a local data file:
+
+```bash
+source ../.venv/bin/activate
+python - <<'PY'
+from pipeline_refactored import (
+    load_and_validate_schema,
+    validate_and_add_amount,
+    flag_unusual_transactions,
+    relabel_out_cluster_transactions,
+    summarize_by_transaction,
+)
+
+path = "data/finpay-411311(04-06-2026to04-06-2026).csv"
+df = load_and_validate_schema(path)
+with_amount = validate_and_add_amount(df)
+unusual = flag_unusual_transactions(with_amount)
+relabeled = relabel_out_cluster_transactions(with_amount)
+summary = summarize_by_transaction(relabeled)
+print({
+    "rows": len(with_amount),
+    "unusual_rows": len(unusual),
+    "summary_rows": len(summary),
+})
+PY
+```
+
+---
+
+## Dependencies
 
 | Package | Version | Purpose |
-|---------|---------|---------|
-| pandas | 2.2.2 | DataFrame loading, transformation, date parsing |
+|---|---:|---|
+| pandas | 2.2.2 | File loading, transformation, date parsing |
 | pandera | 0.20.4 | Schema validation |
 | polars | 0.20.31 | Available for high-performance transforms |
 | gspread | 6.1.2 | Google Sheets API client |
-| google-auth | 2.30.0 | GCP service account authentication |
+| google-auth | 2.30.0 | GCP service-account authentication |
 | pyarrow | latest | Parquet inter-task file transfer |
-| openpyxl | latest | Excel (.xlsx) file reading |
-| kestra | latest | Kestra output/variable SDK |
+| openpyxl | latest | Excel `.xlsx` reading |
+| kestra | latest | Kestra output SDK |
 
 ---
 
-## Key Design Decisions
+## Design Notes
 
-- **Pure function module** — `pipeline_refactored.py` contains only data logic. All orchestration lives in the Kestra YAML flow.
-- **Auto header detection** — the loader scans the first 10 rows to find the real header regardless of leading metadata rows in the export.
-- **Parquet inter-task handoff** — tasks exchange data via `.parquet` files rather than environment variables to handle large row counts efficiently.
-- **Excel formulas for footer** — footer totals are written as live cell formulas (e.g. `=C4-D4+C5-D5`) rather than Python-computed values. The `_net()` helper was removed entirely; the formulas reference rows at fixed offsets from `insert_row`, so they remain correct even if the sheet is manually edited.
-- **Dry run flag** — task 5 is skipped entirely when `dry_run=true`, making validation safe to run in production.
+- Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `pipeline_refactored.py`.
+- The summary monthly worksheet is based on the pipeline run month, not the uploaded file date.
+- The starting balance date is the last day of the previous month, computed at runtime.
+- Unusual detection runs before summary relabeling so fee checks see the original transaction labels.
+- Unusual upload and summary upload run in parallel after unusual detection.
+- Parquet files are used between Kestra tasks to avoid passing large datasets through variables.
+- Google Sheets footer totals are live formulas, not Python-computed totals.
+- Dry runs execute all compute steps and skip only Google Sheets writes.
