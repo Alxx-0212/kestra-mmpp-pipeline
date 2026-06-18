@@ -1,4 +1,4 @@
-id: finpay_daily_pipeline
+id: finpay_daily_pipeline_v3
 namespace: finance.finpay
 
 # ── MANUAL RUN WITH FILE UPLOAD ─────────────────────────────────────────────────
@@ -117,7 +117,6 @@ tasks:
       print(f"💰 Balance dt : {starting_balance_date}")
       Kestra.outputs(outputs)
 
-
   # ── TASK 2 ─ Determine run date + monthly summary worksheet ─────────────────
   - id: determine_current_date
     type: io.kestra.plugin.scripts.python.Script
@@ -126,7 +125,7 @@ tasks:
     timeout: PT1M
     env:
       BASE_WORKSHEET: "{{ outputs.parse_and_resolve.vars.target_worksheet }}"
-      RUN_TIMEZONE:   "Asia/Makassar"
+      RUN_TIMEZONE: "Asia/Makassar"
     script: |
       import os
       from datetime import datetime
@@ -152,7 +151,6 @@ tasks:
       print(f"🕒 Run date          : {outputs['run_date']} ({timezone})")
       print(f"📊 Summary worksheet : {summary_worksheet}")
       Kestra.outputs(outputs)
-
 
   # ── TASK 3 ─ Load & validate schema ──────────────────────────────────────────
   - id: load_and_validate
@@ -183,7 +181,6 @@ tasks:
 
       print(f"✅ Loaded {len(df)} rows, {len(df.columns)} columns.")
       Kestra.outputs({"rows": len(df), "columns": list(df.columns)})
-
 
   # ── TASK 4 ─ Validate debit/credit integrity ─────────────────────────────────
   - id: validate_integrity
@@ -217,7 +214,6 @@ tasks:
       print(f"✅ Integrity check passed. Amount range: {amount_min:,.0f} → {amount_max:,.0f}")
       Kestra.outputs({"rows": len(df), "amount_min": amount_min, "amount_max": amount_max})
 
-
   # ── TASK 5 ─ Drop duplicate rows using minute-level datetime ────────────────
   - id: deduplicate_transactions
     type: io.kestra.plugin.scripts.python.Script
@@ -248,7 +244,6 @@ tasks:
           "dropped_rows": before_rows - after_rows,
       })
 
-
   # ── TASK 6 ─ Flag unusual transaction groups from pre-relabel data ──────────
   - id: flag_unusual_transactions
     type: io.kestra.plugin.scripts.python.Script
@@ -261,8 +256,8 @@ tasks:
       - unusual.parquet
     env:
       CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
-      ISO_DATE:   "{{ outputs.parse_and_resolve.vars.iso_date }}"
-      DRY_RUN:    "{{ inputs.dry_run }}"
+      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
     script: |
       import os, sys, pandas as pd
       sys.path.insert(0, "/app")
@@ -302,7 +297,6 @@ tasks:
           "reasons": reasons,
       })
 
-
   # ── TASK 7 ─ Split unusual upload from summary path ─────────────────────────
   - id: branch_after_unusual_flag
     type: io.kestra.plugin.core.flow.Parallel
@@ -323,8 +317,8 @@ tasks:
           unusual.parquet: "{{ outputs.flag_unusual_transactions.outputFiles['unusual.parquet'] }}"
         env:
           TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
-          TARGET_WORKSHEET:   "{{ outputs.parse_and_resolve.vars.unusual_worksheet }}"
-          SECRET_GCP_SA_KEY:  "{{ secret('GCP_SA_KEY') }}"
+          TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.unusual_worksheet }}"
+          SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
         script: |
           import os, sys, json, tempfile, pandas as pd
           sys.path.insert(0, "/app")
@@ -378,7 +372,7 @@ tasks:
         formData:
           chat_id: "{{ secret('TELEGRAM_CHAT_ID') }}"
           text: |
-            🚨 FinPay unusual transactions detected
+            FinPay unusual transactions detected!!!
 
             Flow: {{ flow.namespace }}.{{ flow.id }}
             Execution: {{ execution.id }}
@@ -442,8 +436,8 @@ tasks:
               - summary.parquet
             env:
               CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
-              ISO_DATE:   "{{ outputs.parse_and_resolve.vars.iso_date }}"
-              DRY_RUN:    "{{ inputs.dry_run }}"
+              ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+              DRY_RUN: "{{ inputs.dry_run }}"
             script: |
               import os, sys, pandas as pd
               sys.path.insert(0, "/app")
@@ -491,11 +485,11 @@ tasks:
             inputFiles:
               summary.parquet: "{{ outputs.summarize.outputFiles['summary.parquet'] }}"
             env:
-              TARGET_SPREADSHEET:       "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
-              TARGET_WORKSHEET:         "{{ outputs.determine_current_date.vars.summary_worksheet }}"
-              STARTING_BALANCE_DATE:    "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
+              TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
+              TARGET_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_worksheet }}"
+              STARTING_BALANCE_DATE: "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
               DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
-              SECRET_GCP_SA_KEY:        "{{ secret('GCP_SA_KEY') }}"
+              SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
             script: |
               import os, sys, json, tempfile, pandas as pd
               sys.path.insert(0, "/app")
@@ -555,8 +549,8 @@ errors:
     pythonVersion: "3.11"
     env:
       EXECUTION_ID: "{{ execution.id }}"
-      FLOW_ID:      "{{ flow.id }}"
-      NAMESPACE:    "{{ flow.namespace }}"
+      FLOW_ID: "{{ flow.id }}"
+      NAMESPACE: "{{ flow.namespace }}"
     script: |
       import os
       execution_id = os.environ.get("EXECUTION_ID", "unknown")

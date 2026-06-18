@@ -126,6 +126,14 @@ GCP_SA_KEY
 
 The value must be the full JSON body of the GCP service account key. Keep local env/secret files out of git; `.env_encoded` is already ignored.
 
+For the local open-source Docker Compose setup, `.env_encoded` must store the base64-encoded value with Kestra's environment prefix:
+
+```text
+SECRET_GCP_SA_KEY=<base64-encoded-service-account-json>
+```
+
+The flow still references it as `{{ secret('GCP_SA_KEY') }}`. Do not include the `SECRET_` prefix inside `secret(...)`; the prefix is only used in the environment variable name.
+
 ### 3b. Configure Telegram unusual-row alerts
 
 Telegram alerts are sent only when `dry_run=false` and `flag_unusual_transactions` finds at least one unusual row.
@@ -136,6 +144,8 @@ Create these Kestra secrets:
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
 ```
+
+In local `.env_encoded`, store them as `SECRET_TELEGRAM_BOT_TOKEN` and `SECRET_TELEGRAM_CHAT_ID`. The flow references them as `{{ secret('TELEGRAM_BOT_TOKEN') }}` and `{{ secret('TELEGRAM_CHAT_ID') }}`.
 
 The alert uses Telegram Bot API `sendMessage` through Kestra's `io.kestra.plugin.core.http.Request` task. The bot must be allowed to send messages to the target chat, group, or channel.
 
