@@ -1,4 +1,4 @@
-id: finpay_daily_pipeline_v3
+id: finpay_daily_pipeline_v4
 namespace: finance.finpay
 
 # ── MANUAL RUN WITH FILE UPLOAD ─────────────────────────────────────────────────
@@ -195,28 +195,25 @@ tasks:
     inputFiles:
       validated.parquet: "{{ outputs.load_and_validate.outputFiles['validated.parquet'] }}"
     outputFiles:
-      - with_amount.parquet
+      - integrity_checked.parquet
     script: |
       import sys, pandas as pd
       sys.path.insert(0, "/app")
-      from pipeline import validate_and_add_amount
+      from pipeline import validate_debit_credit_integrity
       from kestra import Kestra
 
       df = pd.read_parquet("validated.parquet")
 
       try:
-          df = validate_and_add_amount(df)
+          df = validate_debit_credit_integrity(df)
       except ValueError as e:
           print(f"❌ Integrity check failed:\n{e}", file=sys.stderr)
           sys.exit(1)
 
-      df.to_parquet("with_amount.parquet", index=False)
+      df.to_parquet("integrity_checked.parquet", index=False)
 
-      amount_min = float(df["Amount"].min())
-      amount_max = float(df["Amount"].max())
-
-      print(f"✅ Integrity check passed. Amount range: {amount_min:,.0f} → {amount_max:,.0f}")
-      Kestra.outputs({"rows": len(df), "amount_min": amount_min, "amount_max": amount_max})
+      print(f"✅ Integrity check passed. Rows: {len(df)}")
+      Kestra.outputs({"rows": len(df)})
 
   # ── TASK 5 ─ Drop duplicate rows using minute-level datetime ────────────────
   - id: deduplicate_transactions
@@ -225,7 +222,7 @@ tasks:
     pythonVersion: "3.11"
     timeout: PT3M
     inputFiles:
-      with_amount.parquet: "{{ outputs.validate_integrity.outputFiles['with_amount.parquet'] }}"
+      integrity_checked.parquet: "{{ outputs.validate_integrity.outputFiles['integrity_checked.parquet'] }}"
     outputFiles:
       - deduplicated.parquet
     script: |
@@ -234,7 +231,7 @@ tasks:
       from pipeline import drop_duplicate_rows_by_minute
       from kestra import Kestra
 
-      df = pd.read_parquet("with_amount.parquet")
+      df = pd.read_parquet("integrity_checked.parquet")
       before_rows = len(df)
       df = drop_duplicate_rows_by_minute(df)
       after_rows = len(df)

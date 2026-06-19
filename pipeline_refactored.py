@@ -201,9 +201,9 @@ def load_and_validate_schema(path: str) -> pd.DataFrame:
 # STEP 2  debit/Kredit integrity
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validate_and_add_amount(df: pd.DataFrame) -> pd.DataFrame:
+def validate_debit_credit_integrity(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Guarantee mutual exclusivity of Debet/Kredit per row, then add Amount column.
+    Guarantee mutual exclusivity of Debet/Kredit per row.
     Raises ValueError on any violation.
     """
     invalid_mask = (df["Kredit"] != 0) & (df["Debet"] != 0)
@@ -215,9 +215,7 @@ def validate_and_add_amount(df: pd.DataFrame) -> pd.DataFrame:
             f"Debet and Kredit non-zero:\n{invalid_rows}"
         )
 
-    result = df.copy()
-    # result["Amount"] = result["Kredit"] - result["Debet"]
-    return result
+    return df.copy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -611,7 +609,8 @@ def append_unusual_to_gsheet(
             col_letter = chr(65 + rem) + col_letter
         return f"{col_letter}{row}"
 
-    def _range(sr, er, sc=1, ec=14):
+    def _range(sr, er, sc=1, ec=None):
+        ec = ec or len(HEADERS)
         return f"{_a1(sr, sc)}:{_a1(er, ec)}"
 
     def _clean(value):
@@ -640,7 +639,6 @@ def append_unusual_to_gsheet(
         'TRANSACTION',
         'KREDIT',
         'DEBET',
-        'AMOUNT',
         'SALDO AWAL',
         'SALDO AKHIR',
         'NOMOR RS',
@@ -705,7 +703,6 @@ def append_unusual_to_gsheet(
             str(_clean(row.get('Transaction'))),
             _number(row.get('Kredit')),
             _number(row.get('Debet')),
-            _number(row.get('Amount')),
             _number(row.get('Saldo Awal')),
             _number(row.get('Saldo Akhir')),
             str(_clean(row.get('Nomor RS'))),
@@ -721,7 +718,7 @@ def append_unusual_to_gsheet(
 
     widths = {
         0: 110, 1: 70, 2: 165, 3: 220, 4: 220, 5: 170, 6: 120,
-        7: 120, 8: 120, 9: 130, 10: 130, 11: 130, 12: 420, 13: 320,
+        7: 120, 8: 130, 9: 130, 10: 130, 11: 420, 12: 320,
     }
     sh.batch_update({"requests": [
         {
@@ -748,8 +745,8 @@ def append_unusual_to_gsheet(
     })
     ws.format(f"A{data_start}:A{data_end}", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}})
     ws.format(f"C{data_start}:C{data_end}", {"numberFormat": {"type": "DATE_TIME", "pattern": "dd/mm/yyyy hh:mm:ss"}})
-    ws.format(f"G{data_start}:K{data_end}", {"numberFormat": IDR})
-    ws.format(f"M{data_start}:N{data_end}", {"wrapStrategy": "WRAP"})
+    ws.format(f"G{data_start}:J{data_end}", {"numberFormat": IDR})
+    ws.format(f"L{data_start}:M{data_end}", {"wrapStrategy": "WRAP"})
     ws.format(_range(data_start, data_start), {
         "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
     })
@@ -889,7 +886,6 @@ def append_transaction_detail_to_gsheet(
         "TRANSACTION",
         "KREDIT",
         "DEBET",
-        "AMOUNT",
         "SALDO AWAL",
         "SALDO AKHIR",
         "NOMOR RS",
@@ -947,7 +943,6 @@ def append_transaction_detail_to_gsheet(
             str(_clean(row.get("Transaction"))),
             _number(row.get("Kredit")),
             _number(row.get("Debet")),
-            _number(row.get("Amount")),
             _number(row.get("Saldo Awal")),
             _number(row.get("Saldo Akhir")),
             str(_clean(row.get("Nomor RS"))),
@@ -971,7 +966,6 @@ def append_transaction_detail_to_gsheet(
         "TRANSACTION": 160,
         "KREDIT": 120,
         "DEBET": 120,
-        "AMOUNT": 120,
         "SALDO AWAL": 130,
         "SALDO AKHIR": 130,
         "NOMOR RS": 130,
@@ -1013,7 +1007,7 @@ def append_transaction_detail_to_gsheet(
         "numberFormat": {"type": "DATE_TIME", "pattern": "dd/mm/yyyy hh:mm:ss"}
     })
 
-    for header in ["KREDIT", "DEBET", "AMOUNT", "SALDO AWAL", "SALDO AKHIR"]:
+    for header in ["KREDIT", "DEBET", "SALDO AWAL", "SALDO AKHIR"]:
         col = HEADERS.index(header) + 1
         ws.format(f"{_a1(data_start, col)}:{_a1(data_end, col)}", {"numberFormat": IDR})
 

@@ -32,7 +32,6 @@ Upload CSV/XLS/XLSX
       v
 [4] validate_integrity
       - enforce Debet/Kredit mutual exclusivity
-      - add Amount
       |
       v
 [5] deduplicate_transactions
@@ -163,7 +162,7 @@ The alert uses Telegram Bot API `sendMessage` through Kestra's `io.kestra.plugin
 In the Kestra UI:
 
 1. Go to `Flows`.
-2. Create or update flow `finance.finpay.finpay_daily_pipeline_v3`.
+2. Create or update flow `finance.finpay.finpay_daily_pipeline_v4`.
 3. Paste the contents of `finpay_pipeline.yml`.
 
 ---
@@ -173,7 +172,7 @@ In the Kestra UI:
 ### Via Kestra UI
 
 1. Open `http://localhost:8080`.
-2. Go to `Flows -> finance.finpay -> finpay_daily_pipeline_v3`.
+2. Go to `Flows -> finance.finpay -> finpay_daily_pipeline_v4`.
 3. Click `Execute`.
 4. Upload the FinPay export file.
 5. Set `dry_run=true` if you only want validation, unusual detection, and summary logs without sheet writes.
@@ -243,7 +242,7 @@ The initial balance date for a new monthly summary worksheet is computed as the 
 | 1 | `parse_and_resolve` | Parses the filename, resolves cluster config, computes the previous-month-end `starting_balance_date`, and sets the unusual worksheet name. |
 | 2 | `determine_current_date` | Computes the `Asia/Makassar` run date and monthly summary worksheet name. |
 | 3 | `load_and_validate` | Loads CSV/XLS/XLSX, auto-detects the header row, coerces dtypes, and validates `FINPAY_SCHEMA`. |
-| 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero; adds `Amount`. |
+| 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero. |
 | 5 | `deduplicate_transactions` | Drops duplicate rows using all columns except `No`, with `Transaction Date` compared at minute precision. |
 | 6 | `flag_unusual_transactions` | Runs fee-rule validation on deduplicated, pre-relabel data and writes `unusual.parquet`. |
 | 7 | `branch_after_unusual_flag` | Runs unusual upload, QRISDUWIT detail export, Reversal detail export, and summary upload paths in parallel. |
@@ -367,9 +366,8 @@ Current unusual report columns:
 | TRANSACTION ID | Original transaction ID. |
 | BASE ID | Grouping key used for fee validation. |
 | TRANSACTION | Transaction label. |
-| KREDIT | Source kredit amount. |
-| DEBET | Source debet amount. |
-| AMOUNT | Computed `Kredit - Debet`. |
+| KREDIT | Source kredit value. |
+| DEBET | Source debet value. |
 | SALDO AWAL | Source starting balance. |
 | SALDO AKHIR | Source ending balance. |
 | NOMOR RS | Source RS number. |
@@ -435,7 +433,7 @@ source ../.venv/bin/activate
 python - <<'PY'
 from pipeline_refactored import (
     load_and_validate_schema,
-    validate_and_add_amount,
+    validate_debit_credit_integrity,
     drop_duplicate_rows_by_minute,
     flag_unusual_transactions,
     prepare_transaction_detail_export,
@@ -445,15 +443,15 @@ from pipeline_refactored import (
 
 path = "data/finpay-411311(04-06-2026to04-06-2026).csv"
 df = load_and_validate_schema(path)
-with_amount = validate_and_add_amount(df)
-deduplicated = drop_duplicate_rows_by_minute(with_amount)
+integrity_checked = validate_debit_credit_integrity(df)
+deduplicated = drop_duplicate_rows_by_minute(integrity_checked)
 unusual = flag_unusual_transactions(deduplicated)
 qrisduwit = prepare_transaction_detail_export(deduplicated, "QRISDUWIT", include_disbursement_date=True)
 reversal = prepare_transaction_detail_export(deduplicated, "REVERSAL")
 relabeled = relabel_out_cluster_transactions(deduplicated)
 summary = summarize_by_transaction(relabeled)
 print({
-    "rows": len(with_amount),
+    "rows": len(integrity_checked),
     "deduplicated_rows": len(deduplicated),
     "unusual_rows": len(unusual),
     "qrisduwit_rows": len(qrisduwit),
