@@ -49,6 +49,15 @@ Upload CSV/XLS/XLSX
       +-- upload_unusual_to_sheets
       |     - writes to one unusual worksheet per cluster
       |
+      +-- qrisduwit_upload_branch
+      |     - filters QRISDUWIT rows
+      |     - extracts Disbursement Date from Remarks
+      |     - writes to one QRISDUWIT worksheet per cluster
+      |
+      +-- reversal_upload_branch
+      |     - filters REVERSAL rows
+      |     - writes to one Reversal worksheet per cluster
+      |
       +-- summary_upload_branch
             - relabel out-cluster rows for summary only
             - summarize transaction totals
@@ -154,7 +163,7 @@ The alert uses Telegram Bot API `sendMessage` through Kestra's `io.kestra.plugin
 In the Kestra UI:
 
 1. Go to `Flows`.
-2. Create or update flow `finance.finpay.finpay_daily_pipeline`.
+2. Create or update flow `finance.finpay.finpay_daily_pipeline_v3`.
 3. Paste the contents of `finpay_pipeline.yml`.
 
 ---
@@ -164,7 +173,7 @@ In the Kestra UI:
 ### Via Kestra UI
 
 1. Open `http://localhost:8080`.
-2. Go to `Flows -> finance.finpay -> finpay_daily_pipeline`.
+2. Go to `Flows -> finance.finpay -> finpay_daily_pipeline_v3`.
 3. Click `Execute`.
 4. Upload the FinPay export file.
 5. Set `dry_run=true` if you only want validation, unusual detection, and summary logs without sheet writes.
@@ -195,14 +204,14 @@ All clusters write to the spreadsheet:
 MONITORING FINPAY
 ```
 
-| Cluster ID | Base worksheet | Summary worksheet example for June 2026 run | Unusual worksheet | Default starting balance |
-|---|---|---|---|-------------------------:|
-| 421306 | MRT | MRT 2026-06 | MRT - Unusual |                        0 |
-| 421307 | TDR | TDR 2026-06 | TDR - Unusual |                        0 |
-| 411311 | PKY | PKY 2026-06 | PKY - Unusual |                        0 |
-| 421315 | BGI | BGI 2026-06 | BGI - Unusual |                        0 |
-| 421318 | MRW | MRW 2026-06 | MRW - Unusual |                        0 |
-| 421320 | TNT | TNT 2026-06 | TNT - Unusual |                        0 |
+| Cluster ID | Base worksheet | Summary worksheet example for June 2026 run | Unusual worksheet | QRISDUWIT worksheet | Reversal worksheet | Default starting balance |
+|---|---|---|---|---|---|-------------------------:|
+| 421306 | MRT | MRT 2026-06 | MRT - Unusual | MRT - QRISDUWIT | MRT - Reversal |                        0 |
+| 421307 | TDR | TDR 2026-06 | TDR - Unusual | TDR - QRISDUWIT | TDR - Reversal |                        0 |
+| 411311 | PKY | PKY 2026-06 | PKY - Unusual | PKY - QRISDUWIT | PKY - Reversal |                        0 |
+| 421315 | BGI | BGI 2026-06 | BGI - Unusual | BGI - QRISDUWIT | BGI - Reversal |                        0 |
+| 421318 | MRW | MRW 2026-06 | MRW - Unusual | MRW - QRISDUWIT | MRW - Reversal |                        0 |
+| 421320 | TNT | TNT 2026-06 | TNT - Unusual | TNT - QRISDUWIT | TNT - Reversal |                        0 |
 
 Summary worksheets are monthly and derived from the run month:
 
@@ -214,6 +223,13 @@ Unusual worksheets are stable per cluster:
 
 ```text
 <base worksheet> - Unusual
+```
+
+QRISDUWIT and Reversal detail worksheets are also stable per cluster:
+
+```text
+<base worksheet> - QRISDUWIT
+<base worksheet> - Reversal
 ```
 
 The initial balance date for a new monthly summary worksheet is computed as the last day of the previous month. For a run on `2026-06-17`, the starting balance date is `2026-05-31`.
@@ -230,13 +246,19 @@ The initial balance date for a new monthly summary worksheet is computed as the 
 | 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero; adds `Amount`. |
 | 5 | `deduplicate_transactions` | Drops duplicate rows using all columns except `No`, with `Transaction Date` compared at minute precision. |
 | 6 | `flag_unusual_transactions` | Runs fee-rule validation on deduplicated, pre-relabel data and writes `unusual.parquet`. |
-| 7 | `branch_after_unusual_flag` | Runs unusual upload and summary upload path in parallel. |
+| 7 | `branch_after_unusual_flag` | Runs unusual upload, QRISDUWIT detail export, Reversal detail export, and summary upload paths in parallel. |
 | 7a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
 | 7b | `notify_unusual_telegram` | Sends a Telegram alert only when unusual rows exist and the run is not a dry run. |
-| 7c | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
-| 7c.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups after deduplication. |
-| 7c.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
-| 7c.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
+| 7c | `qrisduwit_upload_branch` | Filters `QRISDUWIT` rows, extracts `Disbursement Date` from `Remarks`, and uploads the detail rows. |
+| 7c.1 | `filter_qrisduwit_rows` | Writes `qrisduwit.parquet` from deduplicated rows. |
+| 7c.2 | `upload_qrisduwit_to_sheets` | Appends QRISDUWIT detail rows to `<base worksheet> - QRISDUWIT`. Skipped on dry run. |
+| 7d | `reversal_upload_branch` | Filters `REVERSAL` rows and uploads the detail rows. |
+| 7d.1 | `filter_reversal_rows` | Writes `reversal.parquet` from deduplicated rows. |
+| 7d.2 | `upload_reversal_to_sheets` | Appends Reversal detail rows to `<base worksheet> - Reversal`. Skipped on dry run. |
+| 7e | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
+| 7e.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups after deduplication. |
+| 7e.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
+| 7e.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
 
 On failure, `notify_on_failure` currently logs the flow ID, execution ID, and UI log path.
 
@@ -356,6 +378,43 @@ Current unusual report columns:
 
 Formatting includes fixed column widths, bold colored headers, date and number formats, wrapped remarks/reason columns, and a top border on each appended daily block.
 
+### QRISDUWIT and Reversal detail worksheets
+
+Targets:
+
+```text
+<base worksheet> - QRISDUWIT
+<base worksheet> - Reversal
+```
+
+Examples:
+
+```text
+PKY - QRISDUWIT
+PKY - Reversal
+```
+
+Both detail exports run in parallel with `summary_upload_branch` after deduplication. They filter the source `Transaction` column using case-insensitive exact matching:
+
+| Detail sheet | Transaction match |
+|---|---|
+| QRISDUWIT | `QRISDUWIT` |
+| Reversal | `REVERSAL`, matching source values such as `Reversal` |
+
+QRISDUWIT rows include an extra `DISBURSEMENT DATE` column derived from `Remarks` using the phrase `tanggal DD-MM-YYYY`. For example, this remark:
+
+```text
+Disburse Qris Duwit atas Transaksi pembayaran QRIS pada tanggal 04-06-2026 sejumlah Rp 180,00
+```
+
+produces:
+
+```text
+04/06/2026
+```
+
+Detail worksheets are created if missing. Blank sheets get formatted headers in row 1 and data from row 2. Duplicate-date guard checks whether the report date already exists in the detail sheet.
+
 ---
 
 ## Local Validation
@@ -379,6 +438,7 @@ from pipeline_refactored import (
     validate_and_add_amount,
     drop_duplicate_rows_by_minute,
     flag_unusual_transactions,
+    prepare_transaction_detail_export,
     relabel_out_cluster_transactions,
     summarize_by_transaction,
 )
@@ -388,12 +448,16 @@ df = load_and_validate_schema(path)
 with_amount = validate_and_add_amount(df)
 deduplicated = drop_duplicate_rows_by_minute(with_amount)
 unusual = flag_unusual_transactions(deduplicated)
+qrisduwit = prepare_transaction_detail_export(deduplicated, "QRISDUWIT", include_disbursement_date=True)
+reversal = prepare_transaction_detail_export(deduplicated, "REVERSAL")
 relabeled = relabel_out_cluster_transactions(deduplicated)
 summary = summarize_by_transaction(relabeled)
 print({
     "rows": len(with_amount),
     "deduplicated_rows": len(deduplicated),
     "unusual_rows": len(unusual),
+    "qrisduwit_rows": len(qrisduwit),
+    "reversal_rows": len(reversal),
     "summary_rows": len(summary),
 })
 PY
