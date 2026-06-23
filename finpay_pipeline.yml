@@ -121,7 +121,7 @@ tasks:
       print(f"💰 Balance dt : {starting_balance_date}")
       Kestra.outputs(outputs)
 
-  # ── TASK 2 ─ Determine run date + monthly summary worksheet ─────────────────
+  # ── TASK 2 ─ Determine run date + stable summary worksheet ──────────────────
   - id: determine_current_date
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
@@ -139,15 +139,13 @@ tasks:
       timezone = os.environ["RUN_TIMEZONE"]
       base_worksheet = os.environ["BASE_WORKSHEET"]
       now = datetime.now(ZoneInfo(timezone))
-      month_key = now.strftime("%Y-%m")
-      summary_worksheet = f"{base_worksheet} {month_key}"
+      summary_worksheet = base_worksheet
 
       outputs = {
           "run_date": now.date().isoformat(),
           "run_timestamp": now.isoformat(),
           "run_year": now.strftime("%Y"),
           "run_month": now.strftime("%m"),
-          "run_month_key": month_key,
           "timezone": timezone,
           "summary_worksheet": summary_worksheet,
       }
@@ -215,8 +213,8 @@ tasks:
       print(f"✅ Integrity check passed. Rows: {len(df)}")
       Kestra.outputs({"rows": len(df)})
 
-  # ── TASK 5 ─ Drop duplicate rows using minute-level datetime ────────────────
-  - id: deduplicate_transactions
+  # ── TASK 5 ─ Preprocess transaction labels before unusual detection ─────────
+  - id: preprocess_transaction_labels
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
     pythonVersion: "3.11"
@@ -224,35 +222,46 @@ tasks:
     inputFiles:
       integrity_checked.parquet: "{{ outputs.validate_integrity.outputFiles['integrity_checked.parquet'] }}"
     outputFiles:
-      - deduplicated.parquet
+      - preprocessed.parquet
     script: |
       import sys, pandas as pd
       sys.path.insert(0, "/app")
-      from pipeline import drop_duplicate_rows_by_minute
+      from pipeline import preprocess_transaction_labels
       from kestra import Kestra
 
       df = pd.read_parquet("integrity_checked.parquet")
-      before_rows = len(df)
-      df = drop_duplicate_rows_by_minute(df)
-      after_rows = len(df)
+      before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
+      df = preprocess_transaction_labels(df)
+      after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
 
-      df.to_parquet("deduplicated.parquet", index=False)
+      out_cluster_rows = int(
+          df["Transaction"].isin(["RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"]).sum()
+      )
+      reversal_rows = int(
+          df["Transaction"].astype(str).str.startswith("Reversal - ").sum()
+      )
 
-      print(f"✅ Deduplication complete. Rows: {before_rows} → {after_rows}")
+      df.to_parquet("preprocessed.parquet", index=False)
+
+      print(f"✅ Transaction preprocessing complete. Rows: {len(df)}")
+      print(f"✅ Out-cluster rows relabeled: {out_cluster_rows}")
+      print(f"✅ Reversal rows relabeled: {reversal_rows}")
       Kestra.outputs({
-          "before_rows": before_rows,
-          "after_rows": after_rows,
-          "dropped_rows": before_rows - after_rows,
+          "rows": len(df),
+          "out_cluster_rows": out_cluster_rows,
+          "reversal_rows": reversal_rows,
+          "before_counts": before_counts,
+          "after_counts": after_counts,
       })
 
-  # ── TASK 6 ─ Flag unusual transaction groups from pre-relabel data ──────────
+  # ── TASK 6 ─ Flag unusual rows before calculation dedup ─────────────────────
   - id: flag_unusual_transactions
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
     pythonVersion: "3.11"
     timeout: PT3M
     inputFiles:
-      deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
+      preprocessed.parquet: "{{ outputs.preprocess_transaction_labels.outputFiles['preprocessed.parquet'] }}"
     outputFiles:
       - unusual.parquet
     env:
@@ -269,7 +278,7 @@ tasks:
       iso_date   = os.environ["ISO_DATE"]
       dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-      df = pd.read_parquet("deduplicated.parquet")
+      df = pd.read_parquet("preprocessed.parquet")
       unusual_df = flag_unusual_transactions(df)
       unusual_df.to_parquet("unusual.parquet", index=False)
 
@@ -386,386 +395,441 @@ tasks:
 
             Check the unusual worksheet for further analysis.
 
-      # ── TASK 10 ─ Export QRISDUWIT detail rows ─────────────────────────────
-      - id: qrisduwit_upload_branch
+      # ── TASK 10 ─ Continue calculation/detail processing after unusual flag ──
+      - id: downstream_processing_branch
         type: io.kestra.plugin.core.flow.Sequential
         tasks:
-          - id: filter_qrisduwit_rows
+          - id: deduplicate_transactions
             type: io.kestra.plugin.scripts.python.Script
             containerImage: finpay-pipeline:3.11
             pythonVersion: "3.11"
             timeout: PT3M
             inputFiles:
-              deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
+              preprocessed.parquet: "{{ outputs.preprocess_transaction_labels.outputFiles['preprocessed.parquet'] }}"
             outputFiles:
-              - qrisduwit.parquet
-            env:
-              CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
-              ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-              DRY_RUN: "{{ inputs.dry_run }}"
-            script: |
-              import os, sys, pandas as pd
-              sys.path.insert(0, "/app")
-              from pipeline import prepare_transaction_detail_export
-              from kestra import Kestra
-
-              cluster_id = os.environ["CLUSTER_ID"]
-              iso_date = os.environ["ISO_DATE"]
-              dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
-
-              df = pd.read_parquet("deduplicated.parquet")
-              qrisduwit_df = prepare_transaction_detail_export(
-                  df,
-                  transaction="QRISDUWIT",
-                  include_disbursement_date=True,
-              )
-              qrisduwit_df.to_parquet("qrisduwit.parquet", index=False)
-
-              missing_disbursement_dates = int(
-                  (qrisduwit_df["Disbursement Date"] == "").sum()
-              ) if not qrisduwit_df.empty else 0
-
-              print(f"\n{'='*60}")
-              print(f"QRISDUWIT DETAIL — Cluster {cluster_id} — {iso_date}")
-              if dry_run:
-                  print("⚠️  DRY RUN — QRISDUWIT rows not written to sheet")
-              print(f"{'='*60}")
-              if qrisduwit_df.empty:
-                  print("No QRISDUWIT rows found.")
-              else:
-                  display_cols = [
-                      "No", "Transaction Date", "Transaction ID", "Transaction",
-                      "Kredit", "Debet", "Disbursement Date", "Remarks",
-                  ]
-                  print(qrisduwit_df[[c for c in display_cols if c in qrisduwit_df.columns]].to_string(index=False))
-              print(f"{'='*60}\n")
-
-              Kestra.outputs({
-                  "rows": len(qrisduwit_df),
-                  "missing_disbursement_dates": missing_disbursement_dates,
-              })
-
-          - id: upload_qrisduwit_to_sheets
-            type: io.kestra.plugin.scripts.python.Script
-            runIf: "{{ inputs.dry_run == false }}"
-            containerImage: finpay-pipeline:3.11
-            pythonVersion: "3.11"
-            timeout: PT10M
-            retry:
-              type: exponential
-              interval: PT15S
-              maxInterval: PT60S
-              maxAttempts: 3
-            inputFiles:
-              qrisduwit.parquet: "{{ outputs.filter_qrisduwit_rows.outputFiles['qrisduwit.parquet'] }}"
-            env:
-              TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
-              TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.qrisduwit_worksheet }}"
-              SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
-            script: |
-              import os, sys, tempfile, pandas as pd
-              sys.path.insert(0, "/app")
-              from pipeline import process_transaction_detail_upload, make_gspread_client
-              from kestra import Kestra
-
-              sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
-              if not sa_key_json or sa_key_json.strip() == "{}":
-                  print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
-                  sys.exit(1)
-
-              sa_key_path = None
-              try:
-                  with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-                      f.write(sa_key_json)
-                      sa_key_path = f.name
-
-                  qrisduwit_df = pd.read_parquet("qrisduwit.parquet")
-                  client = make_gspread_client(sa_key_path)
-
-                  written = process_transaction_detail_upload(
-                      target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
-                      target_worksheet=os.environ["TARGET_WORKSHEET"],
-                      detail_df=qrisduwit_df,
-                      gspread_client=client,
-                      include_disbursement_date=True,
-                  )
-
-                  if len(qrisduwit_df) == 0:
-                      status = "no_rows"
-                  else:
-                      status = "success" if written else "skipped_duplicate"
-                  print(f"✅ QRISDUWIT upload status: {status}. Rows: {len(qrisduwit_df)}")
-                  Kestra.outputs({
-                      "status": status,
-                      "rows": len(qrisduwit_df),
-                      "worksheet": os.environ["TARGET_WORKSHEET"],
-                  })
-              finally:
-                  if sa_key_path and os.path.exists(sa_key_path):
-                      os.unlink(sa_key_path)
-
-      # ── TASK 11 ─ Export REVERSAL detail rows ──────────────────────────────
-      - id: reversal_upload_branch
-        type: io.kestra.plugin.core.flow.Sequential
-        tasks:
-          - id: filter_reversal_rows
-            type: io.kestra.plugin.scripts.python.Script
-            containerImage: finpay-pipeline:3.11
-            pythonVersion: "3.11"
-            timeout: PT3M
-            inputFiles:
-              deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
-            outputFiles:
-              - reversal.parquet
-            env:
-              CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
-              ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-              DRY_RUN: "{{ inputs.dry_run }}"
-            script: |
-              import os, sys, pandas as pd
-              sys.path.insert(0, "/app")
-              from pipeline import prepare_transaction_detail_export
-              from kestra import Kestra
-
-              cluster_id = os.environ["CLUSTER_ID"]
-              iso_date = os.environ["ISO_DATE"]
-              dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
-
-              df = pd.read_parquet("deduplicated.parquet")
-              reversal_df = prepare_transaction_detail_export(
-                  df,
-                  transaction="REVERSAL",
-                  include_disbursement_date=False,
-              )
-              reversal_df.to_parquet("reversal.parquet", index=False)
-
-              print(f"\n{'='*60}")
-              print(f"REVERSAL DETAIL — Cluster {cluster_id} — {iso_date}")
-              if dry_run:
-                  print("⚠️  DRY RUN — REVERSAL rows not written to sheet")
-              print(f"{'='*60}")
-              if reversal_df.empty:
-                  print("No REVERSAL rows found.")
-              else:
-                  display_cols = [
-                      "No", "Transaction Date", "Transaction ID", "Transaction",
-                      "Kredit", "Debet", "Remarks",
-                  ]
-                  print(reversal_df[[c for c in display_cols if c in reversal_df.columns]].to_string(index=False))
-              print(f"{'='*60}\n")
-
-              Kestra.outputs({"rows": len(reversal_df)})
-
-          - id: upload_reversal_to_sheets
-            type: io.kestra.plugin.scripts.python.Script
-            runIf: "{{ inputs.dry_run == false }}"
-            containerImage: finpay-pipeline:3.11
-            pythonVersion: "3.11"
-            timeout: PT10M
-            retry:
-              type: exponential
-              interval: PT15S
-              maxInterval: PT60S
-              maxAttempts: 3
-            inputFiles:
-              reversal.parquet: "{{ outputs.filter_reversal_rows.outputFiles['reversal.parquet'] }}"
-            env:
-              TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
-              TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.reversal_worksheet }}"
-              SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
-            script: |
-              import os, sys, tempfile, pandas as pd
-              sys.path.insert(0, "/app")
-              from pipeline import process_transaction_detail_upload, make_gspread_client
-              from kestra import Kestra
-
-              sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
-              if not sa_key_json or sa_key_json.strip() == "{}":
-                  print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
-                  sys.exit(1)
-
-              sa_key_path = None
-              try:
-                  with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-                      f.write(sa_key_json)
-                      sa_key_path = f.name
-
-                  reversal_df = pd.read_parquet("reversal.parquet")
-                  client = make_gspread_client(sa_key_path)
-
-                  written = process_transaction_detail_upload(
-                      target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
-                      target_worksheet=os.environ["TARGET_WORKSHEET"],
-                      detail_df=reversal_df,
-                      gspread_client=client,
-                      include_disbursement_date=False,
-                  )
-
-                  if len(reversal_df) == 0:
-                      status = "no_rows"
-                  else:
-                      status = "success" if written else "skipped_duplicate"
-                  print(f"✅ REVERSAL upload status: {status}. Rows: {len(reversal_df)}")
-                  Kestra.outputs({
-                      "status": status,
-                      "rows": len(reversal_df),
-                      "worksheet": os.environ["TARGET_WORKSHEET"],
-                  })
-              finally:
-                  if sa_key_path and os.path.exists(sa_key_path):
-                      os.unlink(sa_key_path)
-
-      # ── TASKS 6-7 ─ Relabel, summarize, then upload summary ─────────────────
-      - id: summary_upload_branch
-        type: io.kestra.plugin.core.flow.Sequential
-        tasks:
-          # ── TASK 6a ─ Relabel out-cluster transactions for summary ──────────
-          - id: relabel_out_cluster
-            type: io.kestra.plugin.scripts.python.Script
-            containerImage: finpay-pipeline:3.11
-            pythonVersion: "3.11"
-            timeout: PT3M
-            inputFiles:
-              deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
-            outputFiles:
-              - relabeled.parquet
+              - deduplicated.parquet
             script: |
               import sys, pandas as pd
               sys.path.insert(0, "/app")
-              from pipeline import relabel_out_cluster_transactions
+              from pipeline import drop_duplicate_rows_by_minute
               from kestra import Kestra
 
-              df = pd.read_parquet("deduplicated.parquet")
-              before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
+              df = pd.read_parquet("preprocessed.parquet")
+              before_rows = len(df)
+              df = drop_duplicate_rows_by_minute(df)
+              after_rows = len(df)
 
-              df = relabel_out_cluster_transactions(df)
-              after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
-              out_cluster_rows = int(
-                  df["Transaction"].isin(["RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"]).sum()
-              )
+              df.to_parquet("deduplicated.parquet", index=False)
 
-              df.to_parquet("relabeled.parquet", index=False)
-
-              print(f"✅ Relabel step complete. Out-cluster rows: {out_cluster_rows}")
+              print(f"✅ Deduplication complete. Rows: {before_rows} → {after_rows}")
               Kestra.outputs({
-                  "rows": len(df),
-                  "out_cluster_rows": out_cluster_rows,
-                  "before_counts": before_counts,
-                  "after_counts": after_counts,
+                  "before_rows": before_rows,
+                  "after_rows": after_rows,
+                  "dropped_rows": before_rows - after_rows,
               })
 
-          # ── TASK 6b ─ Summarize by transaction ──────────────────────────────
-          - id: summarize
-            type: io.kestra.plugin.scripts.python.Script
-            containerImage: finpay-pipeline:3.11
-            pythonVersion: "3.11"
-            timeout: PT3M
-            inputFiles:
-              relabeled.parquet: "{{ outputs.relabel_out_cluster.outputFiles['relabeled.parquet'] }}"
-            outputFiles:
-              - summary.parquet
-            env:
-              CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
-              ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-              DRY_RUN: "{{ inputs.dry_run }}"
-            script: |
-              import os, sys, pandas as pd
-              sys.path.insert(0, "/app")
-              from pipeline import summarize_by_transaction
-              from kestra import Kestra
+          - id: post_dedup_branches
+            type: io.kestra.plugin.core.flow.Parallel
+            tasks:
+              # ── TASK 10 ─ Export QRISDUWIT detail rows ─────────────────────────────
+              - id: qrisduwit_upload_branch
+                type: io.kestra.plugin.core.flow.Sequential
+                tasks:
+                  - id: filter_qrisduwit_rows
+                    type: io.kestra.plugin.scripts.python.Script
+                    containerImage: finpay-pipeline:3.11
+                    pythonVersion: "3.11"
+                    timeout: PT3M
+                    inputFiles:
+                      deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
+                    outputFiles:
+                      - qrisduwit.parquet
+                    env:
+                      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+                      DRY_RUN: "{{ inputs.dry_run }}"
+                    script: |
+                      import os, sys, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import prepare_transaction_detail_export
+                      from kestra import Kestra
 
-              cluster_id = os.environ["CLUSTER_ID"]
-              iso_date   = os.environ["ISO_DATE"]
-              dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
+                      cluster_id = os.environ["CLUSTER_ID"]
+                      iso_date = os.environ["ISO_DATE"]
+                      dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-              df         = pd.read_parquet("relabeled.parquet")
-              summary_df = summarize_by_transaction(df)
+                      df = pd.read_parquet("deduplicated.parquet")
+                      qrisduwit_df = prepare_transaction_detail_export(
+                          df,
+                          transaction="QRISDUWIT",
+                          include_disbursement_date=True,
+                      )
+                      qrisduwit_df.to_parquet("qrisduwit.parquet", index=False)
 
-              print(f"\n{'='*60}")
-              print(f"SUMMARY — Cluster {cluster_id} — {iso_date}")
-              if dry_run:
-                  print("⚠️  DRY RUN — not written to sheet")
-              print(f"{'='*60}")
-              print(summary_df.to_string(index=False))
-              print(f"{'='*60}\n")
+                      missing_disbursement_dates = int(
+                          (qrisduwit_df["Disbursement Date"] == "").sum()
+                      ) if not qrisduwit_df.empty else 0
 
-              total_credit = float(summary_df["Sum_of_Kredit"].sum())
-              total_debet  = float(summary_df["Sum_of_Debet"].sum())
+                      print(f"\n{'='*60}")
+                      print(f"QRISDUWIT DETAIL — Cluster {cluster_id} — {iso_date}")
+                      if dry_run:
+                          print("⚠️  DRY RUN — QRISDUWIT rows not written to sheet")
+                      print(f"{'='*60}")
+                      if qrisduwit_df.empty:
+                          print("No QRISDUWIT rows found.")
+                      else:
+                          display_cols = [
+                              "No", "Transaction Date", "Transaction ID", "Transaction",
+                              "Kredit", "Debet", "Disbursement Date", "Remarks",
+                          ]
+                          print(qrisduwit_df[[c for c in display_cols if c in qrisduwit_df.columns]].to_string(index=False))
+                      print(f"{'='*60}\n")
 
-              summary_df.to_parquet("summary.parquet", index=False)
-              Kestra.outputs({
-                  "transaction_count": len(summary_df),
-                  "transactions":      summary_df["Transaction"].tolist(),
-                  "total_credit":      total_credit,
-                  "total_debet":       total_debet,
-              })
-
-          # ── TASK 7 ─ Upload summary to Google Sheets ────────────────────────
-          - id: upload_to_sheets
-            type: io.kestra.plugin.scripts.python.Script
-            runIf: "{{ inputs.dry_run == false }}"
-            containerImage: finpay-pipeline:3.11
-            pythonVersion: "3.11"
-            timeout: PT10M
-            retry:
-              type: exponential
-              interval: PT15S
-              maxInterval: PT60S
-              maxAttempts: 3
-            inputFiles:
-              summary.parquet: "{{ outputs.summarize.outputFiles['summary.parquet'] }}"
-            env:
-              TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
-              TARGET_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_worksheet }}"
-              STARTING_BALANCE_DATE: "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
-              DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
-              SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
-            script: |
-              import os, sys, json, tempfile, pandas as pd
-              sys.path.insert(0, "/app")
-              from pipeline import process_daily_upload, make_gspread_client
-              from kestra import Kestra
-
-              sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
-              if not sa_key_json or sa_key_json.strip() == "{}":
-                  print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
-                  sys.exit(1)
-
-              sa_key_path = None
-              try:
-                  with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-                      f.write(sa_key_json)
-                      sa_key_path = f.name
-
-                  summary_df = pd.read_parquet("summary.parquet")
-                  client     = make_gspread_client(sa_key_path)
-
-                  insert_row, footer_end = process_daily_upload(
-                      target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
-                      target_worksheet=os.environ["TARGET_WORKSHEET"],
-                      summary_df=summary_df,
-                      starting_balance_date=os.environ["STARTING_BALANCE_DATE"],
-                      default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
-                      gspread_client=client,
-                  )
-
-                  if insert_row is None:
-                      print("⚠️  Sheet duplicate guard — date already exists.")
                       Kestra.outputs({
-                          "status": "skipped_duplicate",
-                          "worksheet": os.environ["TARGET_WORKSHEET"],
+                          "rows": len(qrisduwit_df),
+                          "missing_disbursement_dates": missing_disbursement_dates,
                       })
-                  else:
-                      print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
+
+                  - id: upload_qrisduwit_to_sheets
+                    type: io.kestra.plugin.scripts.python.Script
+                    runIf: "{{ inputs.dry_run == false }}"
+                    containerImage: finpay-pipeline:3.11
+                    pythonVersion: "3.11"
+                    timeout: PT10M
+                    retry:
+                      type: exponential
+                      interval: PT15S
+                      maxInterval: PT60S
+                      maxAttempts: 3
+                    inputFiles:
+                      qrisduwit.parquet: "{{ outputs.filter_qrisduwit_rows.outputFiles['qrisduwit.parquet'] }}"
+                    env:
+                      TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
+                      TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.qrisduwit_worksheet }}"
+                      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+                    script: |
+                      import os, sys, tempfile, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import process_transaction_detail_upload, make_gspread_client
+                      from kestra import Kestra
+
+                      sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+                      if not sa_key_json or sa_key_json.strip() == "{}":
+                          print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
+                          sys.exit(1)
+
+                      sa_key_path = None
+                      try:
+                          with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                              f.write(sa_key_json)
+                              sa_key_path = f.name
+
+                          qrisduwit_df = pd.read_parquet("qrisduwit.parquet")
+                          client = make_gspread_client(sa_key_path)
+
+                          written = process_transaction_detail_upload(
+                              target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+                              target_worksheet=os.environ["TARGET_WORKSHEET"],
+                              detail_df=qrisduwit_df,
+                              gspread_client=client,
+                              include_disbursement_date=True,
+                          )
+
+                          if len(qrisduwit_df) == 0:
+                              status = "no_rows"
+                          else:
+                              status = "success" if written else "skipped_duplicate"
+                          print(f"✅ QRISDUWIT upload status: {status}. Rows: {len(qrisduwit_df)}")
+                          Kestra.outputs({
+                              "status": status,
+                              "rows": len(qrisduwit_df),
+                              "worksheet": os.environ["TARGET_WORKSHEET"],
+                          })
+                      finally:
+                          if sa_key_path and os.path.exists(sa_key_path):
+                              os.unlink(sa_key_path)
+
+              # ── TASK 11 ─ Export REVERSAL detail rows ──────────────────────────────
+              - id: reversal_upload_branch
+                type: io.kestra.plugin.core.flow.Sequential
+                tasks:
+                  - id: filter_reversal_rows
+                    type: io.kestra.plugin.scripts.python.Script
+                    containerImage: finpay-pipeline:3.11
+                    pythonVersion: "3.11"
+                    timeout: PT3M
+                    inputFiles:
+                      deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
+                    outputFiles:
+                      - reversal.parquet
+                    env:
+                      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+                      DRY_RUN: "{{ inputs.dry_run }}"
+                    script: |
+                      import os, sys, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import prepare_reversal_detail_export
+                      from kestra import Kestra
+
+                      cluster_id = os.environ["CLUSTER_ID"]
+                      iso_date = os.environ["ISO_DATE"]
+                      dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+                      df = pd.read_parquet("deduplicated.parquet")
+                      reversal_df = prepare_reversal_detail_export(df)
+                      reversal_df.to_parquet("reversal.parquet", index=False)
+
+                      print(f"\n{'='*60}")
+                      print(f"REVERSAL DETAIL — Cluster {cluster_id} — {iso_date}")
+                      if dry_run:
+                          print("⚠️  DRY RUN — REVERSAL rows not written to sheet")
+                      print(f"{'='*60}")
+                      if reversal_df.empty:
+                          print("No REVERSAL rows found.")
+                      else:
+                          display_cols = [
+                              "No", "Transaction Date", "Transaction ID", "Transaction",
+                              "Kredit", "Debet", "Remarks",
+                          ]
+                          print(reversal_df[[c for c in display_cols if c in reversal_df.columns]].to_string(index=False))
+                      print(f"{'='*60}\n")
+
+                      Kestra.outputs({"rows": len(reversal_df)})
+
+                  - id: upload_reversal_to_sheets
+                    type: io.kestra.plugin.scripts.python.Script
+                    runIf: "{{ inputs.dry_run == false }}"
+                    containerImage: finpay-pipeline:3.11
+                    pythonVersion: "3.11"
+                    timeout: PT10M
+                    retry:
+                      type: exponential
+                      interval: PT15S
+                      maxInterval: PT60S
+                      maxAttempts: 3
+                    inputFiles:
+                      reversal.parquet: "{{ outputs.filter_reversal_rows.outputFiles['reversal.parquet'] }}"
+                    env:
+                      TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
+                      TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.reversal_worksheet }}"
+                      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+                    script: |
+                      import os, sys, tempfile, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import process_transaction_detail_upload, make_gspread_client
+                      from kestra import Kestra
+
+                      sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+                      if not sa_key_json or sa_key_json.strip() == "{}":
+                          print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
+                          sys.exit(1)
+
+                      sa_key_path = None
+                      try:
+                          with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                              f.write(sa_key_json)
+                              sa_key_path = f.name
+
+                          reversal_df = pd.read_parquet("reversal.parquet")
+                          client = make_gspread_client(sa_key_path)
+
+                          written = process_transaction_detail_upload(
+                              target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+                              target_worksheet=os.environ["TARGET_WORKSHEET"],
+                              detail_df=reversal_df,
+                              gspread_client=client,
+                              include_disbursement_date=False,
+                          )
+
+                          if len(reversal_df) == 0:
+                              status = "no_rows"
+                          else:
+                              status = "success" if written else "skipped_duplicate"
+                          print(f"✅ REVERSAL upload status: {status}. Rows: {len(reversal_df)}")
+                          Kestra.outputs({
+                              "status": status,
+                              "rows": len(reversal_df),
+                              "worksheet": os.environ["TARGET_WORKSHEET"],
+                          })
+                      finally:
+                          if sa_key_path and os.path.exists(sa_key_path):
+                              os.unlink(sa_key_path)
+
+              # ── TASKS 6-7 ─ Prepare, summarize, then upload summary ─────────────────
+              - id: summary_upload_branch
+                type: io.kestra.plugin.core.flow.Sequential
+                tasks:
+                  # ── TASK 6a ─ Remove reversal rows excluded from summary ────────────
+                  - id: prepare_summary_transactions
+                    type: io.kestra.plugin.scripts.python.Script
+                    containerImage: finpay-pipeline:3.11
+                    pythonVersion: "3.11"
+                    timeout: PT3M
+                    inputFiles:
+                      deduplicated.parquet: "{{ outputs.deduplicate_transactions.outputFiles['deduplicated.parquet'] }}"
+                    outputFiles:
+                      - summary_ready.parquet
+                    script: |
+                      import sys, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import prepare_reversal_summary_transactions
+                      from kestra import Kestra
+
+                      df = pd.read_parquet("deduplicated.parquet")
+                      before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
+
+                      df, reversal_unusual_df = prepare_reversal_summary_transactions(df)
+                      after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
+                      out_cluster_rows = int(
+                          df["Transaction"].isin(["RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"]).sum()
+                      )
+                      reversal_rows = int(
+                          df["Transaction"].astype(str).str.startswith("Reversal - ").sum()
+                      )
+                      reversal_unusual_rows = len(reversal_unusual_df)
+                      if reversal_unusual_df.empty:
+                          reversal_excluded_rows = 0
+                          reversal_included_unusual_rows = 0
+                      else:
+                          reversal_reasons = reversal_unusual_df["unusual_reason"].astype(str)
+                          reversal_excluded_rows = int(
+                              reversal_reasons.str.contains("excluded from summary", regex=False).sum()
+                          )
+                          reversal_included_unusual_rows = int(
+                              reversal_reasons.str.contains("included in summary", regex=False).sum()
+                          )
+
+                      df.to_parquet("summary_ready.parquet", index=False)
+
+                      print(f"✅ Summary preparation complete. Out-cluster rows: {out_cluster_rows}")
+                      print(f"✅ Reversal summary rows: {reversal_rows}")
+                      print(f"⚠️  Reversal unusual rows flagged: {reversal_unusual_rows}")
+                      print(f"⚠️  Reversal unusual rows included in summary: {reversal_included_unusual_rows}")
+                      print(f"⚠️  Reversal rows excluded from summary: {reversal_excluded_rows}")
                       Kestra.outputs({
-                          "status": "success",
-                          "worksheet": os.environ["TARGET_WORKSHEET"],
-                          "insert_row": insert_row,
-                          "footer_end": footer_end,
+                          "rows": len(df),
+                          "out_cluster_rows": out_cluster_rows,
+                          "reversal_summary_rows": reversal_rows,
+                          "reversal_unusual_rows": reversal_unusual_rows,
+                          "reversal_included_unusual_rows": reversal_included_unusual_rows,
+                          "reversal_excluded_rows": reversal_excluded_rows,
+                          "before_counts": before_counts,
+                          "after_counts": after_counts,
                       })
-              finally:
-                  if sa_key_path and os.path.exists(sa_key_path):
-                      os.unlink(sa_key_path)
+
+                  # ── TASK 6b ─ Summarize by transaction ──────────────────────────────
+                  - id: summarize
+                    type: io.kestra.plugin.scripts.python.Script
+                    containerImage: finpay-pipeline:3.11
+                    pythonVersion: "3.11"
+                    timeout: PT3M
+                    inputFiles:
+                      summary_ready.parquet: "{{ outputs.prepare_summary_transactions.outputFiles['summary_ready.parquet'] }}"
+                    outputFiles:
+                      - summary.parquet
+                    env:
+                      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+                      DRY_RUN: "{{ inputs.dry_run }}"
+                    script: |
+                      import os, sys, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import summarize_by_transaction
+                      from kestra import Kestra
+
+                      cluster_id = os.environ["CLUSTER_ID"]
+                      iso_date   = os.environ["ISO_DATE"]
+                      dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+                      df         = pd.read_parquet("summary_ready.parquet")
+                      summary_df = summarize_by_transaction(df)
+
+                      print(f"\n{'='*60}")
+                      print(f"SUMMARY — Cluster {cluster_id} — {iso_date}")
+                      if dry_run:
+                          print("⚠️  DRY RUN — not written to sheet")
+                      print(f"{'='*60}")
+                      print(summary_df.to_string(index=False))
+                      print(f"{'='*60}\n")
+
+                      total_credit = float(summary_df["Sum_of_Kredit"].sum())
+                      total_debet  = float(summary_df["Sum_of_Debet"].sum())
+
+                      summary_df.to_parquet("summary.parquet", index=False)
+                      Kestra.outputs({
+                          "transaction_count": len(summary_df),
+                          "transactions":      summary_df["Transaction"].tolist(),
+                          "total_credit":      total_credit,
+                          "total_debet":       total_debet,
+                      })
+
+                  # ── TASK 7 ─ Upload summary to Google Sheets ────────────────────────
+                  - id: upload_to_sheets
+                    type: io.kestra.plugin.scripts.python.Script
+                    runIf: "{{ inputs.dry_run == false }}"
+                    containerImage: finpay-pipeline:3.11
+                    pythonVersion: "3.11"
+                    timeout: PT10M
+                    retry:
+                      type: exponential
+                      interval: PT15S
+                      maxInterval: PT60S
+                      maxAttempts: 3
+                    inputFiles:
+                      summary.parquet: "{{ outputs.summarize.outputFiles['summary.parquet'] }}"
+                    env:
+                      TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
+                      TARGET_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_worksheet }}"
+                      STARTING_BALANCE_DATE: "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
+                      DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
+                      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+                    script: |
+                      import os, sys, json, tempfile, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import process_daily_upload, make_gspread_client
+                      from kestra import Kestra
+
+                      sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+                      if not sa_key_json or sa_key_json.strip() == "{}":
+                          print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
+                          sys.exit(1)
+
+                      sa_key_path = None
+                      try:
+                          with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                              f.write(sa_key_json)
+                              sa_key_path = f.name
+
+                          summary_df = pd.read_parquet("summary.parquet")
+                          client     = make_gspread_client(sa_key_path)
+
+                          insert_row, footer_end = process_daily_upload(
+                              target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+                              target_worksheet=os.environ["TARGET_WORKSHEET"],
+                              summary_df=summary_df,
+                              starting_balance_date=os.environ["STARTING_BALANCE_DATE"],
+                              default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
+                              gspread_client=client,
+                          )
+
+                          if insert_row is None:
+                              print("⚠️  Sheet duplicate guard — date already exists.")
+                              Kestra.outputs({
+                                  "status": "skipped_duplicate",
+                                  "worksheet": os.environ["TARGET_WORKSHEET"],
+                              })
+                          else:
+                              print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
+                              Kestra.outputs({
+                                  "status": "success",
+                                  "worksheet": os.environ["TARGET_WORKSHEET"],
+                                  "insert_row": insert_row,
+                                  "footer_end": footer_end,
+                              })
+                      finally:
+                          if sa_key_path and os.path.exists(sa_key_path):
+                              os.unlink(sa_key_path)
 
 errors:
   # ── TODO: replace with a real notification plugin once your channel is ready ──

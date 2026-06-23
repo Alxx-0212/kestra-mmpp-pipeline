@@ -222,28 +222,95 @@ def validate_debit_credit_integrity(df: pd.DataFrame) -> pd.DataFrame:
 # STEP 2a  preprocessing: drop duplicate rows
 # ─────────────────────────────────────────────────────────────────────────────
 
+DUPLICATE_UNUSUAL_REASON = "duplicate row removed from calculation"
+
+
+def _minute_level_dedup_key(df: pd.DataFrame) -> pd.DataFrame:
+    dedup_key = df.copy()
+    if "No" in dedup_key.columns:
+        dedup_key = dedup_key.drop(columns="No")
+    dedup_key["Transaction Date"] = (
+        pd.to_datetime(dedup_key["Transaction Date"]).dt.floor("min")
+    )
+    return dedup_key
+
+
+def _duplicate_unusual_reason(
+    duplicate_row: pd.Series,
+    kept_row: pd.Series,
+    duplicate_minute,
+) -> str:
+    minute_display = ""
+    if not pd.isna(duplicate_minute):
+        minute_display = pd.to_datetime(duplicate_minute).strftime("%Y-%m-%d %H:%M")
+
+    return (
+        f"{DUPLICATE_UNUSUAL_REASON}"
+        f"; duplicate of No={kept_row.get('No', '')}"
+        f"; duplicate key minute={minute_display}"
+        f"; duplicate Transaction ID={duplicate_row.get('Transaction ID', '')}"
+    )
+
+
+def deduplicate_rows_by_minute_with_report(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split rows into calculation-ready rows and duplicate rows for unusual logging.
+
+    Duplicate detection uses all columns except No as the comparison key.
+    Transaction Date is compared at minute precision only.
+    The original Transaction Date value is preserved in both returned DataFrames.
+    """
+    result = df.copy()
+    dedup_key = _minute_level_dedup_key(result)
+
+    duplicate_mask = dedup_key.duplicated(keep="first")
+    dropped_rows = int(duplicate_mask.sum())
+    print(f"Duplicate rows dropped using minute-level datetime: {dropped_rows}")
+
+    first_index_by_key = {}
+    duplicate_of_by_index = {}
+    for idx, row in dedup_key.iterrows():
+        key = tuple(row.tolist())
+        if key in first_index_by_key:
+            duplicate_of_by_index[idx] = first_index_by_key[key]
+        else:
+            first_index_by_key[key] = idx
+
+    deduplicated = result.loc[~duplicate_mask].reset_index(drop=True)
+    duplicate_unusual = result.loc[duplicate_mask].copy()
+
+    if duplicate_unusual.empty:
+        duplicate_unusual["base_id"] = pd.Series(dtype="object")
+        duplicate_unusual["unusual_reason"] = pd.Series(dtype="object")
+        return deduplicated, duplicate_unusual
+
+    duplicate_unusual["base_id"] = (
+        duplicate_unusual["Transaction ID"]
+        .astype(str)
+        .str.replace(r"(SLSFEE|SALESFEE|FEE)$", "", regex=True)
+    )
+    duplicate_unusual["unusual_reason"] = [
+        _duplicate_unusual_reason(
+            row,
+            result.loc[duplicate_of_by_index[idx]],
+            dedup_key.loc[idx, "Transaction Date"],
+        )
+        for idx, row in duplicate_unusual.iterrows()
+    ]
+
+    return deduplicated, duplicate_unusual.reset_index(drop=True)
+
+
 def drop_duplicate_rows_by_minute(df: pd.DataFrame) -> pd.DataFrame:
     """
     Drop duplicate rows using all columns except No as the comparison key.
     Transaction Date is compared at minute precision only.
     The original Transaction Date value is preserved in the returned rows.
     """
-    result = df.copy()
-    dedup_key = result.copy()
-    if "No" in dedup_key.columns:
-        dedup_key = dedup_key.drop(columns="No")
-    dedup_key["Transaction Date"] = (
-        pd.to_datetime(dedup_key["Transaction Date"]).dt.floor("min")
-    )
-
-    duplicate_mask = dedup_key.duplicated(keep="first")
-    dropped_rows = int(duplicate_mask.sum())
-    print(f"Duplicate rows dropped using minute-level datetime: {dropped_rows}")
-
-    if dropped_rows == 0:
-        return result
-
-    return result.loc[~duplicate_mask].reset_index(drop=True)
+    deduplicated, _ = deduplicate_rows_by_minute_with_report(df)
+    return deduplicated
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,7 +433,11 @@ def append_daily_to_gsheet(
         ("BIAYA FEE NGRS",             "RECHARGEFEE"),
         ("RECHARGE OUT CLUSTER",       "RECHARGE OUT CLUSTER"),
         ("RECHARGE OUT CLUSTER FEE",   "RECHARGE OUT CLUSTER FEE"),
-        ("REVERSAL",                   "Reversal"),
+        ("REVERSAL NGRS",              REVERSAL_NGRS_CATEGORY),
+        ("REVERSAL NGRS FEE",          REVERSAL_NGRS_FEE_CATEGORY),
+        ("REVERSAL ST",                REVERSAL_ST_CATEGORY),
+        ("REVERSAL ST SELLTHRUFEE",    REVERSAL_ST_SELLTHRU_FEE_CATEGORY),
+        ("REVERSAL ST SELLTHRUSALESFEE", REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY),
         ("ST",                         "SELLTHRU"),
         ("BIAYA FEE ST",               "SELLTHRUFEE"),
         ("BIAYA FEE BAR A. ST",        "SELLTHRUSALESFEE"),
@@ -389,28 +460,43 @@ def append_daily_to_gsheet(
     # Row offsets from insert_row (matches KETERANGAN order):
     #  +1 QRISDUWIT  +2 DISBURSEMENT  +3 FeeTransaksi
     #  +4 RECHARGE   +5 RECHARGEFEE   +6 RECHARGE OUT CLUSTER
-    #  +7 RECHARGE OUT CLUSTER FEE    +8 Reversal   +9 SELLTHRU
-    #  +10 SELLTHRUFEE  +11 SELLTHRUSALESFEE
+    #  +7 RECHARGE OUT CLUSTER FEE    +8 Reversal NGRS
+    #  +9 Reversal NGRS FEE  +10 Reversal ST
+    #  +11 Reversal ST SELLTHRUFEE  +12 Reversal ST SELLTHRUSALESFEE
+    #  +13 SELLTHRU  +14 SELLTHRUFEE  +15 SELLTHRUSALESFEE
     ir = insert_row
-    n  = len(KETERANGAN)   # = 10  -> footer rows start at ir + n
+    n  = len(KETERANGAN)   # footer rows start at ir + n
     footer_formulas = [
-        # NGRS  = net(RECHARGE + RECHARGEFEE + RECHARGE OUT CLUSTER + Reversal)
-        f"=C{ir+4}-D{ir+4}+C{ir+5}-D{ir+5}+C{ir+6}-D{ir+6}+C{ir+7}-D{ir+7}+C{ir+8}-D{ir+8}",
+        # NGRS = net(RECHARGE family only)
+        f"=C{ir+4}-D{ir+4}+C{ir+5}-D{ir+5}+C{ir+6}-D{ir+6}+C{ir+7}-D{ir+7}",
+        # Reversal - NGRS = net(Reversal NGRS - Reversal NGRS fee)
+        f"=(C{ir+8}-D{ir+8})+(C{ir+9}-D{ir+9})",
         # PPOB  = net(FeeTransaksi)
         f"=C{ir+3}-D{ir+3}",
-        # ST    = net(SELLTHRU + SELLTHRUFEE + SELLTHRUSALESFEE)
-        f"=C{ir+9}-D{ir+9}+C{ir+10}-D{ir+10}+C{ir+11}-D{ir+11}",
+        # ST = net(SELLTHRU family only)
+        f"=C{ir+13}-D{ir+13}+C{ir+14}-D{ir+14}+C{ir+15}-D{ir+15}",
+        # Reversal - ST = net(Reversal ST - reversal sellthru fees)
+        f"=(C{ir+10}-D{ir+10})+(C{ir+11}-D{ir+11})+(C{ir+12}-D{ir+12})",
         # DISBURSEMENT
         f"=C{ir+2}-D{ir+2}",
         # QRISDUWIT
         f"=C{ir+1}-D{ir+1}",
     ]
-    # Total = sum of the five footer C-cells above
+    # Total = sum of the footer C-cells above
     footer_formulas.append(
         "=" + "+".join(f"C{ir + n + j}" for j in range(len(footer_formulas)))
     )
 
-    FOOTER_LABELS = ["NGRS", "PPOB", "ST", "DISBURSEMENT", "QRISDUWIT", "Total"]
+    FOOTER_LABELS = [
+        "NGRS",
+        "Reversal - NGRS",
+        "PPOB",
+        "ST",
+        "Reversal - ST",
+        "DISBURSEMENT",
+        "QRISDUWIT",
+        "Total",
+    ]
     for i, f_label in enumerate(FOOTER_LABELS):
         rows_to_append.append([formatted_date if i == 0 else "", f_label, footer_formulas[i], "", ""])
         r += 1
@@ -492,16 +578,96 @@ def make_gspread_client(sa_key_path: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2b  preprocessing: relabel RECHARGE out-cluster transactions
+# STEP 2b  preprocessing: relabel transaction categories
 # ─────────────────────────────────────────────────────────────────────────────
 
 SUMMARY_OUT_CLUSTER_REMARK = 'fee pembelian recharge out cluster'
 UNUSUAL_RECHARGE_EXEMPT_REMARK = 'biaya pembelian recharge out cluster'
 
-# Fee validation rules: txn_type -> {fee_type: expected_total_debet, None = presence check only}
-FEE_RULES = {
-    'RECHARGE':             {'RECHARGEFEE':              20  },
-    'SELLTHRU':             {'SELLTHRUFEE': 100, 'SELLTHRUSALESFEE': None},
+REVERSAL_TRANSACTION = 'REVERSAL'
+REVERSAL_NGRS_CATEGORY = 'Reversal - NGRS'
+REVERSAL_NGRS_FEE_CATEGORY = 'Reversal - NGRS FEE'
+REVERSAL_ST_CATEGORY = 'Reversal - ST'
+REVERSAL_ST_SELLTHRU_FEE_CATEGORY = 'Reversal - ST SELLTHRUFEE'
+REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY = 'Reversal - ST SELLTHRUSALESFEE'
+REVERSAL_NGRS_MAIN_REMARK = 'biaya pembelian recharge'
+REVERSAL_NGRS_PLATFORM_FEE_REMARK = 'platform fee recharge rp. 20,-'
+REVERSAL_ST_MAIN_REMARK = 'sellthru sales fee'
+REVERSAL_ST_PLATFORM_FEE_REMARK = 'platform fee sellthru rp. 100,-'
+REVERSAL_ST_SALES_HOLD_REMARK = 'sales hold transaksi sellthru'
+
+# Transaction group validation rules. A group is keyed by Transaction ID with
+# fee suffixes removed, then the main transaction determines the required rows.
+TRANSACTION_GROUP_RULES = {
+    'RECHARGE': {
+        'required': {
+            'RECHARGEFEE': {
+                'column': 'Debet',
+                'equals': 20,
+            },
+        },
+        'exempt_remark': UNUSUAL_RECHARGE_EXEMPT_REMARK,
+    },
+    'SELLTHRU': {
+        'required': {
+            'SELLTHRUFEE': {
+                'column': 'Debet',
+                'equals': 100,
+            },
+            'SELLTHRUSALESFEE': {
+                'presence_only': True,
+            },
+        },
+    },
+    REVERSAL_NGRS_CATEGORY: {
+        'required': {
+            REVERSAL_NGRS_FEE_CATEGORY: {
+                'column': 'Kredit',
+                'equals': 20,
+                'missing_reason': (
+                    'missing reversal platform fee remark: '
+                    f'{REVERSAL_NGRS_PLATFORM_FEE_REMARK}'
+                ),
+                'amount_label': 'reversal NGRS platform fee',
+            },
+        },
+        'exempt_remark': UNUSUAL_RECHARGE_EXEMPT_REMARK,
+    },
+    REVERSAL_ST_CATEGORY: {
+        'required': {
+            REVERSAL_ST_SELLTHRU_FEE_CATEGORY: {
+                'column': 'Kredit',
+                'equals': 100,
+                'missing_reason': (
+                    'missing reversal platform fee remark: '
+                    f'{REVERSAL_ST_PLATFORM_FEE_REMARK}'
+                ),
+                'amount_label': 'reversal ST platform fee',
+            },
+            REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY: {
+                'column': 'Kredit',
+                'greater_than': 0,
+                'missing_reason': (
+                    'missing reversal SLSFEE remark: '
+                    f'{REVERSAL_ST_SALES_HOLD_REMARK}'
+                ),
+                'amount_label': 'reversal ST SLSFEE',
+                'expected_text': 'non-zero',
+            },
+        },
+    },
+}
+
+REVERSAL_CATEGORY_TO_MAIN = {
+    REVERSAL_NGRS_CATEGORY: REVERSAL_NGRS_CATEGORY,
+    REVERSAL_NGRS_FEE_CATEGORY: REVERSAL_NGRS_CATEGORY,
+    REVERSAL_ST_CATEGORY: REVERSAL_ST_CATEGORY,
+    REVERSAL_ST_SELLTHRU_FEE_CATEGORY: REVERSAL_ST_CATEGORY,
+    REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY: REVERSAL_ST_CATEGORY,
+}
+REVERSAL_MAIN_MISSING_REASONS = {
+    REVERSAL_NGRS_CATEGORY: f'missing reversal remark: {REVERSAL_NGRS_MAIN_REMARK}',
+    REVERSAL_ST_CATEGORY: f'missing reversal remark: {REVERSAL_ST_MAIN_REMARK}',
 }
 
 
@@ -510,17 +676,23 @@ def _remarks_contain(remarks: pd.Series, phrase: str) -> pd.Series:
     return normalized.str.contains(phrase, regex=False)
 
 
+def _base_id_from_transaction_id(transaction_id: pd.Series) -> pd.Series:
+    return (
+        transaction_id.astype(str)
+        .str.replace(r'(SLSFEE|SALESFEE|FEE)$', '', regex=True)
+    )
+
+
 def relabel_out_cluster_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     Relabels RECHARGE / RECHARGEFEE rows that belong to out-cluster groups:
       RECHARGE    -> RECHARGE OUT CLUSTER
       RECHARGEFEE -> RECHARGE OUT CLUSTER FEE
     Out-cluster groups are identified by the RECHARGE row's Remarks containing
-    SUMMARY_OUT_CLUSTER_REMARK (case-insensitive). This relabeling is for the
-    summary calculation only.
+    SUMMARY_OUT_CLUSTER_REMARK (case-insensitive).
     """
     df = df.copy()
-    df['_base_id'] = df['Transaction ID'].str.replace(r'(SLSFEE|SALESFEE|FEE)$', '', regex=True)
+    df['_base_id'] = _base_id_from_transaction_id(df['Transaction ID'])
     out_cluster_mask = (
         (df['Transaction'] == 'RECHARGE')
         & _remarks_contain(df['Remarks'], SUMMARY_OUT_CLUSTER_REMARK)
@@ -534,42 +706,298 @@ def relabel_out_cluster_transactions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2c  flag unusual transactions (fee-rule validation)
+# STEP 2c  preprocessing: classify reversal rows for summary
 # ─────────────────────────────────────────────────────────────────────────────
 
-def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
+def _numeric_sum(rows: pd.DataFrame, column: str) -> int | float:
+    if rows.empty:
+        return 0
+    total = pd.to_numeric(rows[column], errors='coerce').fillna(0).sum()
+    if float(total).is_integer():
+        return int(total)
+    return float(total)
+
+
+def _format_expected_text(rule: dict) -> str:
+    if 'expected_text' in rule:
+        return str(rule['expected_text'])
+    if 'equals' in rule:
+        return str(rule['equals'])
+    if 'greater_than' in rule:
+        return f"> {rule['greater_than']}"
+    return 'present'
+
+
+def _validate_transaction_group_rules(
+    group: pd.DataFrame,
+    main_transaction: str,
+) -> list[str]:
+    """
+    Validate required companion rows for one transaction group.
+
+    Rules cover the original fee checks and the relabeled reversal categories.
+    """
+    config = TRANSACTION_GROUP_RULES.get(main_transaction)
+    if not config:
+        return []
+
+    main_rows = group[group['Transaction'] == main_transaction]
+    exempt_remark = config.get('exempt_remark')
+    if (
+        exempt_remark
+        and not main_rows.empty
+        and _remarks_contain(main_rows['Remarks'], str(exempt_remark)).any()
+    ):
+        return []
+
+    reasons = []
+    for required_transaction, rule in config.get('required', {}).items():
+        required_rows = group[group['Transaction'] == required_transaction]
+        if required_rows.empty:
+            reasons.append(rule.get('missing_reason', f'missing {required_transaction}'))
+            continue
+
+        if rule.get('presence_only'):
+            continue
+
+        column = rule.get('column')
+        if not column:
+            continue
+
+        actual = _numeric_sum(required_rows, str(column))
+        label = rule.get('amount_label', required_transaction)
+
+        if 'equals' in rule and actual != rule['equals']:
+            expected = _format_expected_text(rule)
+            reasons.append(f'{label} {column}={actual} (expected {expected})')
+        elif 'greater_than' in rule and not actual > rule['greater_than']:
+            expected = _format_expected_text(rule)
+            reasons.append(f'{label} {column}={actual} (expected {expected})')
+
+    return reasons
+
+
+def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Relabel source REVERSAL rows into reversal summary/detail categories.
+
+    Rows whose remarks cannot be classified remain as Reversal so validation can
+    flag them as unusual and exclude them from summary calculations.
+    """
+    result = df.copy()
+    transaction = result['Transaction'].fillna('').astype(str).str.strip().str.upper()
+    reversal_mask = transaction == REVERSAL_TRANSACTION
+    if not reversal_mask.any():
+        print('Reversal rows relabeled: {}')
+        return result
+
+    remarks = result.loc[reversal_mask, 'Remarks']
+    category_masks = {
+        REVERSAL_NGRS_CATEGORY: _remarks_contain(remarks, REVERSAL_NGRS_MAIN_REMARK),
+        REVERSAL_NGRS_FEE_CATEGORY: _remarks_contain(
+            remarks,
+            REVERSAL_NGRS_PLATFORM_FEE_REMARK,
+        ),
+        REVERSAL_ST_CATEGORY: _remarks_contain(remarks, REVERSAL_ST_MAIN_REMARK),
+        REVERSAL_ST_SELLTHRU_FEE_CATEGORY: _remarks_contain(
+            remarks,
+            REVERSAL_ST_PLATFORM_FEE_REMARK,
+        ),
+        REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY: _remarks_contain(
+            remarks,
+            REVERSAL_ST_SALES_HOLD_REMARK,
+        ),
+    }
+
+    match_counts = pd.Series(0, index=remarks.index)
+    for mask in category_masks.values():
+        match_counts = match_counts.add(mask.astype(int), fill_value=0)
+
+    relabeled_counts: dict[str, int] = {}
+    single_match = match_counts == 1
+    for category, mask in category_masks.items():
+        relabel_mask = reversal_mask.copy()
+        relabel_mask.loc[:] = False
+        relabel_mask.loc[remarks.index] = mask & single_match
+        result.loc[relabel_mask, 'Transaction'] = category
+        count = int(relabel_mask.sum())
+        if count:
+            relabeled_counts[category] = count
+
+    ambiguous_rows = int((match_counts > 1).sum())
+    unclassified_rows = int((match_counts == 0).sum())
+    print(f'Reversal rows relabeled: {relabeled_counts}')
+    print(f'Reversal rows ambiguous after relabel: {ambiguous_rows}')
+    print(f'Reversal rows unclassified after relabel: {unclassified_rows}')
+    return result
+
+
+def preprocess_transaction_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply all transaction relabeling before unusual detection and downstream
+    calculation/detail paths.
+    """
+    result = relabel_reversal_transactions(df)
+    result = relabel_out_cluster_transactions(result)
+    return result
+
+
+def _is_reversal_transaction_label(value: object) -> bool:
+    transaction = str(value).strip()
+    return (
+        transaction.upper() == REVERSAL_TRANSACTION
+        or transaction in REVERSAL_CATEGORY_TO_MAIN
+    )
+
+
+def _validate_relabelled_reversal_group(
+    rows: pd.DataFrame,
+) -> tuple[str | None, list[str], bool]:
+    transaction_values = rows['Transaction'].fillna('').astype(str).str.strip()
+    known_categories = {
+        value for value in transaction_values
+        if value in REVERSAL_CATEGORY_TO_MAIN
+    }
+    implied_main_categories = {
+        REVERSAL_CATEGORY_TO_MAIN[value] for value in known_categories
+    }
+    has_unclassified_rows = transaction_values.str.upper().eq(REVERSAL_TRANSACTION).any()
+
+    if len(implied_main_categories) > 1:
+        return None, ['ambiguous reversal remarks matched NGRS and ST'], True
+
+    if not implied_main_categories:
+        return None, ['unclassified reversal remarks'], True
+
+    main_transaction = next(iter(implied_main_categories))
+    has_main_row = main_transaction in set(transaction_values)
+    reasons = []
+    exclude_from_summary = False
+
+    if has_unclassified_rows:
+        reasons.append('unclassified reversal remarks')
+        exclude_from_summary = True
+
+    if not has_main_row:
+        reasons.append(REVERSAL_MAIN_MISSING_REASONS[main_transaction])
+        exclude_from_summary = True
+
+    reasons.extend(_validate_transaction_group_rules(rows, main_transaction))
+    return main_transaction, reasons, exclude_from_summary
+
+
+def _collect_reversal_unusual_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[int], dict[str, int]]:
+    """
+    Validate already relabeled reversal groups.
+
+    Returns unusual rows, source indices that should be excluded from summary,
+    and category counts for rows that remain in summary.
+    """
+    base_ids = _base_id_from_transaction_id(df['Transaction ID'])
+    reversal_mask = df['Transaction'].apply(_is_reversal_transaction_label)
+    reversal_indices = set(df[reversal_mask].index)
+    invalid_parts = []
+    excluded_indices = set()
+    categorized_counts: dict[str, int] = {}
+
+    for base_id, group_indices in base_ids.groupby(base_ids, sort=False).groups.items():
+        group_reversal_indices = [
+            idx for idx in group_indices
+            if idx in reversal_indices
+        ]
+        if not group_reversal_indices:
+            continue
+
+        reversal_rows = df.loc[group_reversal_indices]
+        _, reasons, exclude_from_summary = _validate_relabelled_reversal_group(
+            reversal_rows,
+        )
+
+        if reasons:
+            unusual_rows = reversal_rows.copy()
+            unusual_rows['base_id'] = base_id
+            summary_status = (
+                'excluded from summary'
+                if exclude_from_summary
+                else 'included in summary'
+            )
+            unusual_rows['unusual_reason'] = (
+                '; '.join(reasons) + f'; {summary_status}'
+            )
+            invalid_parts.append(unusual_rows)
+            if exclude_from_summary:
+                excluded_indices.update(group_reversal_indices)
+
+        if exclude_from_summary:
+            continue
+
+        for value, count in reversal_rows['Transaction'].value_counts().items():
+            categorized_counts[str(value)] = categorized_counts.get(str(value), 0) + int(count)
+
+    if invalid_parts:
+        unusual_df = pd.concat(invalid_parts, ignore_index=True, sort=False)
+        unusual_df = unusual_df.sort_values(['base_id', 'No']).reset_index(drop=True)
+    else:
+        unusual_df = df.iloc[0:0].copy()
+        unusual_df['base_id'] = pd.Series(dtype='object')
+        unusual_df['unusual_reason'] = pd.Series(dtype='object')
+
+    return unusual_df, excluded_indices, categorized_counts
+
+
+def prepare_reversal_summary_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Relabel REVERSAL rows for summary and return unusual reversal rows.
+
+    Invalid groups with a main NGRS/ST row stay in the summary but are flagged.
+    Fee-only, ambiguous, or unclassified groups are flagged and excluded.
+    """
+    result = relabel_reversal_transactions(df)
+    unusual_df, excluded_indices, categorized_counts = (
+        _collect_reversal_unusual_transactions(result)
+    )
+
+    if excluded_indices:
+        summary_ready = result.drop(index=sorted(excluded_indices)).reset_index(drop=True)
+    else:
+        summary_ready = result.reset_index(drop=True)
+
+    print(f'Reversal rows categorized for summary: {categorized_counts}')
+    print(f'Reversal unusual rows flagged: {len(unusual_df)}')
+    print(f'Reversal rows excluded from summary: {len(excluded_indices)}')
+    return summary_ready, unusual_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2d  flag unusual transactions (fee-rule validation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flag_fee_rule_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     Returns all rows (main + fee) belonging to transaction groups that violate
-    expected fee rules defined in FEE_RULES. RECHARGE rows whose remarks contain
-    UNUSUAL_RECHARGE_EXEMPT_REMARK are exempt from RECHARGEFEE validation.
+    expected rules defined in TRANSACTION_GROUP_RULES. RECHARGE rows whose
+    remarks contain UNUSUAL_RECHARGE_EXEMPT_REMARK are exempt from RECHARGEFEE
+    validation.
     Adds 'base_id' and 'unusual_reason' columns to the result.
     """
     df = df.copy()
-    df['base_id'] = df['Transaction ID'].str.replace(r'(SLSFEE|SALESFEE|FEE)$', '', regex=True)
+    df['base_id'] = _base_id_from_transaction_id(df['Transaction ID'])
     unusual_base_ids: dict[str, str] = {}
     for base_id, group in df.groupby('base_id', sort=False):
-        main_rows = group[~group['Transaction'].str.endswith('FEE')]
+        transaction = group['Transaction'].fillna('').astype(str)
+        main_rows = group[~transaction.str.endswith('FEE')]
         if main_rows.empty:
             continue
         txn_type = main_rows['Transaction'].iloc[0]
-        is_recharge_fee_exempt = (
-            txn_type == 'RECHARGE'
-            and _remarks_contain(main_rows['Remarks'], UNUSUAL_RECHARGE_EXEMPT_REMARK).any()
-        )
-        rules = FEE_RULES.get(txn_type)
-        if rules is None:
+        if _is_reversal_transaction_label(txn_type):
             continue
-        reasons = []
-        for fee_type, expected_debet in rules.items():
-            if is_recharge_fee_exempt and fee_type == 'RECHARGEFEE':
-                continue
-            fee_rows = group[group['Transaction'] == fee_type]
-            if fee_rows.empty:
-                reasons.append(f'missing {fee_type}')
-            elif expected_debet is not None:
-                actual = fee_rows['Debet'].sum()
-                if actual != expected_debet:
-                    reasons.append(f'{fee_type} Debet={actual} (expected {expected_debet})')
+        if txn_type not in TRANSACTION_GROUP_RULES:
+            continue
+        reasons = _validate_transaction_group_rules(group, txn_type)
         if reasons:
             unusual_base_ids[base_id] = '; '.join(reasons)
     mask = df['base_id'].isin(unusual_base_ids)
@@ -578,6 +1006,42 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     result = result.sort_values(['base_id', 'No']).reset_index(drop=True)
     print(f'Unusual transaction groups : {result["base_id"].nunique()}')
     print(f'Total rows flagged         : {len(result)}')
+    return result
+
+
+def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flag all unusual rows after transaction-label preprocessing.
+
+    Duplicate rows are reported as unusual, while fee-rule and reversal
+    validation run against the deduplicated view to avoid duplicate-driven false
+    positives. Downstream calculation tasks still perform their own dedup step.
+    """
+    deduplicated_df, duplicate_unusual_df = deduplicate_rows_by_minute_with_report(df)
+    fee_unusual_df = _flag_fee_rule_unusual_transactions(deduplicated_df)
+    reversal_unusual_df, _, _ = _collect_reversal_unusual_transactions(deduplicated_df)
+
+    unusual_parts = [
+        part for part in (fee_unusual_df, duplicate_unusual_df, reversal_unusual_df)
+        if not part.empty
+    ]
+    if unusual_parts:
+        result = pd.concat(unusual_parts, ignore_index=True, sort=False)
+        sort_cols = [
+            col for col in ["Transaction Date", "No", "unusual_reason"]
+            if col in result.columns
+        ]
+        if sort_cols:
+            result = result.sort_values(sort_cols).reset_index(drop=True)
+        else:
+            result = result.reset_index(drop=True)
+    else:
+        result = fee_unusual_df
+
+    print(f'Combined unusual rows      : {len(result)}')
+    print(f'Duplicate unusual rows     : {len(duplicate_unusual_df)}')
+    print(f'Fee-rule unusual rows      : {len(fee_unusual_df)}')
+    print(f'Reversal unusual rows      : {len(reversal_unusual_df)}')
     return result
 
 
@@ -826,6 +1290,46 @@ def prepare_transaction_detail_export(
     return result.reset_index(drop=True)
 
 
+def prepare_reversal_detail_export(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filters REVERSAL rows and relabels rows into reversal detail categories
+    using the same remark rules as the summary transform.
+    """
+    if "Transaction" not in df.columns:
+        raise KeyError("Transaction column is required for detail export.")
+
+    prepared = relabel_reversal_transactions(df)
+    reversal_mask = prepared['Transaction'].apply(_is_reversal_transaction_label)
+    result = prepared.loc[reversal_mask].copy()
+
+    if result.empty:
+        print('No REVERSAL rows found for detail export.')
+        return result
+
+    categorized_counts = {
+        str(value): int(count)
+        for value, count in result['Transaction'].value_counts().items()
+        if value in REVERSAL_CATEGORY_TO_MAIN
+    }
+    unclassified_rows = int(
+        result['Transaction']
+        .fillna('')
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .eq(REVERSAL_TRANSACTION)
+        .sum()
+    )
+
+    sort_cols = [col for col in ["Transaction Date", "No"] if col in result.columns]
+    if sort_cols:
+        result = result.sort_values(sort_cols)
+
+    print(f'Reversal detail rows categorized: {categorized_counts}')
+    print(f'Reversal detail rows left as Reversal: {unclassified_rows}')
+    return result.reset_index(drop=True)
+
+
 def append_transaction_detail_to_gsheet(
     gspread_client,
     target_spreadsheet: str,
@@ -862,6 +1366,12 @@ def append_transaction_detail_to_gsheet(
         if value == "":
             return ""
         return int(value)
+
+    def _sheet_text(value):
+        value = _clean(value)
+        if value == "":
+            return ""
+        return f"'{str(value)}"
 
     def _datetime_display(value):
         value = _clean(value)
@@ -945,7 +1455,7 @@ def append_transaction_detail_to_gsheet(
             _number(row.get("Debet")),
             _number(row.get("Saldo Awal")),
             _number(row.get("Saldo Akhir")),
-            str(_clean(row.get("Nomor RS"))),
+            _sheet_text(row.get("Nomor RS")),
             str(_clean(row.get("Remarks"))),
         ])
         rows_to_append.append(output_row)
@@ -1010,6 +1520,11 @@ def append_transaction_detail_to_gsheet(
     for header in ["KREDIT", "DEBET", "SALDO AWAL", "SALDO AKHIR"]:
         col = HEADERS.index(header) + 1
         ws.format(f"{_a1(data_start, col)}:{_a1(data_end, col)}", {"numberFormat": IDR})
+
+    nomor_rs_col = HEADERS.index("NOMOR RS") + 1
+    ws.format(f"{_a1(data_start, nomor_rs_col)}:{_a1(data_end, nomor_rs_col)}", {
+        "numberFormat": {"type": "TEXT"}
+    })
 
     remarks_col = HEADERS.index("REMARKS") + 1
     ws.format(f"{_a1(data_start, remarks_col)}:{_a1(data_end, remarks_col)}", {

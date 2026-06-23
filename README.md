@@ -20,7 +20,7 @@ Upload CSV/XLS/XLSX
       v
 [2] determine_current_date
       - compute current run date
-      - compute monthly summary worksheet, e.g. PKY 2026-06
+      - use stable cluster summary worksheet, e.g. PKY
       |
       v
 [3] load_and_validate
@@ -34,13 +34,16 @@ Upload CSV/XLS/XLSX
       - enforce Debet/Kredit mutual exclusivity
       |
       v
-[5] deduplicate_transactions
-      - drop duplicate rows using all columns except No
-      - compare Transaction Date at date + hour + minute precision only
+[5] preprocess_transaction_labels
+      - relabel Reversal rows from Remarks
+      - relabel Recharge Out Cluster groups
+      - write preprocessed.parquet
       |
       v
 [6] flag_unusual_transactions
-      - run on pre-relabel data
+      - run on preprocessed, pre-dedup data
+      - flag duplicate rows before they are removed from calculations
+      - validate fee rules and reversal rules on a deduped view
       - write unusual.parquet
       |
       v
@@ -48,19 +51,11 @@ Upload CSV/XLS/XLSX
       +-- upload_unusual_to_sheets
       |     - writes to one unusual worksheet per cluster
       |
-      +-- qrisduwit_upload_branch
-      |     - filters QRISDUWIT rows
-      |     - extracts Disbursement Date from Remarks
-      |     - writes to one QRISDUWIT worksheet per cluster
-      |
-      +-- reversal_upload_branch
-      |     - filters REVERSAL rows
-      |     - writes to one Reversal worksheet per cluster
-      |
-      +-- summary_upload_branch
-            - relabel out-cluster rows for summary only
-            - summarize transaction totals
-            - upload the daily summary block to the monthly worksheet
+      +-- downstream_processing_branch
+            - deduplicate rows for calculations/details
+            - export QRISDUWIT and REVERSAL detail rows
+            - remove reversal rows excluded from summary
+            - summarize and upload the daily summary block
 ```
 
 `dry_run=true` still runs validation, integrity checks, unusual detection, relabeling, and summary generation. Google Sheets uploads are skipped.
@@ -191,7 +186,7 @@ Example:
 finpay-411311(04-06-2026to04-06-2026).csv
 ```
 
-The first date in the filename becomes the file `iso_date` output. Monthly worksheet selection and starting balance date are based on the pipeline run date, not the file date.
+The first date in the filename becomes the file `iso_date` output. The summary worksheet is stable per cluster, while the starting balance date for a newly created summary sheet is based on the pipeline run date.
 
 ---
 
@@ -203,35 +198,25 @@ All clusters write to the spreadsheet:
 MONITORING FINPAY
 ```
 
-| Cluster ID | Base worksheet | Summary worksheet example for June 2026 run | Unusual worksheet | QRISDUWIT worksheet | Reversal worksheet | Default starting balance |
-|---|---|---|---|---|---|-------------------------:|
-| 421306 | MRT | MRT 2026-06 | MRT - Unusual | MRT - QRISDUWIT | MRT - Reversal |                        0 |
-| 421307 | TDR | TDR 2026-06 | TDR - Unusual | TDR - QRISDUWIT | TDR - Reversal |                        0 |
-| 411311 | PKY | PKY 2026-06 | PKY - Unusual | PKY - QRISDUWIT | PKY - Reversal |                        0 |
-| 421315 | BGI | BGI 2026-06 | BGI - Unusual | BGI - QRISDUWIT | BGI - Reversal |                        0 |
-| 421318 | MRW | MRW 2026-06 | MRW - Unusual | MRW - QRISDUWIT | MRW - Reversal |                        0 |
-| 421320 | TNT | TNT 2026-06 | TNT - Unusual | TNT - QRISDUWIT | TNT - Reversal |                        0 |
+| Cluster ID | Summary worksheet | Unusual worksheet | QRISDUWIT worksheet | Reversal worksheet | Default starting balance |
+|---|---|---|---|---|-------------------------:|
+| 421306 | MRT | MRT - Unusual | MRT - QRISDUWIT | MRT - Reversal |                        0 |
+| 421307 | TDR | TDR - Unusual | TDR - QRISDUWIT | TDR - Reversal |                        0 |
+| 411311 | PKY | PKY - Unusual | PKY - QRISDUWIT | PKY - Reversal |                        0 |
+| 421315 | BGI | BGI - Unusual | BGI - QRISDUWIT | BGI - Reversal |                        0 |
+| 421318 | MRW | MRW - Unusual | MRW - QRISDUWIT | MRW - Reversal |                        0 |
+| 421320 | TNT | TNT - Unusual | TNT - QRISDUWIT | TNT - Reversal |                        0 |
 
-Summary worksheets are monthly and derived from the run month:
-
-```text
-<base worksheet> <YYYY-MM>
-```
-
-Unusual worksheets are stable per cluster:
+Each cluster uses exactly four stable worksheets:
 
 ```text
+<base worksheet>
 <base worksheet> - Unusual
-```
-
-QRISDUWIT and Reversal detail worksheets are also stable per cluster:
-
-```text
 <base worksheet> - QRISDUWIT
 <base worksheet> - Reversal
 ```
 
-The initial balance date for a new monthly summary worksheet is computed as the last day of the previous month. For a run on `2026-06-17`, the starting balance date is `2026-05-31`.
+The pipeline continues appending daily summary blocks to the same summary worksheet across month boundaries. The initial balance date is only used when creating or initializing a blank summary worksheet, and is computed as the last day of the previous month. For a first run on `2026-06-17`, the starting balance date is `2026-05-31`.
 
 ---
 
@@ -240,24 +225,22 @@ The initial balance date for a new monthly summary worksheet is computed as the 
 | # | Task ID | Description |
 |---|---|---|
 | 1 | `parse_and_resolve` | Parses the filename, resolves cluster config, computes the previous-month-end `starting_balance_date`, and sets the unusual worksheet name. |
-| 2 | `determine_current_date` | Computes the `Asia/Makassar` run date and monthly summary worksheet name. |
+| 2 | `determine_current_date` | Computes the `Asia/Makassar` run date and stable summary worksheet name. |
 | 3 | `load_and_validate` | Loads CSV/XLS/XLSX, auto-detects the header row, coerces dtypes, and validates `FINPAY_SCHEMA`. |
 | 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero. |
-| 5 | `deduplicate_transactions` | Drops duplicate rows using all columns except `No`, with `Transaction Date` compared at minute precision. |
-| 6 | `flag_unusual_transactions` | Runs fee-rule validation on deduplicated, pre-relabel data and writes `unusual.parquet`. |
-| 7 | `branch_after_unusual_flag` | Runs unusual upload, QRISDUWIT detail export, Reversal detail export, and summary upload paths in parallel. |
+| 5 | `preprocess_transaction_labels` | Relabels Reversal rows and Recharge Out Cluster groups before unusual detection, then writes `preprocessed.parquet`. |
+| 6 | `flag_unusual_transactions` | Runs before calculation dedup on preprocessed rows, flags duplicates, fee-rule issues, and invalid reversal groups, then writes `unusual.parquet`. |
+| 7 | `branch_after_unusual_flag` | Runs unusual upload/alerting in parallel with the downstream calculation/detail path. |
 | 7a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
 | 7b | `notify_unusual_telegram` | Sends a Telegram alert only when unusual rows exist and the run is not a dry run. |
-| 7c | `qrisduwit_upload_branch` | Filters `QRISDUWIT` rows, extracts `Disbursement Date` from `Remarks`, and uploads the detail rows. |
-| 7c.1 | `filter_qrisduwit_rows` | Writes `qrisduwit.parquet` from deduplicated rows. |
-| 7c.2 | `upload_qrisduwit_to_sheets` | Appends QRISDUWIT detail rows to `<base worksheet> - QRISDUWIT`. Skipped on dry run. |
-| 7d | `reversal_upload_branch` | Filters `REVERSAL` rows and uploads the detail rows. |
-| 7d.1 | `filter_reversal_rows` | Writes `reversal.parquet` from deduplicated rows. |
-| 7d.2 | `upload_reversal_to_sheets` | Appends Reversal detail rows to `<base worksheet> - Reversal`. Skipped on dry run. |
-| 7e | `summary_upload_branch` | Sequential branch for relabeling, summarizing, and uploading summary. |
-| 7e.1 | `relabel_out_cluster` | Relabels summary-only out-cluster RECHARGE groups after deduplication. |
-| 7e.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
-| 7e.3 | `upload_to_sheets` | Appends the formatted daily summary block to the monthly summary worksheet. Skipped on dry run. |
+| 7c | `downstream_processing_branch` | Deduplicates preprocessed rows, then runs QRISDUWIT detail, Reversal detail, and summary branches. |
+| 7c.1 | `deduplicate_transactions` | Writes `deduplicated.parquet` for calculation/detail outputs using all columns except `No`, with `Transaction Date` compared at minute precision. |
+| 7c.2 | `qrisduwit_upload_branch` | Filters `QRISDUWIT` rows, extracts `Disbursement Date` from `Remarks`, and uploads the detail rows. |
+| 7c.3 | `reversal_upload_branch` | Exports rows already labeled as Reversal categories and any unclassified raw `Reversal` rows. |
+| 7c.4 | `summary_upload_branch` | Removes reversal rows excluded from summary, summarizes, and uploads summary. |
+| 7c.4.1 | `prepare_summary_transactions` | Keeps invalid main NGRS/ST groups in summary with unusual flags and excludes fee-only/ambiguous/unclassified reversal groups. |
+| 7c.4.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
+| 7c.4.3 | `upload_to_sheets` | Appends the formatted daily summary block to the stable summary worksheet. Skipped on dry run. |
 
 On failure, `notify_on_failure` currently logs the flow ID, execution ID, and UI log path.
 
@@ -269,7 +252,7 @@ The pipeline intentionally uses two different remark phrases for two different p
 
 | Purpose | Phrase | Behavior |
 |---|---|---|
-| Summary relabeling | `fee pembelian recharge out cluster` | In the summary branch only, matching `RECHARGE` groups are relabeled to `RECHARGE OUT CLUSTER`, and matching fee rows are relabeled to `RECHARGE OUT CLUSTER FEE`. |
+| Preprocessing relabeling | `fee pembelian recharge out cluster` | Before unusual detection, matching `RECHARGE` groups are relabeled to `RECHARGE OUT CLUSTER`, and matching fee rows are relabeled to `RECHARGE OUT CLUSTER FEE`. |
 | Unusual exemption | `biaya pembelian recharge out cluster` | In unusual detection, matching `RECHARGE` rows are exempt from the missing `RECHARGEFEE` rule. |
 
 Fee validation currently monitors:
@@ -286,25 +269,39 @@ base_id
 unusual_reason
 ```
 
+Duplicate rows detected before calculation deduplication are also written to the unusual output. Their original `Remarks` value is preserved, and the kept row number plus minute-level duplicate key are written to `unusual_reason`.
+
+Reversal rows are classified for summary from `Remarks`:
+
+| Summary category | Required remarks and Kredit rules |
+|---|---|
+| `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`. Rows containing `biaya pembelian recharge out cluster` are exempt from the fee requirement. |
+| `Reversal - NGRS FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-`; total `Kredit` must be `20` unless the group is out-cluster exempt. |
+| `Reversal - ST` | Main reversal rows with `Sellthru Sales Fee`. |
+| `Reversal - ST SELLTHRUFEE` | Fee rows with `Platform Fee Sellthru Rp. 100,-`; total `Kredit` must be `100`. |
+| `Reversal - ST SELLTHRUSALESFEE` | Sales hold rows with `Sales Hold Transaksi Sellthru`; total `Kredit` must be non-zero. |
+
+Invalid reversal groups are always written to the unusual output. If the group has a main `Reversal - NGRS` or `Reversal - ST` row, it is still transformed and included in the summary with a reason ending in `included in summary`. Fee-only, ambiguous, or unclassified reversal groups are written with a reason ending in `excluded from summary` and are removed before summary aggregation.
+
 ---
 
 ## Google Sheets Outputs
 
-### Monthly summary worksheet
+### Summary worksheet
 
 Target:
 
 ```text
-<base worksheet> <YYYY-MM>
+<base worksheet>
 ```
 
 Example:
 
 ```text
-PKY 2026-06
+PKY
 ```
 
-If the monthly worksheet does not exist, it is created. If it is empty, the pipeline initializes:
+If the summary worksheet does not exist, it is created. If it is empty, the pipeline initializes:
 
 - Header row: `TANGGAL`, `KETERANGAN`, `DEBET`, `KREDIT`, `SALDO`
 - Opening balance row using the previous-month-end date
@@ -324,7 +321,11 @@ Daily data rows are written in this fixed order:
 | BIAYA FEE NGRS | `RECHARGEFEE` |
 | RECHARGE OUT CLUSTER | `RECHARGE OUT CLUSTER` |
 | RECHARGE OUT CLUSTER FEE | `RECHARGE OUT CLUSTER FEE` |
-| REVERSAL | `Reversal` |
+| REVERSAL NGRS | `Reversal - NGRS` |
+| REVERSAL NGRS FEE | `Reversal - NGRS FEE` |
+| REVERSAL ST | `Reversal - ST` |
+| REVERSAL ST SELLTHRUFEE | `Reversal - ST SELLTHRUFEE` |
+| REVERSAL ST SELLTHRUSALESFEE | `Reversal - ST SELLTHRUSALESFEE` |
 | ST | `SELLTHRU` |
 | BIAYA FEE ST | `SELLTHRUFEE` |
 | BIAYA FEE BAR A. ST | `SELLTHRUSALESFEE` |
@@ -333,9 +334,11 @@ Footer rows are formula-based:
 
 | Footer | Formula meaning |
 |---|---|
-| NGRS | Net of `RECHARGE`, `RECHARGEFEE`, `RECHARGE OUT CLUSTER`, `RECHARGE OUT CLUSTER FEE`, and `Reversal`. |
+| NGRS | Net of `RECHARGE`, `RECHARGEFEE`, `RECHARGE OUT CLUSTER`, and `RECHARGE OUT CLUSTER FEE`. |
+| Reversal - NGRS | Net of `Reversal - NGRS` minus `Reversal - NGRS FEE`. |
 | PPOB | Net of `FeeTransaksi`. |
 | ST | Net of `SELLTHRU`, `SELLTHRUFEE`, and `SELLTHRUSALESFEE`. |
+| Reversal - ST | Net of `Reversal - ST` minus `Reversal - ST SELLTHRUFEE` and `Reversal - ST SELLTHRUSALESFEE`. |
 | DISBURSEMENT | Net of `DISBURSEMENT`. |
 | QRISDUWIT | Net of `QRISDUWIT`. |
 | Total | Sum of the footer rows above. |
@@ -392,12 +395,14 @@ PKY - QRISDUWIT
 PKY - Reversal
 ```
 
-Both detail exports run in parallel with `summary_upload_branch` after deduplication. They filter the source `Transaction` column using case-insensitive exact matching:
+Both detail exports run in parallel with `summary_upload_branch` after deduplication:
 
 | Detail sheet | Transaction match |
 |---|---|
 | QRISDUWIT | `QRISDUWIT` |
-| Reversal | `REVERSAL`, matching source values such as `Reversal` |
+| Reversal | Any preprocessed Reversal category plus unclassified raw `Reversal` rows |
+
+The Reversal detail export uses the same remark-based categories as the summary transform, such as `Reversal - NGRS`, `Reversal - NGRS FEE`, and `Reversal - ST SELLTHRUFEE`. Rows whose remarks cannot be classified remain `Reversal`; invalid but classifiable rows still show their reversal category and are explained in the unusual sheet.
 
 QRISDUWIT rows include an extra `DISBURSEMENT DATE` column derived from `Remarks` using the phrase `tanggal DD-MM-YYYY`. For example, this remark:
 
@@ -434,25 +439,31 @@ python - <<'PY'
 from pipeline_refactored import (
     load_and_validate_schema,
     validate_debit_credit_integrity,
+    preprocess_transaction_labels,
     drop_duplicate_rows_by_minute,
     flag_unusual_transactions,
+    prepare_reversal_summary_transactions,
+    prepare_reversal_detail_export,
     prepare_transaction_detail_export,
-    relabel_out_cluster_transactions,
     summarize_by_transaction,
 )
 
 path = "data/finpay-411311(04-06-2026to04-06-2026).csv"
 df = load_and_validate_schema(path)
 integrity_checked = validate_debit_credit_integrity(df)
-deduplicated = drop_duplicate_rows_by_minute(integrity_checked)
-unusual = flag_unusual_transactions(deduplicated)
+preprocessed = preprocess_transaction_labels(integrity_checked)
+unusual = flag_unusual_transactions(preprocessed)
+deduplicated = drop_duplicate_rows_by_minute(preprocessed)
+summary_ready, reversal_unusual = prepare_reversal_summary_transactions(deduplicated)
 qrisduwit = prepare_transaction_detail_export(deduplicated, "QRISDUWIT", include_disbursement_date=True)
-reversal = prepare_transaction_detail_export(deduplicated, "REVERSAL")
-relabeled = relabel_out_cluster_transactions(deduplicated)
-summary = summarize_by_transaction(relabeled)
+reversal = prepare_reversal_detail_export(deduplicated)
+summary = summarize_by_transaction(summary_ready)
 print({
     "rows": len(integrity_checked),
+    "preprocessed_rows": len(preprocessed),
     "deduplicated_rows": len(deduplicated),
+    "reversal_unusual_rows": len(reversal_unusual),
+    "summary_ready_rows": len(summary_ready),
     "unusual_rows": len(unusual),
     "qrisduwit_rows": len(qrisduwit),
     "reversal_rows": len(reversal),
@@ -481,10 +492,10 @@ PY
 ## Design Notes
 
 - Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `pipeline_refactored.py`.
-- The summary monthly worksheet is based on the pipeline run month, not the uploaded file date.
+- The summary worksheet is stable per cluster and continues across month boundaries.
 - The starting balance date is the last day of the previous month, computed at runtime.
 - Deduplication compares all columns except `No`, and normalizes `Transaction Date` to minute precision for duplicate detection.
-- Unusual detection runs before summary relabeling so fee checks see the original transaction labels.
+- Transaction relabeling runs before unusual detection, calculation deduplication, detail exports, and summary aggregation.
 - Unusual upload, Telegram unusual-row alerting, and summary upload run in parallel after unusual detection.
 - Parquet files are used between Kestra tasks to avoid passing large datasets through variables.
 - Google Sheets footer totals are live formulas, not Python-computed totals.
