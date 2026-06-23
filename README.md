@@ -275,7 +275,7 @@ Reversal rows are classified for summary from `Remarks`:
 
 | Summary category | Required remarks and Kredit rules |
 |---|---|
-| `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`. Rows containing `biaya pembelian recharge out cluster` are exempt from the fee requirement. |
+| `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`. Rows with `Fee Pembelian recharge out cluster` are also classified as NGRS and still require the Rp 20 fee. Rows containing `biaya pembelian recharge out cluster` are exempt from the fee requirement. |
 | `Reversal - NGRS FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-`; total `Kredit` must be `20` unless the group is out-cluster exempt. |
 | `Reversal - ST` | Main reversal rows with `Sellthru Sales Fee`. |
 | `Reversal - ST SELLTHRUFEE` | Fee rows with `Platform Fee Sellthru Rp. 100,-`; total `Kredit` must be `100`. |

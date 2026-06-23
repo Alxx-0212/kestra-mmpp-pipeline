@@ -591,6 +591,7 @@ REVERSAL_ST_CATEGORY = 'Reversal - ST'
 REVERSAL_ST_SELLTHRU_FEE_CATEGORY = 'Reversal - ST SELLTHRUFEE'
 REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY = 'Reversal - ST SELLTHRUSALESFEE'
 REVERSAL_NGRS_MAIN_REMARK = 'biaya pembelian recharge'
+REVERSAL_NGRS_OUT_CLUSTER_FEE_REMARK = SUMMARY_OUT_CLUSTER_REMARK
 REVERSAL_NGRS_PLATFORM_FEE_REMARK = 'platform fee recharge rp. 20,-'
 REVERSAL_ST_MAIN_REMARK = 'sellthru sales fee'
 REVERSAL_ST_PLATFORM_FEE_REMARK = 'platform fee sellthru rp. 100,-'
@@ -666,7 +667,10 @@ REVERSAL_CATEGORY_TO_MAIN = {
     REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY: REVERSAL_ST_CATEGORY,
 }
 REVERSAL_MAIN_MISSING_REASONS = {
-    REVERSAL_NGRS_CATEGORY: f'missing reversal remark: {REVERSAL_NGRS_MAIN_REMARK}',
+    REVERSAL_NGRS_CATEGORY: (
+        f'missing reversal remark: {REVERSAL_NGRS_MAIN_REMARK} '
+        f'or {REVERSAL_NGRS_OUT_CLUSTER_FEE_REMARK}'
+    ),
     REVERSAL_ST_CATEGORY: f'missing reversal remark: {REVERSAL_ST_MAIN_REMARK}',
 }
 
@@ -793,7 +797,10 @@ def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
 
     remarks = result.loc[reversal_mask, 'Remarks']
     category_masks = {
-        REVERSAL_NGRS_CATEGORY: _remarks_contain(remarks, REVERSAL_NGRS_MAIN_REMARK),
+        REVERSAL_NGRS_CATEGORY: (
+            _remarks_contain(remarks, REVERSAL_NGRS_MAIN_REMARK)
+            | _remarks_contain(remarks, REVERSAL_NGRS_OUT_CLUSTER_FEE_REMARK)
+        ),
         REVERSAL_NGRS_FEE_CATEGORY: _remarks_contain(
             remarks,
             REVERSAL_NGRS_PLATFORM_FEE_REMARK,
