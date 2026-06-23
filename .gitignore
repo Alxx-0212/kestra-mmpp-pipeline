@@ -3,3 +3,4 @@ tmp/kestra-wd/secrets/gcp-sa-key.json
 __pycache__/
 data/
 .idea/
+main.ipynb
