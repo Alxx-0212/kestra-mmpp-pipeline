@@ -595,6 +595,7 @@ REVERSAL_NGRS_OUT_CLUSTER_FEE_REMARK = SUMMARY_OUT_CLUSTER_REMARK
 REVERSAL_NGRS_PLATFORM_FEE_REMARK = 'platform fee recharge rp. 20,-'
 REVERSAL_ST_MAIN_REMARK = 'sellthru sales fee'
 REVERSAL_ST_PLATFORM_FEE_REMARK = 'platform fee sellthru rp. 100,-'
+REVERSAL_ST_TRANSACTION_FEE_REMARK = 'fee transaksi sellthru sejumlah 100 rupiah'
 REVERSAL_ST_SALES_HOLD_REMARK = 'sales hold transaksi sellthru'
 
 # Transaction group validation rules. A group is keyed by Transaction ID with
@@ -641,7 +642,8 @@ TRANSACTION_GROUP_RULES = {
                 'equals': 100,
                 'missing_reason': (
                     'missing reversal platform fee remark: '
-                    f'{REVERSAL_ST_PLATFORM_FEE_REMARK}'
+                    f'{REVERSAL_ST_PLATFORM_FEE_REMARK} '
+                    f'or {REVERSAL_ST_TRANSACTION_FEE_REMARK}'
                 ),
                 'amount_label': 'reversal ST platform fee',
             },
@@ -809,7 +811,7 @@ def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
         REVERSAL_ST_SELLTHRU_FEE_CATEGORY: _remarks_contain(
             remarks,
             REVERSAL_ST_PLATFORM_FEE_REMARK,
-        ),
+        ) | _remarks_contain(remarks, REVERSAL_ST_TRANSACTION_FEE_REMARK),
         REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY: _remarks_contain(
             remarks,
             REVERSAL_ST_SALES_HOLD_REMARK,

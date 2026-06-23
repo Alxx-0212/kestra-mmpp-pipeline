@@ -278,7 +278,7 @@ Reversal rows are classified for summary from `Remarks`:
 | `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`. Rows with `Fee Pembelian recharge out cluster` are also classified as NGRS and still require the Rp 20 fee. Rows containing `biaya pembelian recharge out cluster` are exempt from the fee requirement. |
 | `Reversal - NGRS FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-`; total `Kredit` must be `20` unless the group is out-cluster exempt. |
 | `Reversal - ST` | Main reversal rows with `Sellthru Sales Fee`. |
-| `Reversal - ST SELLTHRUFEE` | Fee rows with `Platform Fee Sellthru Rp. 100,-`; total `Kredit` must be `100`. |
+| `Reversal - ST SELLTHRUFEE` | Fee rows with `Platform Fee Sellthru Rp. 100,-` or `Fee Transaksi Sellthru sejumlah 100 rupiah`; total `Kredit` must be `100`. |
 | `Reversal - ST SELLTHRUSALESFEE` | Sales hold rows with `Sales Hold Transaksi Sellthru`; total `Kredit` must be non-zero. |
 
 Invalid reversal groups are always written to the unusual output. If the group has a main `Reversal - NGRS` or `Reversal - ST` row, it is still transformed and included in the summary with a reason ending in `included in summary`. Fee-only, ambiguous, or unclassified reversal groups are written with a reason ending in `excluded from summary` and are removed before summary aggregation.
