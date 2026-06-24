@@ -467,8 +467,10 @@ def append_daily_to_gsheet(
     ir = insert_row
     n  = len(KETERANGAN)   # footer rows start at ir + n
     footer_formulas = [
-        # NGRS = net(RECHARGE family only)
-        f"=C{ir+4}-D{ir+4}+C{ir+5}-D{ir+5}+C{ir+6}-D{ir+6}+C{ir+7}-D{ir+7}",
+        # NGRS = net(RECHARGE - RECHARGEFEE)
+        f"=C{ir+4}-D{ir+4}+C{ir+5}-D{ir+5}",
+        # Recharge Out Cluster = net(RECHARGE OUT CLUSTER - RECHARGE OUT CLUSTER FEE)
+        f"=C{ir+6}-D{ir+6}+C{ir+7}-D{ir+7}",
         # Reversal - NGRS = net(Reversal NGRS - Reversal NGRS fee)
         f"=(C{ir+8}-D{ir+8})+(C{ir+9}-D{ir+9})",
         # PPOB  = net(FeeTransaksi)
@@ -489,6 +491,7 @@ def append_daily_to_gsheet(
 
     FOOTER_LABELS = [
         "NGRS",
+        "Recharge Out Cluster",
         "Reversal - NGRS",
         "PPOB",
         "ST",

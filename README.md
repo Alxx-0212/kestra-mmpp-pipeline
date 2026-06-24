@@ -334,7 +334,8 @@ Footer rows are formula-based:
 
 | Footer | Formula meaning |
 |---|---|
-| NGRS | Net of `RECHARGE`, `RECHARGEFEE`, `RECHARGE OUT CLUSTER`, and `RECHARGE OUT CLUSTER FEE`. |
+| NGRS | Net of `RECHARGE` minus `RECHARGEFEE`. |
+| Recharge Out Cluster | Net of `RECHARGE OUT CLUSTER` minus `RECHARGE OUT CLUSTER FEE`. |
 | Reversal - NGRS | Net of `Reversal - NGRS` minus `Reversal - NGRS FEE`. |
 | PPOB | Net of `FeeTransaksi`. |
 | ST | Net of `SELLTHRU`, `SELLTHRUFEE`, and `SELLTHRUSALESFEE`. |
