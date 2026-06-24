@@ -998,24 +998,34 @@ def _flag_fee_rule_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
     df['base_id'] = _base_id_from_transaction_id(df['Transaction ID'])
-    unusual_base_ids: dict[str, str] = {}
+    unusual_parts = []
     for base_id, group in df.groupby('base_id', sort=False):
         transaction = group['Transaction'].fillna('').astype(str)
-        main_rows = group[~transaction.str.endswith('FEE')]
+        non_reversal_mask = ~transaction.apply(_is_reversal_transaction_label)
+        non_reversal_group = group[non_reversal_mask]
+        if non_reversal_group.empty:
+            continue
+
+        non_reversal_transaction = non_reversal_group['Transaction'].fillna('').astype(str)
+        main_rows = non_reversal_group[~non_reversal_transaction.str.endswith('FEE')]
         if main_rows.empty:
             continue
         txn_type = main_rows['Transaction'].iloc[0]
-        if _is_reversal_transaction_label(txn_type):
-            continue
         if txn_type not in TRANSACTION_GROUP_RULES:
             continue
-        reasons = _validate_transaction_group_rules(group, txn_type)
+        reasons = _validate_transaction_group_rules(non_reversal_group, txn_type)
         if reasons:
-            unusual_base_ids[base_id] = '; '.join(reasons)
-    mask = df['base_id'].isin(unusual_base_ids)
-    result = df[mask].copy()
-    result['unusual_reason'] = result['base_id'].map(unusual_base_ids)
-    result = result.sort_values(['base_id', 'No']).reset_index(drop=True)
+            unusual_rows = non_reversal_group.copy()
+            unusual_rows['unusual_reason'] = '; '.join(reasons)
+            unusual_parts.append(unusual_rows)
+
+    if unusual_parts:
+        result = pd.concat(unusual_parts, ignore_index=True, sort=False)
+        result = result.sort_values(['base_id', 'No']).reset_index(drop=True)
+    else:
+        result = df.iloc[0:0].copy()
+        result['unusual_reason'] = pd.Series(dtype='object')
+
     print(f'Unusual transaction groups : {result["base_id"].nunique()}')
     print(f'Total rows flagged         : {len(result)}')
     return result
