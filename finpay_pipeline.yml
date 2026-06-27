@@ -1,4 +1,4 @@
-id: finpay_daily_pipeline_v4
+id: finpay_daily_pipeline_v5
 namespace: finance.finpay
 
 # ── MANUAL RUN WITH FILE UPLOAD ─────────────────────────────────────────────────
@@ -213,7 +213,45 @@ tasks:
       print(f"✅ Integrity check passed. Rows: {len(df)}")
       Kestra.outputs({"rows": len(df)})
 
-  # ── TASK 5 ─ Preprocess transaction labels before unusual detection ─────────
+  # ── TASK 5 ─ Persist true raw transactions to FinPay Postgres ───────────────
+  - id: persist_raw_transactions_to_db
+    type: io.kestra.plugin.scripts.python.Script
+    runIf: "{{ inputs.dry_run == false }}"
+    containerImage: finpay-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: finpay-network
+    pythonVersion: "3.11"
+    timeout: PT5M
+    inputFiles:
+      integrity_checked.parquet: "{{ outputs.validate_integrity.outputFiles['integrity_checked.parquet'] }}"
+    env:
+      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+      FINPAY_DB_HOST: finpay-postgres
+      FINPAY_DB_PORT: "5432"
+      FINPAY_DB_NAME: finpay
+      FINPAY_DB_USER: finpay
+      FINPAY_DB_PASSWORD: finpay
+    script: |
+      import os, sys, pandas as pd
+      sys.path.insert(0, "/app")
+      from pipeline import postgres_dsn_from_env, write_finpay_dataframe_to_postgres
+      from kestra import Kestra
+
+      df = pd.read_parquet("integrity_checked.parquet")
+      rows = write_finpay_dataframe_to_postgres(
+          df=df,
+          table_name="finpay_raw_transactions",
+          cluster_id=os.environ["CLUSTER_ID"],
+          report_date=os.environ["ISO_DATE"],
+          dsn=postgres_dsn_from_env(),
+      )
+
+      print(f"✅ Persisted raw transactions to Postgres. Rows: {rows}")
+      Kestra.outputs({"rows": rows, "table": "finpay_raw_transactions"})
+
+  # ── TASK 6 ─ Preprocess transaction labels before unusual detection ─────────
   - id: preprocess_transaction_labels
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
@@ -230,8 +268,10 @@ tasks:
       from kestra import Kestra
 
       df = pd.read_parquet("integrity_checked.parquet")
+      df["raw_transaction_label"] = df["Transaction"]
       before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
       df = preprocess_transaction_labels(df)
+      df["processed_transaction_label"] = df["Transaction"]
       after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
 
       out_cluster_rows = int(
@@ -254,7 +294,7 @@ tasks:
           "after_counts": after_counts,
       })
 
-  # ── TASK 6 ─ Flag unusual rows before calculation dedup ─────────────────────
+  # ── TASK 7 ─ Flag unusual rows before calculation dedup ─────────────────────
   - id: flag_unusual_transactions
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
@@ -309,9 +349,47 @@ tasks:
 
   # ── TASK 7 ─ Split unusual upload from summary path ─────────────────────────
   - id: branch_after_unusual_flag
-    type: io.kestra.plugin.core.flow.Parallel
+    type: io.kestra.plugin.core.flow.Sequential
     tasks:
-      # ── TASK 8 ─ Upload unusual transactions immediately ────────────────────
+      # ── TASK 9 ─ Persist unusual transactions to FinPay Postgres ────────────
+      - id: persist_unusual_to_db
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ inputs.dry_run == false }}"
+        containerImage: finpay-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: finpay-network
+        pythonVersion: "3.11"
+        timeout: PT5M
+        inputFiles:
+          unusual.parquet: "{{ outputs.flag_unusual_transactions.outputFiles['unusual.parquet'] }}"
+        env:
+          CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+          ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+          FINPAY_DB_HOST: finpay-postgres
+          FINPAY_DB_PORT: "5432"
+          FINPAY_DB_NAME: finpay
+          FINPAY_DB_USER: finpay
+          FINPAY_DB_PASSWORD: finpay
+        script: |
+          import os, sys, pandas as pd
+          sys.path.insert(0, "/app")
+          from pipeline import postgres_dsn_from_env, write_finpay_dataframe_to_postgres
+          from kestra import Kestra
+
+          unusual_df = pd.read_parquet("unusual.parquet")
+          rows = write_finpay_dataframe_to_postgres(
+              df=unusual_df,
+              table_name="finpay_unusual_transactions",
+              cluster_id=os.environ["CLUSTER_ID"],
+              report_date=os.environ["ISO_DATE"],
+              dsn=postgres_dsn_from_env(),
+          )
+
+          print(f"✅ Persisted unusual transactions to Postgres. Rows: {rows}")
+          Kestra.outputs({"rows": rows, "table": "finpay_unusual_transactions"})
+
+      # ── TASK 10 ─ Upload unusual transactions immediately ───────────────────
       - id: upload_unusual_to_sheets
         type: io.kestra.plugin.scripts.python.Script
         runIf: "{{ inputs.dry_run == false }}"
@@ -429,7 +507,7 @@ tasks:
               })
 
           - id: post_dedup_branches
-            type: io.kestra.plugin.core.flow.Parallel
+            type: io.kestra.plugin.core.flow.Sequential
             tasks:
               # ── TASK 10 ─ Export QRISDUWIT detail rows ─────────────────────────────
               - id: qrisduwit_upload_branch
@@ -489,6 +567,43 @@ tasks:
                           "rows": len(qrisduwit_df),
                           "missing_disbursement_dates": missing_disbursement_dates,
                       })
+
+                  - id: persist_qrisduwit_to_db
+                    type: io.kestra.plugin.scripts.python.Script
+                    runIf: "{{ inputs.dry_run == false }}"
+                    containerImage: finpay-pipeline:3.11
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: finpay-network
+                    pythonVersion: "3.11"
+                    timeout: PT5M
+                    inputFiles:
+                      qrisduwit.parquet: "{{ outputs.filter_qrisduwit_rows.outputFiles['qrisduwit.parquet'] }}"
+                    env:
+                      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+                      FINPAY_DB_HOST: finpay-postgres
+                      FINPAY_DB_PORT: "5432"
+                      FINPAY_DB_NAME: finpay
+                      FINPAY_DB_USER: finpay
+                      FINPAY_DB_PASSWORD: finpay
+                    script: |
+                      import os, sys, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import postgres_dsn_from_env, write_finpay_dataframe_to_postgres
+                      from kestra import Kestra
+
+                      qrisduwit_df = pd.read_parquet("qrisduwit.parquet")
+                      rows = write_finpay_dataframe_to_postgres(
+                          df=qrisduwit_df,
+                          table_name="finpay_qrisduwit_transactions",
+                          cluster_id=os.environ["CLUSTER_ID"],
+                          report_date=os.environ["ISO_DATE"],
+                          dsn=postgres_dsn_from_env(),
+                      )
+
+                      print(f"✅ Persisted QRISDUWIT transactions to Postgres. Rows: {rows}")
+                      Kestra.outputs({"rows": rows, "table": "finpay_qrisduwit_transactions"})
 
                   - id: upload_qrisduwit_to_sheets
                     type: io.kestra.plugin.scripts.python.Script
@@ -597,6 +712,43 @@ tasks:
 
                       Kestra.outputs({"rows": len(reversal_df)})
 
+                  - id: persist_reversal_to_db
+                    type: io.kestra.plugin.scripts.python.Script
+                    runIf: "{{ inputs.dry_run == false }}"
+                    containerImage: finpay-pipeline:3.11
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: finpay-network
+                    pythonVersion: "3.11"
+                    timeout: PT5M
+                    inputFiles:
+                      reversal.parquet: "{{ outputs.filter_reversal_rows.outputFiles['reversal.parquet'] }}"
+                    env:
+                      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+                      FINPAY_DB_HOST: finpay-postgres
+                      FINPAY_DB_PORT: "5432"
+                      FINPAY_DB_NAME: finpay
+                      FINPAY_DB_USER: finpay
+                      FINPAY_DB_PASSWORD: finpay
+                    script: |
+                      import os, sys, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import postgres_dsn_from_env, write_finpay_dataframe_to_postgres
+                      from kestra import Kestra
+
+                      reversal_df = pd.read_parquet("reversal.parquet")
+                      rows = write_finpay_dataframe_to_postgres(
+                          df=reversal_df,
+                          table_name="finpay_reversal_transactions",
+                          cluster_id=os.environ["CLUSTER_ID"],
+                          report_date=os.environ["ISO_DATE"],
+                          dsn=postgres_dsn_from_env(),
+                      )
+
+                      print(f"✅ Persisted Reversal transactions to Postgres. Rows: {rows}")
+                      Kestra.outputs({"rows": rows, "table": "finpay_reversal_transactions"})
+
                   - id: upload_reversal_to_sheets
                     type: io.kestra.plugin.scripts.python.Script
                     runIf: "{{ inputs.dry_run == false }}"
@@ -660,7 +812,7 @@ tasks:
               - id: summary_upload_branch
                 type: io.kestra.plugin.core.flow.Sequential
                 tasks:
-                  # ── TASK 6a ─ Remove reversal rows excluded from summary ────────────
+                  # ── TASK 6a ─ Remove rows excluded from summary ─────────────────────
                   - id: prepare_summary_transactions
                     type: io.kestra.plugin.scripts.python.Script
                     containerImage: finpay-pipeline:3.11
@@ -679,7 +831,7 @@ tasks:
                       df = pd.read_parquet("deduplicated.parquet")
                       before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
 
-                      df, reversal_unusual_df = prepare_reversal_summary_transactions(df)
+                      df, summary_unusual_df = prepare_reversal_summary_transactions(df)
                       after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
                       out_cluster_rows = int(
                           df["Transaction"].isin(["RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"]).sum()
@@ -687,38 +839,79 @@ tasks:
                       reversal_rows = int(
                           df["Transaction"].astype(str).str.startswith("Reversal - ").sum()
                       )
-                      reversal_unusual_rows = len(reversal_unusual_df)
-                      if reversal_unusual_df.empty:
-                          reversal_excluded_rows = 0
-                          reversal_included_unusual_rows = 0
+                      summary_unusual_rows = len(summary_unusual_df)
+                      if summary_unusual_df.empty:
+                          summary_excluded_rows = 0
+                          summary_included_unusual_rows = 0
                       else:
-                          reversal_reasons = reversal_unusual_df["unusual_reason"].astype(str)
-                          reversal_excluded_rows = int(
-                              reversal_reasons.str.contains("excluded from summary", regex=False).sum()
+                          summary_reasons = summary_unusual_df["unusual_reason"].astype(str)
+                          summary_excluded_rows = int(
+                              summary_reasons.str.contains("excluded from summary", regex=False).sum()
                           )
-                          reversal_included_unusual_rows = int(
-                              reversal_reasons.str.contains("included in summary", regex=False).sum()
+                          summary_included_unusual_rows = int(
+                              summary_reasons.str.contains("included in summary", regex=False).sum()
                           )
 
                       df.to_parquet("summary_ready.parquet", index=False)
 
                       print(f"✅ Summary preparation complete. Out-cluster rows: {out_cluster_rows}")
                       print(f"✅ Reversal summary rows: {reversal_rows}")
-                      print(f"⚠️  Reversal unusual rows flagged: {reversal_unusual_rows}")
-                      print(f"⚠️  Reversal unusual rows included in summary: {reversal_included_unusual_rows}")
-                      print(f"⚠️  Reversal rows excluded from summary: {reversal_excluded_rows}")
+                      print(f"⚠️  Summary unusual rows flagged: {summary_unusual_rows}")
+                      print(f"⚠️  Summary unusual rows included in summary: {summary_included_unusual_rows}")
+                      print(f"⚠️  Summary rows excluded from summary: {summary_excluded_rows}")
                       Kestra.outputs({
                           "rows": len(df),
                           "out_cluster_rows": out_cluster_rows,
                           "reversal_summary_rows": reversal_rows,
-                          "reversal_unusual_rows": reversal_unusual_rows,
-                          "reversal_included_unusual_rows": reversal_included_unusual_rows,
-                          "reversal_excluded_rows": reversal_excluded_rows,
+                          "summary_unusual_rows": summary_unusual_rows,
+                          "summary_included_unusual_rows": summary_included_unusual_rows,
+                          "summary_excluded_rows": summary_excluded_rows,
+                          "reversal_unusual_rows": summary_unusual_rows,
+                          "reversal_included_unusual_rows": summary_included_unusual_rows,
+                          "reversal_excluded_rows": summary_excluded_rows,
                           "before_counts": before_counts,
                           "after_counts": after_counts,
                       })
 
-                  # ── TASK 6b ─ Summarize by transaction ──────────────────────────────
+                  # ── TASK 6b ─ Persist summary-ready transactions to Postgres ──────────
+                  - id: persist_transactions_to_db
+                    type: io.kestra.plugin.scripts.python.Script
+                    runIf: "{{ inputs.dry_run == false }}"
+                    containerImage: finpay-pipeline:3.11
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: finpay-network
+                    pythonVersion: "3.11"
+                    timeout: PT5M
+                    inputFiles:
+                      summary_ready.parquet: "{{ outputs.prepare_summary_transactions.outputFiles['summary_ready.parquet'] }}"
+                    env:
+                      CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+                      FINPAY_DB_HOST: finpay-postgres
+                      FINPAY_DB_PORT: "5432"
+                      FINPAY_DB_NAME: finpay
+                      FINPAY_DB_USER: finpay
+                      FINPAY_DB_PASSWORD: finpay
+                    script: |
+                      import os, sys, pandas as pd
+                      sys.path.insert(0, "/app")
+                      from pipeline import postgres_dsn_from_env, write_finpay_dataframe_to_postgres
+                      from kestra import Kestra
+
+                      df = pd.read_parquet("summary_ready.parquet")
+                      rows = write_finpay_dataframe_to_postgres(
+                          df=df,
+                          table_name="finpay_transactions",
+                          cluster_id=os.environ["CLUSTER_ID"],
+                          report_date=os.environ["ISO_DATE"],
+                          dsn=postgres_dsn_from_env(),
+                      )
+
+                      print(f"✅ Persisted summary-ready transactions to Postgres. Rows: {rows}")
+                      Kestra.outputs({"rows": rows, "table": "finpay_transactions"})
+
+                  # ── TASK 6c ─ Summarize by transaction ──────────────────────────────
                   - id: summarize
                     type: io.kestra.plugin.scripts.python.Script
                     containerImage: finpay-pipeline:3.11

@@ -6,3 +6,4 @@ google-auth==2.30.0
 pyarrow
 kestra
 openpyxl
+psycopg[binary]==3.2.3

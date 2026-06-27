@@ -69,7 +69,7 @@ kestra-mmpp-pipeline/
 ├── pipeline_refactored.py   # Core data and Google Sheets functions
 ├── finpay_pipeline.yml      # Kestra flow definition
 ├── Dockerfile               # Builds finpay-pipeline:3.11 and copies pipeline.py into /app
-├── docker-compose.yml       # Kestra + PostgreSQL local stack
+├── docker-compose.yml       # Kestra + PostgreSQL + pgAdmin local stack
 ├── requirements.txt         # Python dependencies for the Docker image
 ├── README.md
 ├── .gitignore
@@ -111,13 +111,37 @@ Default credentials from `docker-compose.yml`:
 admin@kestra.io / Admin1234!
 ```
 
+FinPay pgAdmin UI:
+
+```text
+http://localhost:5050
+```
+
+Default pgAdmin credentials:
+
+```text
+admin@finpay.com / admin
+```
+
+Register the FinPay database server in pgAdmin with:
+
+```text
+Host: finpay-postgres
+Port: 5432
+Database: finpay
+Username: finpay
+Password: finpay
+```
+
+From the host machine, FinPay Postgres is exposed at `localhost:5433`.
+
 ### 2. Build the pipeline image
 
 ```bash
 docker build -t finpay-pipeline:3.11 .
 ```
 
-The image installs `requirements.txt` and copies `pipeline_refactored.py` as `/app/pipeline.py`, which is what the Kestra Python tasks import.
+The image installs `requirements.txt`, including `psycopg`, and copies `pipeline_refactored.py` as `/app/pipeline.py`, which is what the Kestra Python tasks import.
 
 ### 3. Configure Google Sheets credentials
 
@@ -228,21 +252,138 @@ The pipeline continues appending daily summary blocks to the same summary worksh
 | 2 | `determine_current_date` | Computes the `Asia/Makassar` run date and stable summary worksheet name. |
 | 3 | `load_and_validate` | Loads CSV/XLS/XLSX, auto-detects the header row, coerces dtypes, and validates `FINPAY_SCHEMA`. |
 | 4 | `validate_integrity` | Ensures each row does not have both `Debet` and `Kredit` non-zero. |
-| 5 | `preprocess_transaction_labels` | Relabels Reversal rows and Recharge Out Cluster groups before unusual detection, then writes `preprocessed.parquet`. |
-| 6 | `flag_unusual_transactions` | Runs before calculation dedup on preprocessed rows, flags duplicates, fee-rule issues, and invalid reversal groups, then writes `unusual.parquet`. |
-| 7 | `branch_after_unusual_flag` | Runs unusual upload/alerting in parallel with the downstream calculation/detail path. |
-| 7a | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
-| 7b | `notify_unusual_telegram` | Sends a Telegram alert only when unusual rows exist and the run is not a dry run. |
-| 7c | `downstream_processing_branch` | Deduplicates preprocessed rows, then runs QRISDUWIT detail, Reversal detail, and summary branches. |
-| 7c.1 | `deduplicate_transactions` | Writes `deduplicated.parquet` for calculation/detail outputs using all columns except `No`, with `Transaction Date` compared at minute precision. |
-| 7c.2 | `qrisduwit_upload_branch` | Filters `QRISDUWIT` rows, extracts `Disbursement Date` from `Remarks`, and uploads the detail rows. |
-| 7c.3 | `reversal_upload_branch` | Exports rows already labeled as Reversal categories and any unclassified raw `Reversal` rows. |
-| 7c.4 | `summary_upload_branch` | Removes reversal rows excluded from summary, summarizes, and uploads summary. |
-| 7c.4.1 | `prepare_summary_transactions` | Keeps invalid main NGRS/ST groups in summary with unusual flags and excludes fee-only/ambiguous/unclassified reversal groups. |
-| 7c.4.2 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
-| 7c.4.3 | `upload_to_sheets` | Appends the formatted daily summary block to the stable summary worksheet. Skipped on dry run. |
+| 5 | `persist_raw_transactions_to_db` | Replaces the `cluster_id + report_date` batch in `finpay_raw_transactions` before transaction labels are relabeled. Skipped on dry run. |
+| 6 | `preprocess_transaction_labels` | Preserves `raw_transaction_label`, relabels Reversal rows and Recharge Out Cluster groups, adds `processed_transaction_label`, then writes `preprocessed.parquet`. |
+| 7 | `flag_unusual_transactions` | Runs before calculation dedup on preprocessed rows, flags duplicates, fee-rule issues, and invalid reversal groups, then writes `unusual.parquet`. |
+| 9 | `branch_after_unusual_flag` | Runs unusual DB/sheet/alerting work in parallel with the downstream calculation/detail path. |
+| 9a | `persist_unusual_to_db` | Replaces the `cluster_id + report_date` batch in `finpay_unusual_transactions`. Skipped on dry run. |
+| 9b | `upload_unusual_to_sheets` | Uploads unusual rows to the per-cluster unusual worksheet. Skipped on dry run. |
+| 9c | `notify_unusual_telegram` | Sends a Telegram alert only when unusual rows exist and the run is not a dry run. |
+| 9d | `downstream_processing_branch` | Deduplicates preprocessed rows, then runs QRISDUWIT detail, Reversal detail, and summary branches. |
+| 9d.1 | `deduplicate_transactions` | Writes `deduplicated.parquet` for calculation/detail outputs using all columns except `No`, with `Transaction Date` compared at minute precision. |
+| 9d.2 | `qrisduwit_upload_branch` | Filters `QRISDUWIT` rows, extracts `Disbursement Date`, persists them to `finpay_qrisduwit_transactions`, and uploads the detail rows. |
+| 9d.3 | `reversal_upload_branch` | Exports Reversal detail rows, persists them to `finpay_reversal_transactions`, and uploads the detail rows. |
+| 9d.4 | `summary_upload_branch` | Removes reversal rows excluded from summary, summarizes, and uploads summary. |
+| 9d.4.1 | `prepare_summary_transactions` | Keeps invalid main NGRS groups in summary with unusual flags and excludes unsupported ST, fee-only, ambiguous, or unclassified groups. |
+| 9d.4.2 | `persist_transactions_to_db` | Replaces the `cluster_id + report_date` batch in `finpay_transactions` using `summary_ready.parquet`, after relabeling, deduplication, and summary-exclusion rules. Skipped on dry run. |
+| 9d.4.3 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
+| 9d.4.4 | `upload_to_sheets` | Appends the formatted daily summary block to the stable summary worksheet. Skipped on dry run. |
 
 On failure, `notify_on_failure` currently logs the flow ID, execution ID, and UI log path.
+
+---
+
+## Postgres Persistence
+
+The workflow writes to a separate FinPay Postgres database, not Kestra's metadata database. All tables are shared across clusters and include:
+
+```text
+cluster_id
+report_date
+```
+
+The pipeline replaces rows by `cluster_id + report_date` for each table before inserting the current batch. This keeps duplicate transaction rows in the raw table while making reruns idempotent.
+
+Tables:
+
+| Table | Written from | Notes |
+|---|---|---|
+| `finpay_raw_transactions` | `integrity_checked.parquet` | True raw FinPay rows after schema and debit/credit validation, before relabeling. Stores `raw_transaction_label`, not the processed `transaction_label`. |
+| `finpay_transactions` | `summary_ready.parquet` | Stores the workflow dataframe after relabeling, deduplication, and summary-exclusion rules, excluding `No`. |
+| `finpay_unusual_transactions` | `unusual.parquet` | Stores the workflow unusual dataframe, excluding `No`. |
+| `finpay_reversal_transactions` | `reversal.parquet` | Stores the workflow Reversal detail dataframe, excluding `No`. |
+| `finpay_qrisduwit_transactions` | `qrisduwit.parquet` | Stores the workflow QRISDUWIT detail dataframe, excluding `No`. |
+
+For non-raw tables, database columns are generated from the workflow parquet schema by normalizing names for SQL, for example `Transaction Date` becomes `transaction_date`, `Nomor RS` becomes `nomor_rs`, and `Disbursement Date` becomes `disbursement_date`. The source `Transaction` column is not persisted because it duplicates `processed_transaction_label`. Every table includes derived `base_id`; all tables except QRISDUWIT also include `transaction_id_type`, which is `MAIN` for the main transaction ID and otherwise the suffix such as `FEE`, `SLSFEE`, or `SALESFEE`. The database schema intentionally does not create a surrogate `id` column and does not persist FinPay `No`, because `transaction_id` is the business identifier and duplicate rows can have different `No` values. Existing pipeline-owned tables are reconciled on write, so obsolete columns from older schemas such as `id`, `no`, `transaction`, and `created_at` are removed.
+
+Current schema definitions:
+
+```text
+finpay_raw_transactions
+cluster_id TEXT NOT NULL
+report_date DATE NOT NULL
+transaction_date TIMESTAMP
+transaction_id TEXT
+base_id TEXT
+transaction_id_type TEXT
+saldo_awal NUMERIC(18, 2)
+kredit NUMERIC(18, 2)
+debet NUMERIC(18, 2)
+saldo_akhir NUMERIC(18, 2)
+transaction_type TEXT
+raw_transaction_label TEXT
+nomor_rs TEXT
+remarks TEXT
+
+finpay_transactions
+cluster_id TEXT NOT NULL
+report_date DATE NOT NULL
+transaction_date TIMESTAMP
+transaction_id TEXT
+base_id TEXT
+transaction_id_type TEXT
+saldo_awal NUMERIC(18, 2)
+kredit NUMERIC(18, 2)
+debet NUMERIC(18, 2)
+saldo_akhir NUMERIC(18, 2)
+transaction_type TEXT
+raw_transaction_label TEXT
+processed_transaction_label TEXT
+nomor_rs TEXT
+remarks TEXT
+
+finpay_unusual_transactions
+cluster_id TEXT NOT NULL
+report_date DATE NOT NULL
+transaction_date TIMESTAMP
+transaction_id TEXT
+base_id TEXT
+transaction_id_type TEXT
+saldo_awal NUMERIC(18, 2)
+kredit NUMERIC(18, 2)
+debet NUMERIC(18, 2)
+saldo_akhir NUMERIC(18, 2)
+transaction_type TEXT
+raw_transaction_label TEXT
+processed_transaction_label TEXT
+nomor_rs TEXT
+remarks TEXT
+unusual_reason TEXT
+
+finpay_reversal_transactions
+cluster_id TEXT NOT NULL
+report_date DATE NOT NULL
+transaction_date TIMESTAMP
+transaction_id TEXT
+base_id TEXT
+transaction_id_type TEXT
+saldo_awal NUMERIC(18, 2)
+kredit NUMERIC(18, 2)
+debet NUMERIC(18, 2)
+saldo_akhir NUMERIC(18, 2)
+transaction_type TEXT
+raw_transaction_label TEXT
+processed_transaction_label TEXT
+nomor_rs TEXT
+remarks TEXT
+
+finpay_qrisduwit_transactions
+cluster_id TEXT NOT NULL
+report_date DATE NOT NULL
+transaction_date TIMESTAMP
+transaction_id TEXT
+base_id TEXT
+saldo_awal NUMERIC(18, 2)
+kredit NUMERIC(18, 2)
+debet NUMERIC(18, 2)
+saldo_akhir NUMERIC(18, 2)
+transaction_type TEXT
+raw_transaction_label TEXT
+processed_transaction_label TEXT
+nomor_rs TEXT
+remarks TEXT
+disbursement_date DATE
+```
 
 ---
 
@@ -262,6 +403,8 @@ Fee validation currently monitors:
 | `RECHARGE` | `RECHARGEFEE` with total `Debet == 20`, unless exempt by the unusual out-cluster remark. |
 | `SELLTHRU` | `SELLTHRUFEE` with total `Debet == 100` and at least one `SELLTHRUSALESFEE` row. |
 
+Known fee rows without their main transaction are also flagged as unusual and excluded from summary, for example `RECHARGEFEE` without `RECHARGE`, or `SELLTHRUFEE` / `SELLTHRUSALESFEE` without `SELLTHRU`.
+
 Flagged rows include the original transaction rows plus:
 
 ```text
@@ -275,13 +418,13 @@ Reversal rows are classified for summary from `Remarks`:
 
 | Summary category | Required remarks and Kredit rules |
 |---|---|
-| `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`. Rows with `Fee Pembelian recharge out cluster` are also classified as NGRS and still require the Rp 20 fee. Rows containing `biaya pembelian recharge out cluster` are exempt from the fee requirement. |
+| `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`. Rows containing `biaya pembelian recharge out cluster` are exempt from the fee requirement. |
 | `Reversal - NGRS FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-`; total `Kredit` must be `20` unless the group is out-cluster exempt. |
-| `Reversal - ST` | Main reversal rows with `Sellthru Sales Fee`. |
-| `Reversal - ST SELLTHRUFEE` | Fee rows with `Platform Fee Sellthru Rp. 100,-` or `Fee Transaksi Sellthru sejumlah 100 rupiah`; total `Kredit` must be `100`. |
-| `Reversal - ST SELLTHRUSALESFEE` | Sales hold rows with `Sales Hold Transaksi Sellthru`; total `Kredit` must be non-zero. |
+| `Reversal - Recharge Out Cluster` | Main reversal rows with `Fee Pembelian recharge out cluster`. Invalid groups with this main row are still included in summary. |
+| `Reversal - Recharge Out Cluster FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-` in the same out-cluster reversal group; total `Kredit` must be `20`. |
+| `Reversal - ST*` | Any ST reversal row is unusual-only and excluded from summary. This includes `Sellthru Sales Fee`, `Platform Fee Sellthru Rp. 100,-`, `Fee Transaksi Sellthru sejumlah 100 rupiah`, and `Sales Hold Transaksi Sellthru`. |
 
-Invalid reversal groups are always written to the unusual output. If the group has a main `Reversal - NGRS` or `Reversal - ST` row, it is still transformed and included in the summary with a reason ending in `included in summary`. Fee-only, ambiguous, or unclassified reversal groups are written with a reason ending in `excluded from summary` and are removed before summary aggregation.
+Invalid reversal groups are always written to the unusual output. If the group has a main `Reversal - NGRS` or `Reversal - Recharge Out Cluster` row, it is still transformed and included in the summary with a reason ending in `included in summary`. ST, fee-only, ambiguous, or unclassified reversal groups are written with a reason ending in `excluded from summary` and are removed before summary aggregation.
 
 ---
 
@@ -323,26 +466,70 @@ Daily data rows are written in this fixed order:
 | RECHARGE OUT CLUSTER FEE | `RECHARGE OUT CLUSTER FEE` |
 | REVERSAL NGRS | `Reversal - NGRS` |
 | REVERSAL NGRS FEE | `Reversal - NGRS FEE` |
-| REVERSAL ST | `Reversal - ST` |
-| REVERSAL ST SELLTHRUFEE | `Reversal - ST SELLTHRUFEE` |
-| REVERSAL ST SELLTHRUSALESFEE | `Reversal - ST SELLTHRUSALESFEE` |
+| REVERSAL RECHARGE OUT CLUSTER | `Reversal - Recharge Out Cluster` |
+| REVERSAL RECHARGE OUT CLUSTER FEE | `Reversal - Recharge Out Cluster FEE` |
 | ST | `SELLTHRU` |
 | BIAYA FEE ST | `SELLTHRUFEE` |
 | BIAYA FEE BAR A. ST | `SELLTHRUSALESFEE` |
 
-Footer rows are formula-based:
+Each daily block then writes three formula-based summary sections in this order:
+
+1. `CASH IN TEAM REPORT`
+2. `ACCOUNTING REPORT`
+3. `FOOTER SUMMARY`
+
+Cash In Team rows:
+
+Cash In values are split across `DEBET` and `KREDIT`: positive net values are written in `DEBET`, and negative net values are written as positive amounts in `KREDIT`.
+
+| Row | Formula meaning |
+|---|---|
+| NGRS | Net value of `RECHARGE`. |
+| Recharge Fee | Net value of `RECHARGEFEE`. |
+| Reversal - NGRS | Net value of `Reversal - NGRS`. |
+| Reversal - NGRS FEE | Net value of `Reversal - NGRS FEE`. |
+| QRISDUWIT | Net of `QRISDUWIT`. |
+
+Accounting rows:
+
+Accounting values use the same split layout as Cash In, so report rows do not show negative amounts.
+
+| Row | Formula meaning |
+|---|---|
+| PPOB | Net of `FeeTransaksi`. |
+| DISBURSEMENT | Net of `DISBURSEMENT`. |
+| Recharge Out Cluster | Net value of `RECHARGE OUT CLUSTER`. |
+| Recharge Out Cluster FEE | Net value of `RECHARGE OUT CLUSTER FEE`. |
+| Reversal - Recharge Out Cluster | Net value of `Reversal - Recharge Out Cluster`. |
+| Reversal - Recharge Out Cluster FEE | Net value of `Reversal - Recharge Out Cluster FEE`. |
+| ST | Net value of `SELLTHRU`. |
+| ST FEE | Net value of `SELLTHRUFEE`. |
+| ST SLSFEE | Net value of `SELLTHRUSALESFEE`. |
+
+Footer Summary rows:
 
 | Footer | Formula meaning |
 |---|---|
 | NGRS | Net of `RECHARGE` minus `RECHARGEFEE`. |
 | Recharge Out Cluster | Net of `RECHARGE OUT CLUSTER` minus `RECHARGE OUT CLUSTER FEE`. |
 | Reversal - NGRS | Net of `Reversal - NGRS` minus `Reversal - NGRS FEE`. |
+| Reversal - Recharge Out Cluster | Net of `Reversal - Recharge Out Cluster` minus `Reversal - Recharge Out Cluster FEE`. |
 | PPOB | Net of `FeeTransaksi`. |
 | ST | Net of `SELLTHRU`, `SELLTHRUFEE`, and `SELLTHRUSALESFEE`. |
-| Reversal - ST | Net of `Reversal - ST` minus `Reversal - ST SELLTHRUFEE` and `Reversal - ST SELLTHRUSALESFEE`. |
 | DISBURSEMENT | Net of `DISBURSEMENT`. |
 | QRISDUWIT | Net of `QRISDUWIT`. |
 | Total | Sum of the footer rows above. |
+
+After `Total`, the block writes two reconciliation rows:
+
+| Row | Behavior |
+|---|---|
+| MANDIRI | Editable input cell in column C. It defaults to the `TRANSFER MASUK DARI FINPAY` source Kredit value when present, otherwise stays blank for manual input. |
+| SELISIH | Formula row where `SELISIH = MANDIRI - Total`; status shows `sesuai`, `lebih bayar n`, or `kurang bayar n`. |
+
+The header row is frozen on each output worksheet; no separate dashboard range is written.
+
+Generated cells are protected after each write. Summary, unusual, QRISDUWIT, and Reversal output ranges are protected for the service account; in the summary sheet, only the daily `MANDIRI` input cell is left unprotected. Users must have spreadsheet editor access to fill that input cell; commenter access cannot edit it.
 
 ### Unusual worksheet
 
@@ -403,7 +590,7 @@ Both detail exports run in parallel with `summary_upload_branch` after deduplica
 | QRISDUWIT | `QRISDUWIT` |
 | Reversal | Any preprocessed Reversal category plus unclassified raw `Reversal` rows |
 
-The Reversal detail export uses the same remark-based categories as the summary transform, such as `Reversal - NGRS`, `Reversal - NGRS FEE`, and `Reversal - ST SELLTHRUFEE`. Rows whose remarks cannot be classified remain `Reversal`; invalid but classifiable rows still show their reversal category and are explained in the unusual sheet.
+The Reversal detail export uses the same remark-based categories as the summary transform, such as `Reversal - NGRS`, `Reversal - Recharge Out Cluster FEE`, and `Reversal - ST SELLTHRUFEE`. Rows whose remarks cannot be classified remain `Reversal`; invalid but classifiable rows still show their reversal category and are explained in the unusual sheet.
 
 QRISDUWIT rows include an extra `DISBURSEMENT DATE` column derived from `Remarks` using the phrase `tanggal DD-MM-YYYY`. For example, this remark:
 

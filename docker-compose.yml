@@ -1,12 +1,23 @@
 volumes:
   postgres-data:
     driver: local
+  finpay-postgres-data:
+    driver: local
+  pgadmin-data:
+    driver: local
   kestra-data:
     driver: local
+
+networks:
+  finpay-network:
+    name: finpay-network
+    driver: bridge
 
 services:
   postgres:
     image: postgres:18
+    networks:
+      - finpay-network
     volumes:
       - postgres-data:/var/lib/postgresql
     environment:
@@ -19,8 +30,43 @@ services:
       timeout: 10s
       retries: 10
 
+  finpay-postgres:
+    image: postgres:18
+    networks:
+      - finpay-network
+    volumes:
+      - finpay-postgres-data:/var/lib/postgresql
+    environment:
+      POSTGRES_DB: finpay
+      POSTGRES_USER: finpay
+      POSTGRES_PASSWORD: finpay
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  finpay-pgadmin:
+    image: dpage/pgadmin4:latest
+    networks:
+      - finpay-network
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@finpay.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    depends_on:
+      finpay-postgres:
+        condition: service_healthy
+
   kestra:
     image: kestra/kestra:latest
+    networks:
+      - finpay-network
     pull_policy: always
     stop_grace_period: 6m
     user: "root"
@@ -63,9 +109,12 @@ services:
             configurations:
               - type: io.kestra.plugin.scripts.runner.docker.Docker
                 values:
-                  volume-enabled: true
+                  volumeEnabled: true
+                  networkMode: finpay-network
     ports:
       - "8080:8080"
     depends_on:
       postgres:
+        condition: service_healthy
+      finpay-postgres:
         condition: service_healthy

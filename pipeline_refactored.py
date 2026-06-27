@@ -12,7 +12,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 import os
 import re
-
+import psycopg
+from psycopg import sql
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1  load & validate schema
@@ -219,7 +220,422 @@ def validate_debit_credit_integrity(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2a  preprocessing: drop duplicate rows
+# STEP 2a  database persistence helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+FINPAY_DB_TABLES = {
+    "finpay_raw_transactions",
+    "finpay_transactions",
+    "finpay_unusual_transactions",
+    "finpay_reversal_transactions",
+    "finpay_qrisduwit_transactions",
+}
+
+FINPAY_DB_CORE_COLUMNS = [
+    ("cluster_id", "TEXT NOT NULL"),
+    ("report_date", "DATE NOT NULL"),
+]
+
+FINPAY_DB_RAW_TRANSACTION_COLUMNS = [
+    ("transaction_date", "TIMESTAMP"),
+    ("transaction_id", "TEXT"),
+    ("base_id", "TEXT"),
+    ("transaction_id_type", "TEXT"),
+    ("saldo_awal", "NUMERIC(18, 2)"),
+    ("kredit", "NUMERIC(18, 2)"),
+    ("debet", "NUMERIC(18, 2)"),
+    ("saldo_akhir", "NUMERIC(18, 2)"),
+    ("transaction_type", "TEXT"),
+    ("raw_transaction_label", "TEXT"),
+    ("nomor_rs", "TEXT"),
+    ("remarks", "TEXT"),
+]
+
+FINPAY_DB_RAW_TABLE_SCHEMA = [
+    *FINPAY_DB_CORE_COLUMNS,
+    *FINPAY_DB_RAW_TRANSACTION_COLUMNS,
+]
+
+FINPAY_DB_WORKFLOW_SOURCE_COLUMNS = {
+    "finpay_transactions": [
+        "Transaction Date",
+        "Transaction ID",
+        "base_id",
+        "transaction_id_type",
+        "Saldo Awal",
+        "Kredit",
+        "Debet",
+        "Saldo Akhir",
+        "Transaction Type",
+        "raw_transaction_label",
+        "processed_transaction_label",
+        "Nomor RS",
+        "Remarks",
+    ],
+    "finpay_unusual_transactions": [
+        "Transaction Date",
+        "Transaction ID",
+        "base_id",
+        "transaction_id_type",
+        "Saldo Awal",
+        "Kredit",
+        "Debet",
+        "Saldo Akhir",
+        "Transaction Type",
+        "raw_transaction_label",
+        "processed_transaction_label",
+        "Nomor RS",
+        "Remarks",
+        "unusual_reason",
+    ],
+    "finpay_reversal_transactions": [
+        "Transaction Date",
+        "Transaction ID",
+        "base_id",
+        "transaction_id_type",
+        "Saldo Awal",
+        "Kredit",
+        "Debet",
+        "Saldo Akhir",
+        "Transaction Type",
+        "raw_transaction_label",
+        "processed_transaction_label",
+        "Nomor RS",
+        "Remarks",
+    ],
+    "finpay_qrisduwit_transactions": [
+        "Transaction Date",
+        "Transaction ID",
+        "base_id",
+        "Saldo Awal",
+        "Kredit",
+        "Debet",
+        "Saldo Akhir",
+        "Transaction Type",
+        "raw_transaction_label",
+        "processed_transaction_label",
+        "Nomor RS",
+        "Remarks",
+        "Disbursement Date",
+    ],
+}
+
+FINPAY_DB_SOURCE_COLUMN_MAP = {
+    "transaction_date": "Transaction Date",
+    "transaction_id": "Transaction ID",
+    "transaction_id_type": "transaction_id_type",
+    "saldo_awal": "Saldo Awal",
+    "kredit": "Kredit",
+    "debet": "Debet",
+    "saldo_akhir": "Saldo Akhir",
+    "transaction_type": "Transaction Type",
+    "nomor_rs": "Nomor RS",
+    "remarks": "Remarks",
+    "base_id": "base_id",
+    "disbursement_date": "Disbursement Date",
+    "unusual_reason": "unusual_reason",
+}
+
+
+def postgres_dsn_from_env(prefix: str = "FINPAY_DB_") -> str:
+    host = os.environ.get(f"{prefix}HOST", "localhost")
+    port = os.environ.get(f"{prefix}PORT", "5432")
+    dbname = os.environ.get(f"{prefix}NAME", "finpay")
+    user = os.environ.get(f"{prefix}USER", "finpay")
+    password = os.environ.get(f"{prefix}PASSWORD", "")
+    return (
+        f"host={host} port={port} dbname={dbname} user={user} "
+        f"password={password}"
+    )
+
+
+def _normalize_finpay_db_column_name(column: object) -> str:
+    normalized = re.sub(r"[^0-9a-zA-Z]+", "_", str(column).strip().lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized or "column"
+
+
+def _finpay_db_type_for_column(column_name: str, series: pd.Series | None = None) -> str:
+    if column_name == "transaction_date":
+        return "TIMESTAMP"
+    if column_name == "disbursement_date":
+        return "DATE"
+    if column_name in {"saldo_awal", "kredit", "debet", "saldo_akhir"}:
+        return "NUMERIC(18, 2)"
+    if series is not None:
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return "TIMESTAMP"
+        if pd.api.types.is_bool_dtype(series):
+            return "BOOLEAN"
+        if pd.api.types.is_integer_dtype(series) or pd.api.types.is_float_dtype(series):
+            return "NUMERIC(18, 2)"
+    return "TEXT"
+
+
+def _dynamic_finpay_db_schema_from_dataframe(
+    df: pd.DataFrame,
+    source_columns: list[str],
+) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """
+    Build a SQL-friendly schema from the expected workflow dataframe columns.
+
+    The source `No` column is intentionally excluded because it is not a stable
+    transaction identifier. Other columns are retained with normalized names.
+    """
+    schema = list(FINPAY_DB_CORE_COLUMNS)
+    source_by_db_column: dict[str, str] = {}
+    used_columns = {column_name for column_name, _ in schema}
+
+    for source_column in source_columns:
+        normalized = _normalize_finpay_db_column_name(source_column)
+        if normalized == "no":
+            continue
+
+        db_column = normalized
+        suffix = 2
+        while db_column in used_columns:
+            db_column = f"{normalized}_{suffix}"
+            suffix += 1
+
+        used_columns.add(db_column)
+        source_by_db_column[db_column] = source_column
+        source_series = df[source_column] if source_column in df.columns else None
+        schema.append((db_column, _finpay_db_type_for_column(db_column, source_series)))
+
+    return schema, source_by_db_column
+
+
+def _finpay_db_schema_for_write(
+    table_name: str,
+    df: pd.DataFrame,
+) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    if table_name == "finpay_raw_transactions":
+        return FINPAY_DB_RAW_TABLE_SCHEMA, {}
+    if table_name not in FINPAY_DB_WORKFLOW_SOURCE_COLUMNS:
+        raise ValueError(f"Unsupported FinPay DB table: {table_name}")
+    return _dynamic_finpay_db_schema_from_dataframe(
+        df,
+        FINPAY_DB_WORKFLOW_SOURCE_COLUMNS[table_name],
+    )
+
+
+def _finpay_db_column_names(table_name: str, df: pd.DataFrame | None = None) -> list[str]:
+    if df is None:
+        if table_name == "finpay_raw_transactions":
+            return [column_name for column_name, _ in FINPAY_DB_RAW_TABLE_SCHEMA]
+        if table_name not in FINPAY_DB_WORKFLOW_SOURCE_COLUMNS:
+            raise ValueError(f"Unsupported FinPay DB table: {table_name}")
+        schema, _ = _dynamic_finpay_db_schema_from_dataframe(
+            pd.DataFrame(),
+            FINPAY_DB_WORKFLOW_SOURCE_COLUMNS[table_name],
+        )
+        return [column_name for column_name, _ in schema]
+    schema, _ = _finpay_db_schema_for_write(table_name, df)
+    return [column_name for column_name, _ in schema]
+
+
+def finpay_db_schema_definition(table_name: str) -> list[tuple[str, str]]:
+    """Return the expected database columns and SQL types for a FinPay table."""
+    if table_name == "finpay_raw_transactions":
+        return list(FINPAY_DB_RAW_TABLE_SCHEMA)
+    if table_name not in FINPAY_DB_WORKFLOW_SOURCE_COLUMNS:
+        raise ValueError(f"Unsupported FinPay DB table: {table_name}")
+    schema, _ = _dynamic_finpay_db_schema_from_dataframe(
+        pd.DataFrame(),
+        FINPAY_DB_WORKFLOW_SOURCE_COLUMNS[table_name],
+    )
+    return schema
+
+
+def _finpay_db_create_table_request(table_name: str, schema: list[tuple[str, str]]):
+    column_defs = sql.SQL(",\n            ").join(
+        sql.SQL("{} {}").format(sql.Identifier(column_name), sql.SQL(column_type))
+        for column_name, column_type in schema
+    )
+
+    return sql.SQL("""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            {column_defs}
+        )
+    """).format(
+        table_name=sql.Identifier(table_name),
+        column_defs=column_defs,
+    )
+
+
+def _reconcile_finpay_db_table_schema(
+    cur,
+    table_name: str,
+    schema: list[tuple[str, str]],
+) -> None:
+    """
+    Keep pipeline-owned FinPay tables aligned with the current write schema.
+
+    Older versions created a generic wide shape with id/no/created_at. The DB is
+    a pipeline-owned reporting store, so obsolete pipeline columns are removed
+    while existing rows in still-required columns are preserved.
+    """
+    expected_columns = dict(schema)
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = %s
+        """,
+        (table_name,),
+    )
+    existing_columns = {row[0] for row in cur.fetchall()}
+
+    for column_name, column_type in schema:
+        if column_name in existing_columns:
+            continue
+        nullable_column_type = column_type.replace(" NOT NULL", "")
+        cur.execute(
+            sql.SQL("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+            .format(
+                table_name=sql.Identifier(table_name),
+                column_name=sql.Identifier(column_name),
+                column_type=sql.SQL(nullable_column_type),
+            )
+        )
+
+    for column_name in sorted(existing_columns - set(expected_columns)):
+        cur.execute(
+            sql.SQL("ALTER TABLE {table_name} DROP COLUMN IF EXISTS {column_name}")
+            .format(
+                table_name=sql.Identifier(table_name),
+                column_name=sql.Identifier(column_name),
+            )
+        )
+
+
+def _finpay_db_index_request(table_name: str):
+
+    index_name = f"{table_name}_cluster_report_date_idx"
+    return sql.SQL(
+        "CREATE INDEX IF NOT EXISTS {index_name} "
+        "ON {table_name} (cluster_id, report_date)"
+    ).format(
+        index_name=sql.Identifier(index_name),
+        table_name=sql.Identifier(table_name),
+    )
+
+
+def _db_value(value, column: str):
+    if pd.isna(value):
+        return None
+    if column == "transaction_date":
+        return pd.to_datetime(value).to_pydatetime()
+    if column == "disbursement_date":
+        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+        return None if pd.isna(parsed) else parsed.date()
+    if column in {"saldo_awal", "kredit", "debet", "saldo_akhir"}:
+        return float(value)
+    return str(value)
+
+
+def _transaction_id_type_from_transaction_id(transaction_id: pd.Series) -> pd.Series:
+    transaction_text = transaction_id.astype(str)
+    suffix = transaction_text.str.extract(r"(SLSFEE|SALESFEE|FEE)$", expand=False)
+    return suffix.fillna("MAIN")
+
+
+def _db_enriched_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    if "Transaction ID" in result.columns:
+        if "base_id" not in result.columns:
+            result["base_id"] = _base_id_from_transaction_id(result["Transaction ID"])
+        if "transaction_id_type" not in result.columns:
+            result["transaction_id_type"] = _transaction_id_type_from_transaction_id(
+                result["Transaction ID"]
+            )
+    if "Transaction" in result.columns and "processed_transaction_label" not in result.columns:
+        result["processed_transaction_label"] = result["Transaction"]
+    return result
+
+
+def _db_raw_source_value(row: pd.Series, db_column: str):
+    if db_column == "raw_transaction_label":
+        return row["Transaction"] if "Transaction" in row.index else None
+    source_column = FINPAY_DB_SOURCE_COLUMN_MAP.get(db_column)
+    if source_column and source_column in row.index:
+        return row[source_column]
+    return None
+
+
+def write_finpay_dataframe_to_postgres(
+    df: pd.DataFrame,
+    table_name: str,
+    cluster_id: str,
+    report_date: str,
+    dsn: str,
+) -> int:
+    """
+    Replace one cluster/date batch in a FinPay table with the supplied DataFrame.
+
+    The delete-and-insert strategy makes workflow reruns idempotent for the same
+    cluster_id + report_date. The caller decides whether the dataframe is raw,
+    deduplicated, unusual-only, or summary-ready.
+    """
+    if table_name not in FINPAY_DB_TABLES:
+        raise ValueError(f"Unsupported FinPay DB table: {table_name}")
+
+    report_date_value = pd.to_datetime(report_date).date()
+    db_df = _db_enriched_dataframe(df)
+    schema, source_by_db_column = _finpay_db_schema_for_write(table_name, db_df)
+    insert_columns = [column_name for column_name, _ in schema]
+
+    rows = []
+    for _, row in db_df.iterrows():
+        db_row = {
+            "cluster_id": cluster_id,
+            "report_date": report_date_value,
+        }
+        for db_col in insert_columns:
+            if db_col in db_row:
+                continue
+            if table_name == "finpay_raw_transactions":
+                value = _db_raw_source_value(row, db_col)
+            else:
+                source_column = source_by_db_column.get(db_col)
+                value = row[source_column] if source_column in row.index else None
+            db_row[db_col] = _db_value(value, db_col)
+        rows.append(tuple(db_row.get(col) for col in insert_columns))
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(_finpay_db_create_table_request(table_name, schema))
+            _reconcile_finpay_db_table_schema(cur, table_name, schema)
+            cur.execute(_finpay_db_index_request(table_name))
+            cur.execute(
+                sql.SQL(
+                    "DELETE FROM {table_name} "
+                    "WHERE cluster_id = %s AND report_date = %s"
+                ).format(table_name=sql.Identifier(table_name)),
+                (cluster_id, report_date_value),
+            )
+
+            if rows:
+                placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in insert_columns)
+                cur.executemany(
+                    sql.SQL("INSERT INTO {table_name} ({columns}) VALUES ({values})")
+                    .format(
+                        table_name=sql.Identifier(table_name),
+                        columns=sql.SQL(", ").join(
+                            sql.Identifier(col) for col in insert_columns
+                        ),
+                        values=placeholders,
+                    ),
+                    rows,
+                )
+        conn.commit()
+
+    return len(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2b  preprocessing: drop duplicate rows
 # ─────────────────────────────────────────────────────────────────────────────
 
 DUPLICATE_UNUSUAL_REASON = "duplicate row removed from calculation"
@@ -350,17 +766,28 @@ def setup_initial_headers_and_saldo(
     ws = sh.worksheet(target_worksheet)
 
     # Column widths
-    widths = {0: 100, 1: 240, 2: 140, 3: 140, 4: 140}
+    widths = {0: 100, 1: 320, 2: 140, 3: 140, 4: 140}
     sh.batch_update({"requests": [
         {
-            "updateDimensionProperties": {
-                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
-                          "startIndex": i, "endIndex": i + 1},
-                "properties": {"pixelSize": px},
-                "fields": "pixelSize",
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
             }
-        }
-        for i, px in widths.items()
+        },
+        *[
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                              "startIndex": i, "endIndex": i + 1},
+                    "properties": {"pixelSize": px},
+                    "fields": "pixelSize",
+                }
+            }
+            for i, px in widths.items()
+        ],
     ]})
 
     date_display = pd.to_datetime(starting_date_str).strftime("%d/%m/%Y")
@@ -371,6 +798,13 @@ def setup_initial_headers_and_saldo(
 
     ws.format("A1:E1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
     ws.format("E2", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}})
+    _protect_written_ranges(
+        gspread_client,
+        sh,
+        ws,
+        [(1, 2, 1, 5, "FinPay generated opening balance")],
+        replace_descriptions=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -401,7 +835,14 @@ def append_daily_to_gsheet(
 
     COL_HEADER = {"red": 0.122, "green": 0.306, "blue": 0.471}
     COL_WHITE  = {"red": 1,     "green": 1,     "blue": 1}
-    COL        = {"red": 0.741, "green": 0.843, "blue": 0.933}
+    COL_CASH_HEADER = {"red": 0.820, "green": 0.910, "blue": 0.800}
+    COL_CASH_BODY = {"red": 0.925, "green": 0.973, "blue": 0.910}
+    COL_ACCOUNTING_HEADER = {"red": 0.980, "green": 0.900, "blue": 0.700}
+    COL_ACCOUNTING_BODY = {"red": 1.000, "green": 0.965, "blue": 0.840}
+    COL_STATUS = {"red": 0.965, "green": 0.930, "blue": 0.990}
+    COL_FOOTER_HEADER = {"red": 0.800, "green": 0.880, "blue": 0.950}
+    COL_FOOTER_BODY = {"red": 0.900, "green": 0.940, "blue": 0.980}
+    COL_INPUT = COL_STATUS
 
     sh = gspread_client.open(target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
@@ -435,9 +876,8 @@ def append_daily_to_gsheet(
         ("RECHARGE OUT CLUSTER FEE",   "RECHARGE OUT CLUSTER FEE"),
         ("REVERSAL NGRS",              REVERSAL_NGRS_CATEGORY),
         ("REVERSAL NGRS FEE",          REVERSAL_NGRS_FEE_CATEGORY),
-        ("REVERSAL ST",                REVERSAL_ST_CATEGORY),
-        ("REVERSAL ST SELLTHRUFEE",    REVERSAL_ST_SELLTHRU_FEE_CATEGORY),
-        ("REVERSAL ST SELLTHRUSALESFEE", REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY),
+        ("REVERSAL RECHARGE OUT CLUSTER", REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY),
+        ("REVERSAL RECHARGE OUT CLUSTER FEE", REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY),
         ("ST",                         "SELLTHRU"),
         ("BIAYA FEE ST",               "SELLTHRUFEE"),
         ("BIAYA FEE BAR A. ST",        "SELLTHRUSALESFEE"),
@@ -461,11 +901,69 @@ def append_daily_to_gsheet(
     #  +1 QRISDUWIT  +2 DISBURSEMENT  +3 FeeTransaksi
     #  +4 RECHARGE   +5 RECHARGEFEE   +6 RECHARGE OUT CLUSTER
     #  +7 RECHARGE OUT CLUSTER FEE    +8 Reversal NGRS
-    #  +9 Reversal NGRS FEE  +10 Reversal ST
-    #  +11 Reversal ST SELLTHRUFEE  +12 Reversal ST SELLTHRUSALESFEE
-    #  +13 SELLTHRU  +14 SELLTHRUFEE  +15 SELLTHRUSALESFEE
+    #  +9 Reversal NGRS FEE  +10 Reversal Recharge Out Cluster
+    #  +11 Reversal Recharge Out Cluster FEE
+    #  +12 SELLTHRU  +13 SELLTHRUFEE  +14 SELLTHRUSALESFEE
     ir = insert_row
-    n  = len(KETERANGAN)   # footer rows start at ir + n
+
+    def _split_net_formula(net_formula: str) -> tuple[str, str]:
+        expression = net_formula[1:] if net_formula.startswith("=") else net_formula
+        return f"=MAX(({expression}),0)", f"=MAX(-({expression}),0)"
+
+    cash_report_rows = [
+        ("NGRS", *_split_net_formula(f"=C{ir+4}-D{ir+4}")),
+        ("Recharge Fee", *_split_net_formula(f"=C{ir+5}-D{ir+5}")),
+        ("Reversal - NGRS", *_split_net_formula(f"=C{ir+8}-D{ir+8}")),
+        ("Reversal - NGRS FEE", *_split_net_formula(f"=C{ir+9}-D{ir+9}")),
+        ("QRISDUWIT", *_split_net_formula(f"=C{ir+1}-D{ir+1}")),
+    ]
+
+    accounting_report_rows = [
+        ("PPOB", *_split_net_formula(f"=C{ir+3}-D{ir+3}")),
+        ("DISBURSEMENT", *_split_net_formula(f"=C{ir+2}-D{ir+2}")),
+        ("Recharge Out Cluster", *_split_net_formula(f"=C{ir+6}-D{ir+6}")),
+        ("Recharge Out Cluster FEE", *_split_net_formula(f"=C{ir+7}-D{ir+7}")),
+        (
+            "Reversal - Recharge Out Cluster",
+            *_split_net_formula(f"=C{ir+10}-D{ir+10}"),
+        ),
+        (
+            "Reversal - Recharge Out Cluster FEE",
+            *_split_net_formula(f"=C{ir+11}-D{ir+11}"),
+        ),
+        ("ST", *_split_net_formula(f"=C{ir+12}-D{ir+12}")),
+        ("BIAYA FEE ST", *_split_net_formula(f"=C{ir+13}-D{ir+13}")),
+        ("BIAYA FEE BAR A. ST", *_split_net_formula(f"=C{ir+14}-D{ir+14}")),
+    ]
+
+    def _append_summary_section(
+        title: str,
+        report_rows: list[tuple[str, str, str]],
+    ) -> tuple[int, int, int]:
+        nonlocal r
+        header_row = r
+        rows_to_append.append([formatted_date, title, "", "", ""])
+        r += 1
+        body_start = r
+        for label, debet_formula, kredit_formula in report_rows:
+            rows_to_append.append(["", label, debet_formula, kredit_formula, ""])
+            r += 1
+        body_end = r - 1
+        return header_row, body_start, body_end
+
+    cash_header, cash_start, cash_end = _append_summary_section(
+        "CASH IN REPORT",
+        cash_report_rows,
+    )
+    accounting_header, accounting_start, accounting_end = _append_summary_section(
+        "ACCOUNTING REPORT",
+        accounting_report_rows,
+    )
+
+    footer_header = r
+    rows_to_append.append([formatted_date, "Transaction SUMMARY", "", "", ""])
+    r += 1
+    footer_start = r
     footer_formulas = [
         # NGRS = net(RECHARGE - RECHARGEFEE)
         f"=C{ir+4}-D{ir+4}+C{ir+5}-D{ir+5}",
@@ -473,54 +971,115 @@ def append_daily_to_gsheet(
         f"=C{ir+6}-D{ir+6}+C{ir+7}-D{ir+7}",
         # Reversal - NGRS = net(Reversal NGRS - Reversal NGRS fee)
         f"=(C{ir+8}-D{ir+8})+(C{ir+9}-D{ir+9})",
+        # Reversal - Recharge Out Cluster = net(out-cluster reversal - fee)
+        f"=(C{ir+10}-D{ir+10})+(C{ir+11}-D{ir+11})",
         # PPOB  = net(FeeTransaksi)
         f"=C{ir+3}-D{ir+3}",
         # ST = net(SELLTHRU family only)
-        f"=C{ir+13}-D{ir+13}+C{ir+14}-D{ir+14}+C{ir+15}-D{ir+15}",
-        # Reversal - ST = net(Reversal ST - reversal sellthru fees)
-        f"=(C{ir+10}-D{ir+10})+(C{ir+11}-D{ir+11})+(C{ir+12}-D{ir+12})",
+        f"=C{ir+12}-D{ir+12}+C{ir+13}-D{ir+13}+C{ir+14}-D{ir+14}",
         # DISBURSEMENT
         f"=C{ir+2}-D{ir+2}",
         # QRISDUWIT
         f"=C{ir+1}-D{ir+1}",
     ]
-    # Total = sum of the footer C-cells above
-    footer_formulas.append(
-        "=" + "+".join(f"C{ir + n + j}" for j in range(len(footer_formulas)))
-    )
-
     FOOTER_LABELS = [
         "NGRS",
         "Recharge Out Cluster",
         "Reversal - NGRS",
+        "Reversal - Recharge Out Cluster",
         "PPOB",
         "ST",
-        "Reversal - ST",
         "DISBURSEMENT",
         "QRISDUWIT",
         "Total",
     ]
+    footer_formulas.append(
+        "=" + "+".join(f"C{footer_start + j}" for j in range(len(footer_formulas)))
+    )
     for i, f_label in enumerate(FOOTER_LABELS):
-        rows_to_append.append([formatted_date if i == 0 else "", f_label, footer_formulas[i], "", ""])
+        rows_to_append.append(["", f_label, footer_formulas[i], "", ""])
         r += 1
+    footer_end = r - 1
+    mandiri_row = r
+    transfer_masuk_kredit_cell = f"C{ir}"
+    mandiri_formula = (
+        f'=IF(OR({transfer_masuk_kredit_cell}="",{transfer_masuk_kredit_cell}=0),'
+        f'"",{transfer_masuk_kredit_cell})'
+    )
+    rows_to_append.append(["", "MANDIRI", mandiri_formula, "", ""])
+    r += 1
+    selisih_row = r
+    selisih_formula = f'=IF(C{mandiri_row}="","",C{mandiri_row}-C{footer_end})'
+    selisih_status_formula = (
+        f'=IF(C{mandiri_row}="","",'
+        f'IF(C{selisih_row}=0,"sesuai",'
+        f'IF(C{selisih_row}>0,'
+        f'"lebih bayar "&TEXT(C{selisih_row},"#,##0"),'
+        f'"kurang bayar "&TEXT(ABS(C{selisih_row}),"#,##0"))))'
+    )
+    rows_to_append.append(["", "SELISIH", selisih_formula, selisih_status_formula, ""])
+    reconciliation_end = r
 
     ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
 
     # Formatting
-    data_start   = insert_row
-    data_end     = insert_row + len(KETERANGAN)
-    footer_start = data_end
-    footer_end   = footer_start + len(FOOTER_LABELS) - 1
+    data_start = insert_row
+    data_end = insert_row + len(KETERANGAN) - 1
     IDR = {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}
 
-    ws.format(_range(data_start, data_end),    {"backgroundColor": COL_WHITE})
-    ws.format(f"C{data_start}:E{data_end}",    {"numberFormat": IDR})
+    def _format_report_section(
+        header_row: int,
+        body_start: int,
+        body_end: int,
+        header_color: dict,
+        body_color: dict,
+    ) -> None:
+        ws.format(_range(header_row, header_row), {
+            "backgroundColor": header_color,
+            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+            "horizontalAlignment": "CENTER",
+        })
+        ws.format(_range(body_start, body_end), {"backgroundColor": body_color})
+        ws.format(f"C{body_start}:D{body_end}", {"numberFormat": IDR})
+        ws.format(_range(header_row, header_row), {
+            "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
+        })
+
+    ws.format(_range(data_start, data_end), {"backgroundColor": COL_WHITE})
+    ws.format(f"C{data_start}:E{data_end}", {"numberFormat": IDR})
+    _format_report_section(
+        cash_header, cash_start, cash_end, COL_CASH_HEADER, COL_CASH_BODY
+    )
+    _format_report_section(
+        accounting_header,
+        accounting_start,
+        accounting_end,
+        COL_ACCOUNTING_HEADER,
+        COL_ACCOUNTING_BODY,
+    )
+    _format_report_section(
+        footer_header, footer_start, footer_end, COL_FOOTER_HEADER, COL_FOOTER_BODY
+    )
     ws.format(_range(footer_start, footer_end, ec=3), {
-        "backgroundColor": COL,
+        "backgroundColor": COL_FOOTER_BODY,
         "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
     })
     ws.format(f"C{footer_start}:D{footer_end}", {"numberFormat": IDR})
-    ws.format(_range(footer_start, footer_start), {
+    ws.format(_range(mandiri_row, mandiri_row), {
+        "backgroundColor": COL_INPUT,
+        "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+    })
+    ws.format(f"C{mandiri_row}", {
+        "backgroundColor": COL_INPUT,
+        "numberFormat": IDR,
+    })
+    ws.format(_range(selisih_row, selisih_row), {
+        "backgroundColor": COL_STATUS,
+        "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+    })
+    ws.format(f"C{selisih_row}", {"numberFormat": IDR})
+    ws.format(f"D{selisih_row}", {"wrapStrategy": "WRAP"})
+    ws.format(f"C{selisih_row}", {
         "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
     })
     ws.format(_range(data_start, data_start), {
@@ -532,8 +1091,97 @@ def append_daily_to_gsheet(
     ws.format(f"C{footer_end}", {
         "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
     })
+    old_dashboard_range = {
+        "sheetId": ws.id,
+        "startRowIndex": 0,
+        "endRowIndex": 1,
+        "startColumnIndex": 6,
+        "endColumnIndex": 15,
+    }
+    summary_widths = {0: 100, 1: 320, 2: 140, 3: 140, 4: 140}
+    sh.batch_update({"requests": [
+        *_delete_protected_range_requests(
+            sh,
+            ws,
+            {"FinPay latest reconciliation dashboard"},
+        ),
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        {
+            "updateCells": {
+                "range": old_dashboard_range,
+                "rows": [{"values": [{} for _ in range(9)]}],
+                "fields": "userEnteredValue",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": old_dashboard_range,
+                "cell": {"userEnteredFormat": {}},
+                "fields": "userEnteredFormat",
+            }
+        },
+        *[
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": i,
+                        "endIndex": i + 1,
+                    },
+                    "properties": {"pixelSize": px},
+                    "fields": "pixelSize",
+                }
+            }
+            for i, px in summary_widths.items()
+        ],
+    ]})
+    _protect_written_ranges(
+        gspread_client,
+        sh,
+        ws,
+        [
+            (
+                insert_row,
+                footer_end,
+                1,
+                5,
+                f"FinPay generated summary {formatted_date}",
+            ),
+            (
+                mandiri_row,
+                mandiri_row,
+                1,
+                2,
+                f"FinPay generated MANDIRI label {formatted_date}",
+            ),
+            (
+                mandiri_row,
+                mandiri_row,
+                4,
+                5,
+                f"FinPay generated MANDIRI protected cells {formatted_date}",
+            ),
+            (
+                selisih_row,
+                selisih_row,
+                1,
+                5,
+                f"FinPay generated SELISIH {formatted_date}",
+            ),
+        ],
+        replace_descriptions=True,
+    )
 
-    return insert_row, footer_end
+    return insert_row, reconciliation_end
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,6 +1229,86 @@ def make_gspread_client(sa_key_path: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Google Sheets protection helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _service_account_email(gspread_client) -> str | None:
+    auth = getattr(gspread_client, "auth", None)
+    return (
+        getattr(auth, "service_account_email", None)
+        or getattr(auth, "signer_email", None)
+    )
+
+
+def _grid_range(
+    ws,
+    start_row: int,
+    end_row: int,
+    start_col: int,
+    end_col: int,
+) -> dict:
+    return {
+        "sheetId": ws.id,
+        "startRowIndex": start_row - 1,
+        "endRowIndex": end_row,
+        "startColumnIndex": start_col - 1,
+        "endColumnIndex": end_col,
+    }
+
+
+def _delete_protected_range_requests(sh, ws, descriptions: set[str]) -> list[dict]:
+    if not descriptions:
+        return []
+
+    metadata = sh.fetch_sheet_metadata({
+        "fields": "sheets(properties(sheetId),protectedRanges(protectedRangeId,description))",
+    })
+    requests = []
+    for sheet in metadata.get("sheets", []):
+        if sheet.get("properties", {}).get("sheetId") != ws.id:
+            continue
+        for protected_range in sheet.get("protectedRanges", []):
+            if protected_range.get("description") in descriptions:
+                requests.append({
+                    "deleteProtectedRange": {
+                        "protectedRangeId": protected_range["protectedRangeId"],
+                    }
+                })
+    return requests
+
+
+def _protect_written_ranges(
+    gspread_client,
+    sh,
+    ws,
+    ranges: list[tuple[int, int, int, int, str]],
+    replace_descriptions: bool = False,
+) -> None:
+    editor_email = _service_account_email(gspread_client)
+    descriptions = {description for *_, description in ranges}
+    requests = (
+        _delete_protected_range_requests(sh, ws, descriptions)
+        if replace_descriptions
+        else []
+    )
+
+    for start_row, end_row, start_col, end_col, description in ranges:
+        if start_row > end_row or start_col > end_col:
+            continue
+        protected_range = {
+            "range": _grid_range(ws, start_row, end_row, start_col, end_col),
+            "description": description,
+            "warningOnly": False,
+        }
+        if editor_email:
+            protected_range["editors"] = {"users": [editor_email]}
+        requests.append({"addProtectedRange": {"protectedRange": protected_range}})
+
+    if requests:
+        sh.batch_update({"requests": requests})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 2b  preprocessing: relabel transaction categories
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -590,16 +1318,19 @@ UNUSUAL_RECHARGE_EXEMPT_REMARK = 'biaya pembelian recharge out cluster'
 REVERSAL_TRANSACTION = 'REVERSAL'
 REVERSAL_NGRS_CATEGORY = 'Reversal - NGRS'
 REVERSAL_NGRS_FEE_CATEGORY = 'Reversal - NGRS FEE'
+REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY = 'Reversal - Recharge Out Cluster'
+REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY = 'Reversal - Recharge Out Cluster FEE'
 REVERSAL_ST_CATEGORY = 'Reversal - ST'
 REVERSAL_ST_SELLTHRU_FEE_CATEGORY = 'Reversal - ST SELLTHRUFEE'
 REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY = 'Reversal - ST SELLTHRUSALESFEE'
 REVERSAL_NGRS_MAIN_REMARK = 'biaya pembelian recharge'
-REVERSAL_NGRS_OUT_CLUSTER_FEE_REMARK = SUMMARY_OUT_CLUSTER_REMARK
+REVERSAL_RECHARGE_OUT_CLUSTER_MAIN_REMARK = SUMMARY_OUT_CLUSTER_REMARK
 REVERSAL_NGRS_PLATFORM_FEE_REMARK = 'platform fee recharge rp. 20,-'
 REVERSAL_ST_MAIN_REMARK = 'sellthru sales fee'
 REVERSAL_ST_PLATFORM_FEE_REMARK = 'platform fee sellthru rp. 100,-'
 REVERSAL_ST_TRANSACTION_FEE_REMARK = 'fee transaksi sellthru sejumlah 100 rupiah'
 REVERSAL_ST_SALES_HOLD_REMARK = 'sales hold transaksi sellthru'
+REVERSAL_ST_UNSUPPORTED_REASON = 'unsupported reversal ST category'
 
 # Transaction group validation rules. A group is keyed by Transaction ID with
 # fee suffixes removed, then the main transaction determines the required rows.
@@ -638,6 +1369,19 @@ TRANSACTION_GROUP_RULES = {
         },
         'exempt_remark': UNUSUAL_RECHARGE_EXEMPT_REMARK,
     },
+    REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: {
+        'required': {
+            REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY: {
+                'column': 'Kredit',
+                'equals': 20,
+                'missing_reason': (
+                    'missing reversal recharge out-cluster platform fee remark: '
+                    f'{REVERSAL_NGRS_PLATFORM_FEE_REMARK}'
+                ),
+                'amount_label': 'reversal recharge out-cluster platform fee',
+            },
+        },
+    },
     REVERSAL_ST_CATEGORY: {
         'required': {
             REVERSAL_ST_SELLTHRU_FEE_CATEGORY: {
@@ -664,17 +1408,31 @@ TRANSACTION_GROUP_RULES = {
     },
 }
 
+FEE_TRANSACTION_TO_MAIN = {
+    'RECHARGEFEE': 'RECHARGE',
+    'RECHARGE OUT CLUSTER FEE': 'RECHARGE OUT CLUSTER',
+    'SELLTHRUFEE': 'SELLTHRU',
+    'SELLTHRUSALESFEE': 'SELLTHRU',
+}
+
 REVERSAL_CATEGORY_TO_MAIN = {
     REVERSAL_NGRS_CATEGORY: REVERSAL_NGRS_CATEGORY,
     REVERSAL_NGRS_FEE_CATEGORY: REVERSAL_NGRS_CATEGORY,
+    REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
+    REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY: REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_ST_CATEGORY: REVERSAL_ST_CATEGORY,
     REVERSAL_ST_SELLTHRU_FEE_CATEGORY: REVERSAL_ST_CATEGORY,
     REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY: REVERSAL_ST_CATEGORY,
 }
+REVERSAL_ST_UNSUPPORTED_CATEGORIES = {
+    REVERSAL_ST_CATEGORY,
+    REVERSAL_ST_SELLTHRU_FEE_CATEGORY,
+    REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY,
+}
 REVERSAL_MAIN_MISSING_REASONS = {
-    REVERSAL_NGRS_CATEGORY: (
-        f'missing reversal remark: {REVERSAL_NGRS_MAIN_REMARK} '
-        f'or {REVERSAL_NGRS_OUT_CLUSTER_FEE_REMARK}'
+    REVERSAL_NGRS_CATEGORY: f'missing reversal remark: {REVERSAL_NGRS_MAIN_REMARK}',
+    REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: (
+        f'missing reversal remark: {REVERSAL_RECHARGE_OUT_CLUSTER_MAIN_REMARK}'
     ),
     REVERSAL_ST_CATEGORY: f'missing reversal remark: {REVERSAL_ST_MAIN_REMARK}',
 }
@@ -786,6 +1544,74 @@ def _validate_transaction_group_rules(
     return reasons
 
 
+def _fee_only_group_missing_main_reasons(transactions: pd.Series) -> list[str]:
+    normalized = transactions.fillna('').astype(str).str.strip().str.upper()
+    implied_mains = sorted({
+        FEE_TRANSACTION_TO_MAIN[value]
+        for value in normalized
+        if value in FEE_TRANSACTION_TO_MAIN
+    })
+
+    if len(implied_mains) == 1:
+        return [f'missing main transaction for fee-only group: {implied_mains[0]}']
+    if len(implied_mains) > 1:
+        return [
+            'fee-only group missing main transaction; fee rows imply multiple '
+            f'main transactions: {", ".join(implied_mains)}'
+        ]
+    return []
+
+
+def _collect_fee_only_unusual_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[int]]:
+    """
+    Return known fee-only non-reversal groups and their source indices.
+
+    Fee-only groups are excluded from summary because the fee cannot be matched
+    to a main transaction for that Transaction ID base group.
+    """
+    source = df.copy()
+    if 'base_id' not in source.columns:
+        source['base_id'] = _base_id_from_transaction_id(source['Transaction ID'])
+
+    invalid_parts = []
+    excluded_indices = set()
+    for base_id, group in source.groupby('base_id', sort=False):
+        transaction = group['Transaction'].fillna('').astype(str)
+        non_reversal_mask = ~transaction.apply(_is_reversal_transaction_label)
+        non_reversal_group = group[non_reversal_mask]
+        if non_reversal_group.empty:
+            continue
+
+        non_reversal_transaction = non_reversal_group['Transaction'].fillna('').astype(str)
+        fee_mask = non_reversal_transaction.str.strip().str.upper().str.endswith('FEE')
+        if not fee_mask.all():
+            continue
+
+        reasons = _fee_only_group_missing_main_reasons(non_reversal_transaction)
+        if not reasons:
+            continue
+
+        unusual_rows = non_reversal_group.copy()
+        unusual_rows['base_id'] = base_id
+        unusual_rows['unusual_reason'] = (
+            '; '.join(reasons) + '; excluded from summary'
+        )
+        invalid_parts.append(unusual_rows)
+        excluded_indices.update(non_reversal_group.index)
+
+    if invalid_parts:
+        unusual_df = pd.concat(invalid_parts, ignore_index=True, sort=False)
+        unusual_df = unusual_df.sort_values(['base_id', 'No']).reset_index(drop=True)
+    else:
+        unusual_df = source.iloc[0:0].copy()
+        unusual_df['base_id'] = pd.Series(dtype='object')
+        unusual_df['unusual_reason'] = pd.Series(dtype='object')
+
+    return unusual_df, excluded_indices
+
+
 def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     Relabel source REVERSAL rows into reversal summary/detail categories.
@@ -801,14 +1627,31 @@ def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
         return result
 
     remarks = result.loc[reversal_mask, 'Remarks']
+    reversal_base_ids = _base_id_from_transaction_id(
+        result.loc[reversal_mask, 'Transaction ID']
+    )
+    recharge_out_cluster_mask = _remarks_contain(
+        remarks,
+        REVERSAL_RECHARGE_OUT_CLUSTER_MAIN_REMARK,
+    )
+    recharge_out_cluster_base_ids = set(
+        reversal_base_ids[recharge_out_cluster_mask]
+    )
+    in_recharge_out_cluster_group = reversal_base_ids.isin(
+        recharge_out_cluster_base_ids
+    )
+    recharge_platform_fee_mask = _remarks_contain(
+        remarks,
+        REVERSAL_NGRS_PLATFORM_FEE_REMARK,
+    )
     category_masks = {
-        REVERSAL_NGRS_CATEGORY: (
-            _remarks_contain(remarks, REVERSAL_NGRS_MAIN_REMARK)
-            | _remarks_contain(remarks, REVERSAL_NGRS_OUT_CLUSTER_FEE_REMARK)
+        REVERSAL_NGRS_CATEGORY: _remarks_contain(remarks, REVERSAL_NGRS_MAIN_REMARK),
+        REVERSAL_NGRS_FEE_CATEGORY: (
+            recharge_platform_fee_mask & ~in_recharge_out_cluster_group
         ),
-        REVERSAL_NGRS_FEE_CATEGORY: _remarks_contain(
-            remarks,
-            REVERSAL_NGRS_PLATFORM_FEE_REMARK,
+        REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: recharge_out_cluster_mask,
+        REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY: (
+            recharge_platform_fee_mask & in_recharge_out_cluster_group
         ),
         REVERSAL_ST_CATEGORY: _remarks_contain(remarks, REVERSAL_ST_MAIN_REMARK),
         REVERSAL_ST_SELLTHRU_FEE_CATEGORY: _remarks_contain(
@@ -875,8 +1718,11 @@ def _validate_relabelled_reversal_group(
     }
     has_unclassified_rows = transaction_values.str.upper().eq(REVERSAL_TRANSACTION).any()
 
+    if known_categories & REVERSAL_ST_UNSUPPORTED_CATEGORIES:
+        return None, [REVERSAL_ST_UNSUPPORTED_REASON], True
+
     if len(implied_main_categories) > 1:
-        return None, ['ambiguous reversal remarks matched NGRS and ST'], True
+        return None, ['ambiguous reversal remarks matched multiple categories'], True
 
     if not implied_main_categories:
         return None, ['unclassified reversal remarks'], True
@@ -963,24 +1809,45 @@ def prepare_reversal_summary_transactions(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Relabel REVERSAL rows for summary and return unusual reversal rows.
+    Relabel REVERSAL rows for summary and return unusual summary rows.
 
-    Invalid groups with a main NGRS/ST row stay in the summary but are flagged.
-    Fee-only, ambiguous, or unclassified groups are flagged and excluded.
+    Invalid groups with a main NGRS or Recharge Out Cluster row stay in the
+    summary but are flagged. ST, fee-only, ambiguous, or unclassified groups are
+    flagged and excluded. Known non-reversal fee-only groups are also excluded.
     """
     result = relabel_reversal_transactions(df)
     unusual_df, excluded_indices, categorized_counts = (
         _collect_reversal_unusual_transactions(result)
     )
+    fee_only_unusual_df, fee_only_excluded_indices = (
+        _collect_fee_only_unusual_transactions(result)
+    )
+    all_excluded_indices = set(excluded_indices) | set(fee_only_excluded_indices)
 
-    if excluded_indices:
-        summary_ready = result.drop(index=sorted(excluded_indices)).reset_index(drop=True)
+    if all_excluded_indices:
+        summary_ready = result.drop(index=sorted(all_excluded_indices)).reset_index(drop=True)
     else:
         summary_ready = result.reset_index(drop=True)
 
+    unusual_parts = [
+        part for part in (unusual_df, fee_only_unusual_df)
+        if not part.empty
+    ]
+    if unusual_parts:
+        unusual_df = pd.concat(unusual_parts, ignore_index=True, sort=False)
+        sort_cols = [
+            col for col in ['base_id', 'No', 'unusual_reason']
+            if col in unusual_df.columns
+        ]
+        if sort_cols:
+            unusual_df = unusual_df.sort_values(sort_cols).reset_index(drop=True)
+        else:
+            unusual_df = unusual_df.reset_index(drop=True)
+
     print(f'Reversal rows categorized for summary: {categorized_counts}')
-    print(f'Reversal unusual rows flagged: {len(unusual_df)}')
+    print(f'Summary unusual rows flagged: {len(unusual_df)}')
     print(f'Reversal rows excluded from summary: {len(excluded_indices)}')
+    print(f'Fee-only rows excluded from summary: {len(fee_only_excluded_indices)}')
     return summary_ready, unusual_df
 
 
@@ -998,7 +1865,8 @@ def _flag_fee_rule_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
     df['base_id'] = _base_id_from_transaction_id(df['Transaction ID'])
-    unusual_parts = []
+    fee_only_unusual_df, _ = _collect_fee_only_unusual_transactions(df)
+    unusual_parts = [fee_only_unusual_df] if not fee_only_unusual_df.empty else []
     for base_id, group in df.groupby('base_id', sort=False):
         transaction = group['Transaction'].fillna('').astype(str)
         non_reversal_mask = ~transaction.apply(_is_reversal_transaction_label)
@@ -1007,7 +1875,8 @@ def _flag_fee_rule_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         non_reversal_transaction = non_reversal_group['Transaction'].fillna('').astype(str)
-        main_rows = non_reversal_group[~non_reversal_transaction.str.endswith('FEE')]
+        fee_mask = non_reversal_transaction.str.strip().str.upper().str.endswith('FEE')
+        main_rows = non_reversal_group[~fee_mask]
         if main_rows.empty:
             continue
         txn_type = main_rows['Transaction'].iloc[0]
@@ -1203,19 +2072,30 @@ def append_unusual_to_gsheet(
     data_end = data_start + len(unusual_df) - 1
 
     widths = {
-        0: 110, 1: 70, 2: 165, 3: 220, 4: 220, 5: 170, 6: 120,
+        0: 110, 1: 70, 2: 165, 3: 220, 4: 220, 5: 320, 6: 120,
         7: 120, 8: 130, 9: 130, 10: 130, 11: 420, 12: 320,
     }
     sh.batch_update({"requests": [
         {
-            "updateDimensionProperties": {
-                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
-                          "startIndex": i, "endIndex": i + 1},
-                "properties": {"pixelSize": px},
-                "fields": "pixelSize",
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
             }
-        }
-        for i, px in widths.items()
+        },
+        *[
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                              "startIndex": i, "endIndex": i + 1},
+                    "properties": {"pixelSize": px},
+                    "fields": "pixelSize",
+                }
+            }
+            for i, px in widths.items()
+        ],
     ]})
 
     ws.format(_range(header_row, header_row), {
@@ -1236,6 +2116,19 @@ def append_unusual_to_gsheet(
     ws.format(_range(data_start, data_start), {
         "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
     })
+    _protect_written_ranges(
+        gspread_client,
+        sh,
+        ws,
+        [(
+            insert_row,
+            write_end,
+            1,
+            len(HEADERS),
+            f"FinPay generated unusual rows {report_date}",
+        )],
+        replace_descriptions=True,
+    )
 
     print(f'✓ Written {len(unusual_df)} unusual rows for {report_date}')
     return True
@@ -1495,7 +2388,7 @@ def append_transaction_detail_to_gsheet(
         "TRANSACTION DATE": 165,
         "TRANSACTION ID": 220,
         "TRANSACTION TYPE": 150,
-        "TRANSACTION": 160,
+        "TRANSACTION": 320,
         "KREDIT": 120,
         "DEBET": 120,
         "SALDO AWAL": 130,
@@ -1505,14 +2398,25 @@ def append_transaction_detail_to_gsheet(
     }
     sh.batch_update({"requests": [
         {
-            "updateDimensionProperties": {
-                "range": {"sheetId": ws.id, "dimension": "COLUMNS",
-                          "startIndex": i, "endIndex": i + 1},
-                "properties": {"pixelSize": widths_by_header.get(header, 120)},
-                "fields": "pixelSize",
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
             }
-        }
-        for i, header in enumerate(HEADERS)
+        },
+        *[
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                              "startIndex": i, "endIndex": i + 1},
+                    "properties": {"pixelSize": widths_by_header.get(header, 120)},
+                    "fields": "pixelSize",
+                }
+            }
+            for i, header in enumerate(HEADERS)
+        ],
     ]})
 
     ws.format(_range(header_row, header_row), {
@@ -1555,6 +2459,19 @@ def append_transaction_detail_to_gsheet(
     ws.format(_range(data_start, data_start), {
         "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
     })
+    _protect_written_ranges(
+        gspread_client,
+        sh,
+        ws,
+        [(
+            insert_row,
+            write_end,
+            1,
+            len(HEADERS),
+            f"FinPay generated {target_worksheet} rows {report_date}",
+        )],
+        replace_descriptions=True,
+    )
 
     print(f"✓ Written {len(detail_df)} rows to {target_worksheet} for {report_date}")
     return True
