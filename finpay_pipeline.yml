@@ -32,15 +32,12 @@ tasks:
     timeout: PT2M
     env:
       CSV_PATH: "{{ inputs.csv_file }}"
-      RUN_TIMEZONE: "Asia/Makassar"
     script: |
       import re, os, sys
       from datetime import datetime, timedelta
-      from zoneinfo import ZoneInfo
       from kestra import Kestra
 
       file_path = os.environ["CSV_PATH"]
-      timezone  = os.environ["RUN_TIMEZONE"]
 
       PATTERN = re.compile(
           r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx|xls)$"
@@ -56,9 +53,9 @@ tasks:
       cluster_id = m.group(1)
       raw        = m.group(2)
       d, mo, y   = raw.split("-")
-      now        = datetime.now(ZoneInfo(timezone))
-      first_day_this_month = now.replace(day=1)
-      starting_balance_date = (first_day_this_month - timedelta(days=1)).date().isoformat()
+      file_date  = datetime.strptime(raw, "%d-%m-%Y").date()
+      first_day_file_month = file_date.replace(day=1)
+      starting_balance_date = (first_day_file_month - timedelta(days=1)).isoformat()
 
       CLUSTERS = {
           "421306": {
@@ -101,7 +98,7 @@ tasks:
       outputs = {
           "cluster_id": cluster_id,
           "raw_date":   raw,
-          "iso_date":   f"{y}-{mo}-{d}",
+          "iso_date":   file_date.isoformat(),
           "file_path":  file_path,
           "filename":   filename,
           "unusual_worksheet": f"{config['target_worksheet']} - Unusual",

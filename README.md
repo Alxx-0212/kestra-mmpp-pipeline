@@ -66,12 +66,15 @@ Upload CSV/XLS/XLSX
 
 ```text
 kestra-mmpp-pipeline/
-├── pipeline_refactored.py   # Core data and Google Sheets functions
+├── pipeline.py              # Kestra compatibility shim: re-exports finpay_pipeline
+├── pipeline_refactored.py   # Backward-compatible shim for older local imports
+├── finpay_pipeline/         # Split Python implementation modules
 ├── finpay_pipeline.yml      # Kestra flow definition
-├── Dockerfile               # Builds finpay-pipeline:3.11 and copies pipeline.py into /app
+├── Dockerfile               # Builds finpay-pipeline:3.11 and copies Python runtime files into /app
 ├── docker-compose.yml       # Kestra + PostgreSQL + pgAdmin local stack
 ├── requirements.txt         # Python dependencies for the Docker image
 ├── README.md
+├── LLM_CONTEXT.md           # Code/module map for future LLM-assisted changes
 ├── .gitignore
 ├── .env_encoded             # Local Kestra env/secret file, ignored by git
 └── data/                    # Local sample/input data, ignored by git
@@ -141,7 +144,7 @@ From the host machine, FinPay Postgres is exposed at `localhost:5433`.
 docker build -t finpay-pipeline:3.11 .
 ```
 
-The image installs `requirements.txt`, including `psycopg`, and copies `pipeline_refactored.py` as `/app/pipeline.py`, which is what the Kestra Python tasks import.
+The image installs `requirements.txt`, including `psycopg`, and copies `pipeline.py`, `pipeline_refactored.py`, and the `finpay_pipeline/` package into `/app`. Kestra tasks continue to import through `from pipeline import ...`.
 
 ### 3. Configure Google Sheets credentials
 
@@ -210,7 +213,7 @@ Example:
 finpay-411311(04-06-2026to04-06-2026).csv
 ```
 
-The first date in the filename becomes the file `iso_date` output. The summary worksheet is stable per cluster, while the starting balance date for a newly created summary sheet is based on the pipeline run date.
+The first date in the filename becomes the file `iso_date` output. The summary worksheet is stable per cluster, while the starting balance date for a newly created summary sheet is the last day of the month before the uploaded file date.
 
 ---
 
@@ -519,17 +522,18 @@ Footer Summary rows:
 | DISBURSEMENT | Net of `DISBURSEMENT`. |
 | QRISDUWIT | Net of `QRISDUWIT`. |
 | Total | Sum of the footer rows above. |
+| RUNNING TOTAL | Carries unsettled footer totals forward until a next-day transfer value appears. It resets to the current `Total` after the previous block has a non-zero `MANDIRI` value. |
 
-After `Total`, the block writes two reconciliation rows:
+After `RUNNING TOTAL`, the block writes two reconciliation rows:
 
 | Row | Behavior |
 |---|---|
-| MANDIRI | Editable input cell in column C. It defaults to the `TRANSFER MASUK DARI FINPAY` source Kredit value when present, otherwise stays blank for manual input. |
-| SELISIH | Formula row where `SELISIH = MANDIRI - Total`; status shows `sesuai`, `lebih bayar n`, or `kurang bayar n`. |
+| MANDIRI | Editable input cell in column C. It defaults to the next block's `TRANSFER MASUK DARI FINPAY` value from column D, or `0` when the next block does not exist yet. Users can overwrite it manually. |
+| SELISIH | Formula row where `SELISIH = MANDIRI - RUNNING TOTAL`; status shows `pending transfer`, `sesuai`, `lebih bayar`, or `kurang bayar`. |
 
 The header row is frozen on each output worksheet; no separate dashboard range is written.
 
-Generated cells are protected after each write. Summary, unusual, QRISDUWIT, and Reversal output ranges are protected for the service account; in the summary sheet, only the daily `MANDIRI` input cell is left unprotected. Users must have spreadsheet editor access to fill that input cell; commenter access cannot edit it.
+Sheet protection is not applied because the spreadsheet is private. When a workflow writes a summary, unusual, QRISDUWIT, or Reversal worksheet, it also removes existing protected ranges from that worksheet.
 
 ### Unusual worksheet
 
@@ -614,9 +618,9 @@ From `kestra-mmpp-pipeline`, using the repo-level uv virtualenv:
 
 ```bash
 source ../.venv/bin/activate
-python -m py_compile pipeline_refactored.py
+python -m py_compile pipeline.py pipeline_refactored.py finpay_pipeline/*.py
 python -c "import pathlib, yaml; yaml.safe_load(pathlib.Path('finpay_pipeline.yml').read_text()); print('YAML OK')"
-git diff --check -- finpay_pipeline.yml pipeline_refactored.py README.md
+git diff --check -- Dockerfile finpay_pipeline.yml pipeline.py pipeline_refactored.py finpay_pipeline README.md LLM_CONTEXT.md
 ```
 
 Example smoke test with a local data file:
@@ -624,7 +628,7 @@ Example smoke test with a local data file:
 ```bash
 source ../.venv/bin/activate
 python - <<'PY'
-from pipeline_refactored import (
+from pipeline import (
     load_and_validate_schema,
     validate_debit_credit_integrity,
     preprocess_transaction_labels,
@@ -674,17 +678,18 @@ PY
 | pyarrow | latest | Parquet inter-task file transfer |
 | openpyxl | latest | Excel `.xlsx` reading |
 | kestra | latest | Kestra output SDK |
+| psycopg | 3.2.3 | FinPay Postgres persistence |
 
 ---
 
 ## Design Notes
 
-- Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `pipeline_refactored.py`.
+- Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `finpay_pipeline/`.
 - The summary worksheet is stable per cluster and continues across month boundaries.
 - The starting balance date is the last day of the previous month, computed at runtime.
 - Deduplication compares all columns except `No`, and normalizes `Transaction Date` to minute precision for duplicate detection.
 - Transaction relabeling runs before unusual detection, calculation deduplication, detail exports, and summary aggregation.
-- Unusual upload, Telegram unusual-row alerting, and summary upload run in parallel after unusual detection.
+- Sheet writes run sequentially after unusual detection to reduce Google Sheets rate-limit pressure.
 - Parquet files are used between Kestra tasks to avoid passing large datasets through variables.
 - Google Sheets footer totals are live formulas, not Python-computed totals.
 - Dry runs execute all compute steps and skip only Google Sheets writes.

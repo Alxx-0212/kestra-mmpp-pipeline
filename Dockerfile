@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Bake the pipeline module into the image
-COPY pipeline_refactored.py ./pipeline.py
+# Bake the split pipeline package and Kestra compatibility module into the image
+COPY finpay_pipeline ./finpay_pipeline
+COPY pipeline.py ./pipeline.py
+COPY pipeline_refactored.py ./pipeline_refactored.py
 
 CMD ["python", "-c", "print('finpay-pipeline image ready')"]

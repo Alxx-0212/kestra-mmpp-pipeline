@@ -4,3 +4,4 @@ __pycache__/
 data/
 .idea/
 main.ipynb
+LLM_CONTEXT.md
