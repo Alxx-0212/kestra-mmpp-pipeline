@@ -2,7 +2,10 @@
 import gspread
 import pandas as pd
 
-from .sheets_common import _delete_all_protected_range_requests
+from .sheets_common import (
+    _add_protected_sheet_request,
+    _delete_all_protected_range_requests,
+)
 
 def append_unusual_to_gsheet(
     gspread_client,
@@ -76,6 +79,18 @@ def append_unusual_to_gsheet(
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=target_worksheet, rows=5000, cols=20)
 
+    def _protect_sheet() -> None:
+        protection_request = _add_protected_sheet_request(
+            gspread_client,
+            ws,
+            f"FinPay protected unusual sheet",
+        )
+        requests = [
+            *_delete_all_protected_range_requests(sh, ws),
+            protection_request,
+        ]
+        sh.batch_update({"requests": requests})
+
     report_date = pd.to_datetime(unusual_df['Transaction Date']).dt.strftime('%d/%m/%Y').max()
     existing = ws.get_all_values()
     meaningful_existing = [
@@ -89,12 +104,14 @@ def append_unusual_to_gsheet(
             report_col = headers.index('REPORT DATE')
             existing_dates = [row[report_col] for row in meaningful_existing[1:] if len(row) > report_col]
             if report_date in existing_dates:
+                _protect_sheet()
                 print(f'⚠️  Unusual transactions for {report_date} already exist — skipping.')
                 return False
         elif 'Transaction Date' in headers:
             td_col = headers.index('Transaction Date')
             existing_dates = [row[td_col] for row in meaningful_existing[1:] if len(row) > td_col]
             if any(report_date in d for d in existing_dates):
+                _protect_sheet()
                 print(f'⚠️  Unusual transactions for {report_date} already exist — skipping.')
                 return False
 
@@ -139,8 +156,14 @@ def append_unusual_to_gsheet(
         0: 110, 1: 70, 2: 165, 3: 220, 4: 220, 5: 320, 6: 120,
         7: 120, 8: 130, 9: 130, 10: 130, 11: 420, 12: 320,
     }
+    protection_request = _add_protected_sheet_request(
+        gspread_client,
+        ws,
+        f"FinPay protected unusual sheet {report_date}",
+    )
     sh.batch_update({"requests": [
         *_delete_all_protected_range_requests(sh, ws),
+        *([protection_request] if protection_request else []),
         {
             "updateSheetProperties": {
                 "properties": {

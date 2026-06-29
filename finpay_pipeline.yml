@@ -59,32 +59,32 @@ tasks:
 
       CLUSTERS = {
           "421306": {
-              "target_spreadsheet":       "MONITORING FINPAY",
+              "target_spreadsheet":       "FINPAY REPORT",
               "target_worksheet":         "MRT",
               "default_starting_balance": 0,
           },
           "421307": {
-              "target_spreadsheet":       "MONITORING FINPAY",
+              "target_spreadsheet":       "FINPAY REPORT",
               "target_worksheet":         "TDR",
               "default_starting_balance": 0,
           },
           "411311": {
-              "target_spreadsheet":       "MONITORING FINPAY",
+              "target_spreadsheet":       "FINPAY REPORT",
               "target_worksheet":         "PKY",
               "default_starting_balance": 0,
           },
           "421315": {
-              "target_spreadsheet":       "MONITORING FINPAY",
+              "target_spreadsheet":       "FINPAY REPORT",
               "target_worksheet":         "BGI",
               "default_starting_balance": 0,
           },
           "421318": {
-              "target_spreadsheet":       "MONITORING FINPAY",
+              "target_spreadsheet":       "FINPAY REPORT",
               "target_worksheet":         "MRW",
               "default_starting_balance": 0,
           },
           "421320": {
-              "target_spreadsheet":       "MONITORING FINPAY",
+              "target_spreadsheet":       "FINPAY REPORT",
               "target_worksheet":         "TNT",
               "default_starting_balance": 0,
           },
@@ -225,11 +225,11 @@ tasks:
     env:
       CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
       ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-      FINPAY_DB_HOST: finpay-postgres
-      FINPAY_DB_PORT: "5432"
-      FINPAY_DB_NAME: finpay
-      FINPAY_DB_USER: finpay
-      FINPAY_DB_PASSWORD: finpay
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
     script: |
       import os, sys, pandas as pd
       sys.path.insert(0, "/app")
@@ -363,11 +363,11 @@ tasks:
         env:
           CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
           ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-          FINPAY_DB_HOST: finpay-postgres
-          FINPAY_DB_PORT: "5432"
-          FINPAY_DB_NAME: finpay
-          FINPAY_DB_USER: finpay
-          FINPAY_DB_PASSWORD: finpay
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
         script: |
           import os, sys, pandas as pd
           sys.path.insert(0, "/app")
@@ -403,6 +403,11 @@ tasks:
         env:
           TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
           TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.unusual_worksheet }}"
+          FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
+          FINPAY_SPREADSHEET_LOCALE: "{{ secret('FINPAY_SPREADSHEET_LOCALE') }}"
+          FINPAY_SPREADSHEET_TIMEZONE: "{{ secret('FINPAY_SPREADSHEET_TIMEZONE') }}"
+          FINPAY_PROTECTION_EDITOR_EMAILS: "{{ secret('FINPAY_PROTECTION_EDITOR_EMAILS') }}"
+          FINPAY_MANDIRI_EDITOR_EMAILS: "{{ secret('FINPAY_MANDIRI_EDITOR_EMAILS') }}"
           SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
         script: |
           import os, sys, json, tempfile, pandas as pd
@@ -579,11 +584,11 @@ tasks:
                     env:
                       CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
                       ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-                      FINPAY_DB_HOST: finpay-postgres
-                      FINPAY_DB_PORT: "5432"
-                      FINPAY_DB_NAME: finpay
-                      FINPAY_DB_USER: finpay
-                      FINPAY_DB_PASSWORD: finpay
+                      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+                      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+                      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+                      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+                      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
                     script: |
                       import os, sys, pandas as pd
                       sys.path.insert(0, "/app")
@@ -618,6 +623,11 @@ tasks:
                     env:
                       TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
                       TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.qrisduwit_worksheet }}"
+                      FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
+                      FINPAY_SPREADSHEET_LOCALE: "{{ secret('FINPAY_SPREADSHEET_LOCALE') }}"
+                      FINPAY_SPREADSHEET_TIMEZONE: "{{ secret('FINPAY_SPREADSHEET_TIMEZONE') }}"
+                      FINPAY_PROTECTION_EDITOR_EMAILS: "{{ secret('FINPAY_PROTECTION_EDITOR_EMAILS') }}"
+                      FINPAY_MANDIRI_EDITOR_EMAILS: "{{ secret('FINPAY_MANDIRI_EDITOR_EMAILS') }}"
                       SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
                     script: |
                       import os, sys, tempfile, pandas as pd
@@ -723,11 +733,11 @@ tasks:
                     env:
                       CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
                       ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-                      FINPAY_DB_HOST: finpay-postgres
-                      FINPAY_DB_PORT: "5432"
-                      FINPAY_DB_NAME: finpay
-                      FINPAY_DB_USER: finpay
-                      FINPAY_DB_PASSWORD: finpay
+                      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+                      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+                      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+                      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+                      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
                     script: |
                       import os, sys, pandas as pd
                       sys.path.insert(0, "/app")
@@ -762,6 +772,11 @@ tasks:
                     env:
                       TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
                       TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.reversal_worksheet }}"
+                      FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
+                      FINPAY_SPREADSHEET_LOCALE: "{{ secret('FINPAY_SPREADSHEET_LOCALE') }}"
+                      FINPAY_SPREADSHEET_TIMEZONE: "{{ secret('FINPAY_SPREADSHEET_TIMEZONE') }}"
+                      FINPAY_PROTECTION_EDITOR_EMAILS: "{{ secret('FINPAY_PROTECTION_EDITOR_EMAILS') }}"
+                      FINPAY_MANDIRI_EDITOR_EMAILS: "{{ secret('FINPAY_MANDIRI_EDITOR_EMAILS') }}"
                       SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
                     script: |
                       import os, sys, tempfile, pandas as pd
@@ -885,11 +900,11 @@ tasks:
                     env:
                       CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
                       ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
-                      FINPAY_DB_HOST: finpay-postgres
-                      FINPAY_DB_PORT: "5432"
-                      FINPAY_DB_NAME: finpay
-                      FINPAY_DB_USER: finpay
-                      FINPAY_DB_PASSWORD: finpay
+                      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+                      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+                      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+                      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+                      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
                     script: |
                       import os, sys, pandas as pd
                       sys.path.insert(0, "/app")
@@ -973,6 +988,11 @@ tasks:
                       TARGET_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_worksheet }}"
                       STARTING_BALANCE_DATE: "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
                       DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
+                      FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
+                      FINPAY_SPREADSHEET_LOCALE: "{{ secret('FINPAY_SPREADSHEET_LOCALE') }}"
+                      FINPAY_SPREADSHEET_TIMEZONE: "{{ secret('FINPAY_SPREADSHEET_TIMEZONE') }}"
+                      FINPAY_PROTECTION_EDITOR_EMAILS: "{{ secret('FINPAY_PROTECTION_EDITOR_EMAILS') }}"
+                      FINPAY_MANDIRI_EDITOR_EMAILS: "{{ secret('FINPAY_MANDIRI_EDITOR_EMAILS') }}"
                       SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
                     script: |
                       import os, sys, json, tempfile, pandas as pd

@@ -1,5 +1,8 @@
 tmp/kestra-wd/secrets/gcp-sa-key.json
 .env_encoded
+.env
+.env.*
+!.env.example
 __pycache__/
 data/
 .idea/

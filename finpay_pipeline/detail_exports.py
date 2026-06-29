@@ -10,7 +10,10 @@ from .classification import (
     _is_reversal_transaction_label,
     relabel_reversal_transactions,
 )
-from .sheets_common import _delete_all_protected_range_requests
+from .sheets_common import (
+    _add_protected_sheet_request,
+    _delete_all_protected_range_requests,
+)
 
 def extract_disbursement_date_from_remarks(remarks) -> str:
     """
@@ -186,6 +189,18 @@ def append_transaction_detail_to_gsheet(
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=target_worksheet, rows=5000, cols=max(20, len(HEADERS)))
 
+    def _protect_sheet() -> None:
+        protection_request = _add_protected_sheet_request(
+            gspread_client,
+            ws,
+            f"FinPay protected {target_worksheet} sheet",
+        )
+        requests = [
+            *_delete_all_protected_range_requests(sh, ws),
+            protection_request,
+        ]
+        sh.batch_update({"requests": requests})
+
     report_date = pd.to_datetime(detail_df["Transaction Date"]).dt.strftime("%d/%m/%Y").max()
     existing = ws.get_all_values()
     meaningful_existing = [
@@ -202,6 +217,7 @@ def append_transaction_detail_to_gsheet(
                 if len(row) > report_col
             ]
             if report_date in existing_dates:
+                _protect_sheet()
                 print(f"⚠️  {target_worksheet} rows for {report_date} already exist — skipping.")
                 return False
 
@@ -255,8 +271,14 @@ def append_transaction_detail_to_gsheet(
         "NOMOR RS": 130,
         "REMARKS": 480,
     }
+    protection_request = _add_protected_sheet_request(
+        gspread_client,
+        ws,
+        f"FinPay protected {target_worksheet} sheet {report_date}",
+    )
     sh.batch_update({"requests": [
         *_delete_all_protected_range_requests(sh, ws),
+        *([protection_request] if protection_request else []),
         {
             "updateSheetProperties": {
                 "properties": {

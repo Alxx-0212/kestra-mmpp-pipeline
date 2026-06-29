@@ -10,7 +10,13 @@ from .classification import (
     REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY,
 )
-from .sheets_common import _delete_all_protected_range_requests
+from .sheets_common import (
+    _add_protected_range_request,
+    _add_protected_sheet_request,
+    _delete_all_protected_range_requests,
+    _mandiri_editor_emails,
+    open_or_create_finpay_spreadsheet,
+)
 
 def setup_initial_headers_and_saldo(
     gspread_client,
@@ -19,7 +25,7 @@ def setup_initial_headers_and_saldo(
     starting_date_str: str,
     starting_balance: int,
 ) -> None:
-    sh = gspread_client.open(target_spreadsheet)
+    sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
 
     # Column widths
@@ -55,9 +61,17 @@ def setup_initial_headers_and_saldo(
 
     ws.format("A1:E1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
     ws.format("E2", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}})
-    delete_requests = _delete_all_protected_range_requests(sh, ws)
-    if delete_requests:
-        sh.batch_update({"requests": delete_requests})
+    protection_request = _add_protected_sheet_request(
+        gspread_client,
+        ws,
+        "FinPay protected opening balance",
+    )
+    requests = [
+        *_delete_all_protected_range_requests(sh, ws),
+        *([protection_request] if protection_request else []),
+    ]
+    if requests:
+        sh.batch_update({"requests": requests})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,11 +111,68 @@ def append_daily_to_gsheet(
     COL_FOOTER_BODY = {"red": 0.900, "green": 0.940, "blue": 0.980}
     COL_INPUT = COL_STATUS
 
-    sh = gspread_client.open(target_spreadsheet)
+    sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
+    existing_values = ws.get_all_values()
+
+    def _existing_mandiri_rows(values: list[list[str]]) -> list[int]:
+        return [
+            idx
+            for idx, row in enumerate(values, start=1)
+            if len(row) > 1 and str(row[1]).strip().upper() == "MANDIRI"
+        ]
+
+    def _summary_protection_requests(
+        end_row: int,
+        mandiri_rows: list[int],
+    ) -> list[dict]:
+        unique_mandiri_rows = [
+            row for row in sorted(set(mandiri_rows))
+            if row <= end_row
+        ]
+        protection_request = _add_protected_sheet_request(
+            gspread_client,
+            ws,
+            "FinPay protected summary sheet",
+            unprotected_ranges=[
+                (row, row, 3, 3)
+                for row in unique_mandiri_rows
+            ],
+        )
+        mandiri_editor_emails = _mandiri_editor_emails()
+        mandiri_protection_requests = []
+        if mandiri_editor_emails:
+            mandiri_protection_requests = [
+                request
+                for request in (
+                    _add_protected_range_request(
+                        gspread_client,
+                        ws,
+                        row,
+                        row,
+                        3,
+                        3,
+                        f"FinPay protected MANDIRI input row {row}",
+                        extra_editor_emails=mandiri_editor_emails,
+                    )
+                    for row in unique_mandiri_rows
+                )
+                if request
+            ]
+        return [
+            *_delete_all_protected_range_requests(sh, ws),
+            *([protection_request] if protection_request else []),
+            *mandiri_protection_requests,
+        ]
 
     # Duplicate guard — col A stores dates as DD/MM/YYYY, so compare using formatted_date
-    if formatted_date in ws.col_values(1):
+    if any(row and str(row[0]).strip() == formatted_date for row in existing_values):
+        protection_requests = _summary_protection_requests(
+            len(existing_values),
+            _existing_mandiri_rows(existing_values),
+        )
+        if protection_requests:
+            sh.batch_update({"requests": protection_requests})
         print(f"⚠️  {formatted_date} already exists in sheet — skipping.")
         return None, None
 
@@ -114,7 +185,7 @@ def append_daily_to_gsheet(
         for _, row in summary_df.iterrows()
     }
 
-    insert_row = len(ws.get_all_values()) + 1
+    insert_row = len(existing_values) + 1
     r = insert_row
     rows_to_append = []
 
@@ -384,8 +455,12 @@ def append_daily_to_gsheet(
         "endColumnIndex": 15,
     }
     summary_widths = {0: 100, 1: 320, 2: 140, 3: 140, 4: 140}
+    protection_requests = _summary_protection_requests(
+        reconciliation_end,
+        [*_existing_mandiri_rows(existing_values), mandiri_row],
+    )
     sh.batch_update({"requests": [
-        *_delete_all_protected_range_requests(sh, ws),
+        *protection_requests,
         {
             "updateSheetProperties": {
                 "properties": {
@@ -440,7 +515,7 @@ def process_daily_upload(
     default_starting_balance: int,
     gspread_client,
 ) -> tuple[int | None, int | None]:
-    sh = gspread_client.open(target_spreadsheet)
+    sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
 
     try:
         ws = sh.worksheet(target_worksheet)

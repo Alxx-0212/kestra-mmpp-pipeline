@@ -76,6 +76,9 @@ kestra-mmpp-pipeline/
 ├── README.md
 ├── LLM_CONTEXT.md           # Code/module map for future LLM-assisted changes
 ├── .gitignore
+├── .env.example             # Safe local environment template
+├── .env                     # Local Docker Compose env file, ignored by git
+├── .env_encoded.example     # Safe Kestra secret template
 ├── .env_encoded             # Local Kestra env/secret file, ignored by git
 └── data/                    # Local sample/input data, ignored by git
 ```
@@ -95,10 +98,37 @@ kestra-mmpp-pipeline/
 
 ## Setup
 
-### 1. Start Kestra
+### 1. Configure local environment
+
+Copy the safe template and fill in local-only values:
 
 ```bash
 cd kestra-mmpp-pipeline
+cp .env.example .env
+```
+
+The `.env` file is ignored by git. It provides Docker Compose values for:
+
+- Kestra metadata database and basic-auth credentials
+- FinPay Postgres container settings
+- pgAdmin login
+
+Kestra workflow values must be configured as base64-encoded secrets in
+`.env_encoded`. Copy the safe template and replace each value with a real
+base64-encoded value:
+
+```bash
+cp .env_encoded.example .env_encoded
+printf '%s' 'real-secret-value' | base64 -w0
+```
+
+For local Compose, Kestra reads `.env_encoded` as environment variables with
+the `SECRET_` prefix. The workflow references them with `secret(...)`, for
+example `{{ secret('FINPAY_DB_PASSWORD') }}`.
+
+### 2. Start Kestra
+
+```bash
 docker compose up -d
 ```
 
@@ -108,11 +138,7 @@ Kestra UI:
 http://localhost:8080
 ```
 
-Default credentials from `docker-compose.yml`:
-
-```text
-admin@kestra.io / Admin1234!
-```
+Use the Kestra basic-auth credentials configured in `.env`.
 
 FinPay pgAdmin UI:
 
@@ -120,25 +146,21 @@ FinPay pgAdmin UI:
 http://localhost:5050
 ```
 
-Default pgAdmin credentials:
-
-```text
-admin@finpay.com / admin
-```
+Use the pgAdmin credentials configured in `.env`.
 
 Register the FinPay database server in pgAdmin with:
 
 ```text
 Host: finpay-postgres
 Port: 5432
-Database: finpay
-Username: finpay
-Password: finpay
+Database: value of FINPAY_DB_NAME
+Username: value of FINPAY_DB_USER
+Password: value of FINPAY_DB_PASSWORD
 ```
 
 From the host machine, FinPay Postgres is exposed at `localhost:5433`.
 
-### 2. Build the pipeline image
+### 3. Build the pipeline image
 
 ```bash
 docker build -t finpay-pipeline:3.11 .
@@ -146,7 +168,7 @@ docker build -t finpay-pipeline:3.11 .
 
 The image installs `requirements.txt`, including `psycopg`, and copies `pipeline.py`, `pipeline_refactored.py`, and the `finpay_pipeline/` package into `/app`. Kestra tasks continue to import through `from pipeline import ...`.
 
-### 3. Configure Google Sheets credentials
+### 4. Configure Google Sheets credentials
 
 Create a Kestra secret named:
 
@@ -163,6 +185,21 @@ SECRET_GCP_SA_KEY=<base64-encoded-service-account-json>
 ```
 
 The flow still references it as `{{ secret('GCP_SA_KEY') }}`. Do not include the `SECRET_` prefix inside `secret(...)`; the prefix is only used in the environment variable name.
+
+The same pattern is used for FinPay database and Google Sheets workflow values:
+
+```text
+SECRET_FINPAY_DB_HOST=<base64-encoded-value>
+SECRET_FINPAY_DB_PORT=<base64-encoded-value>
+SECRET_FINPAY_DB_NAME=<base64-encoded-value>
+SECRET_FINPAY_DB_USER=<base64-encoded-value>
+SECRET_FINPAY_DB_PASSWORD=<base64-encoded-value>
+SECRET_FINPAY_SPREADSHEET_WRITER_EMAILS=<base64-encoded-value>
+SECRET_FINPAY_SPREADSHEET_LOCALE=<base64-encoded-value>
+SECRET_FINPAY_SPREADSHEET_TIMEZONE=<base64-encoded-value>
+SECRET_FINPAY_PROTECTION_EDITOR_EMAILS=<base64-encoded-value>
+SECRET_FINPAY_MANDIRI_EDITOR_EMAILS=<base64-encoded-value>
+```
 
 ### 3b. Configure Telegram unusual-row alerts
 
@@ -533,7 +570,16 @@ After `RUNNING TOTAL`, the block writes two reconciliation rows:
 
 The header row is frozen on each output worksheet; no separate dashboard range is written.
 
-Sheet protection is not applied because the spreadsheet is private. When a workflow writes a summary, unusual, QRISDUWIT, or Reversal worksheet, it also removes existing protected ranges from that worksheet.
+Generated sheet ranges are protected after each write. Summary sheet columns A:E are locked for all generated rows except `MANDIRI` cells in column C, which remain editable for users with spreadsheet editor access. QRISDUWIT, Reversal, and Unusual worksheets are locked across their generated used ranges.
+
+Protection editors are recreated by the workflow on every sheet write.
+Configure them in `.env_encoded` with `SECRET_FINPAY_PROTECTION_EDITOR_EMAILS`.
+The workflow also auto-adds the authenticated service-account email to
+protected ranges. If `SECRET_FINPAY_MANDIRI_EDITOR_EMAILS` decodes to a
+comma-separated email list, the editable `MANDIRI` column C cells are also
+protected so only those listed users and the protected-range editors can edit
+them. If it decodes to a blank value, any invited spreadsheet editor can edit
+`MANDIRI` column C cells.
 
 ### Unusual worksheet
 

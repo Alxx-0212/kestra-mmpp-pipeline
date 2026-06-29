@@ -21,9 +21,9 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql
     environment:
-      POSTGRES_DB: kestra
-      POSTGRES_USER: kestra
-      POSTGRES_PASSWORD: k3str4
+      POSTGRES_DB: ${KESTRA_POSTGRES_DB}
+      POSTGRES_USER: ${KESTRA_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${KESTRA_POSTGRES_PASSWORD}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       interval: 30s
@@ -37,9 +37,9 @@ services:
     volumes:
       - finpay-postgres-data:/var/lib/postgresql
     environment:
-      POSTGRES_DB: finpay
-      POSTGRES_USER: finpay
-      POSTGRES_PASSWORD: finpay
+      POSTGRES_DB: ${FINPAY_DB_NAME}
+      POSTGRES_USER: ${FINPAY_DB_USER}
+      POSTGRES_PASSWORD: ${FINPAY_DB_PASSWORD}
     ports:
       - "5433:5432"
     healthcheck:
@@ -53,8 +53,8 @@ services:
     networks:
       - finpay-network
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@finpay.com
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
     volumes:
       - pgadmin-data:/var/lib/pgadmin
     ports:
@@ -81,15 +81,15 @@ services:
       KESTRA_CONFIGURATION: |
         datasources:
           postgres:
-            url: jdbc:postgresql://postgres:5432/kestra
+            url: jdbc:postgresql://postgres:5432/${KESTRA_POSTGRES_DB}
             driverClassName: org.postgresql.Driver
-            username: kestra
-            password: k3str4
+            username: ${KESTRA_POSTGRES_USER}
+            password: ${KESTRA_POSTGRES_PASSWORD}
         kestra:
           server:
             basic-auth:
-              username: admin@kestra.io
-              password: Admin1234!
+              username: ${KESTRA_BASIC_AUTH_USERNAME}
+              password: ${KESTRA_BASIC_AUTH_PASSWORD}
           repository:
             type: postgres
           storage:
