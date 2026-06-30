@@ -304,7 +304,7 @@ The pipeline continues appending daily summary blocks to the same summary worksh
 | 9d.2 | `qrisduwit_upload_branch` | Filters `QRISDUWIT` rows, extracts `Disbursement Date`, persists them to `finpay_qrisduwit_transactions`, and uploads the detail rows. |
 | 9d.3 | `reversal_upload_branch` | Exports Reversal detail rows, persists them to `finpay_reversal_transactions`, and uploads the detail rows. |
 | 9d.4 | `summary_upload_branch` | Removes reversal rows excluded from summary, summarizes, and uploads summary. |
-| 9d.4.1 | `prepare_summary_transactions` | Keeps invalid main NGRS groups in summary with unusual flags and excludes unsupported ST, fee-only, ambiguous, or unclassified groups. |
+| 9d.4.1 | `prepare_summary_transactions` | Keeps invalid NGRS, Recharge Out Cluster, and Recharge-type fee-only groups in summary with unusual flags, and excludes unsupported ST, ST fee-only, ambiguous, or unclassified groups. |
 | 9d.4.2 | `persist_transactions_to_db` | Replaces the `cluster_id + report_date` batch in `finpay_transactions` using `summary_ready.parquet`, after relabeling, deduplication, and summary-exclusion rules. Skipped on dry run. |
 | 9d.4.3 | `summarize` | Aggregates `Sum_of_Kredit`, `Sum_of_Debet`, and `Transaction_Date` by `Transaction`. |
 | 9d.4.4 | `upload_to_sheets` | Appends the formatted daily summary block to the stable summary worksheet. Skipped on dry run. |
@@ -443,7 +443,7 @@ Fee validation currently monitors:
 | `RECHARGE` | `RECHARGEFEE` with total `Debet == 20`, unless exempt by the unusual out-cluster remark. |
 | `SELLTHRU` | `SELLTHRUFEE` with total `Debet == 100` and at least one `SELLTHRUSALESFEE` row. |
 
-Known fee rows without their main transaction are also flagged as unusual and excluded from summary, for example `RECHARGEFEE` without `RECHARGE`, or `SELLTHRUFEE` / `SELLTHRUSALESFEE` without `SELLTHRU`.
+Known fee rows without their main transaction are also flagged as unusual. `RECHARGEFEE` without `RECHARGE` is included in summary and its `unusual_reason` ends with `included in summary`. `SELLTHRUFEE` / `SELLTHRUSALESFEE` without `SELLTHRU` is excluded from summary and its `unusual_reason` ends with `excluded from summary`.
 
 Flagged rows include the original transaction rows plus:
 
@@ -452,7 +452,7 @@ base_id
 unusual_reason
 ```
 
-Duplicate rows detected before calculation deduplication are also written to the unusual output. Their original `Remarks` value is preserved, and the kept row number plus minute-level duplicate key are written to `unusual_reason`.
+Duplicate rows detected before calculation deduplication are also written to the unusual output. Their original `Remarks` value is preserved, and the kept row number plus minute-level duplicate key are written to `unusual_reason` with `excluded from summary`.
 
 Reversal rows are classified for summary from `Remarks`:
 
@@ -464,7 +464,7 @@ Reversal rows are classified for summary from `Remarks`:
 | `Reversal - Recharge Out Cluster FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-` in the same out-cluster reversal group; total `Kredit` must be `20`. |
 | `Reversal - ST*` | Any ST reversal row is unusual-only and excluded from summary. This includes `Sellthru Sales Fee`, `Platform Fee Sellthru Rp. 100,-`, `Fee Transaksi Sellthru sejumlah 100 rupiah`, and `Sales Hold Transaksi Sellthru`. |
 
-Invalid reversal groups are always written to the unusual output. If the group has a main `Reversal - NGRS` or `Reversal - Recharge Out Cluster` row, it is still transformed and included in the summary with a reason ending in `included in summary`. ST, fee-only, ambiguous, or unclassified reversal groups are written with a reason ending in `excluded from summary` and are removed before summary aggregation.
+Invalid reversal groups are always written to the unusual output. If the group is `Reversal - NGRS`, `Reversal - NGRS FEE`, `Reversal - Recharge Out Cluster`, or `Reversal - Recharge Out Cluster FEE`, it is still transformed and included in the summary with a reason ending in `included in summary`, even when only the fee row exists. ST, ambiguous, or unclassified reversal groups are written with a reason ending in `excluded from summary` and are removed before summary aggregation.
 
 ---
 
@@ -569,6 +569,10 @@ After `RUNNING TOTAL`, the block writes two reconciliation rows:
 | SELISIH | Formula row where `SELISIH = MANDIRI - RUNNING TOTAL`; status shows `pending transfer`, `sesuai`, `lebih bayar`, or `kurang bayar`. |
 
 The header row is frozen on each output worksheet; no separate dashboard range is written.
+
+Drive-level ownership, sharing, and editor permission settings are managed by
+the spreadsheet owner, not by the workflow. The workflow only writes values,
+formats worksheets, and recreates worksheet protected ranges.
 
 Generated sheet ranges are protected after each write. Summary sheet columns A:E are locked for all generated rows except `MANDIRI` cells in column C, which remain editable for users with spreadsheet editor access. QRISDUWIT, Reversal, and Unusual worksheets are locked across their generated used ranges.
 

@@ -236,12 +236,7 @@ def _validate_transaction_group_rules(
 
 
 def _fee_only_group_missing_main_reasons(transactions: pd.Series) -> list[str]:
-    normalized = transactions.fillna('').astype(str).str.strip().str.upper()
-    implied_mains = sorted({
-        FEE_TRANSACTION_TO_MAIN[value]
-        for value in normalized
-        if value in FEE_TRANSACTION_TO_MAIN
-    })
+    implied_mains = _fee_only_group_implied_mains(transactions)
 
     if len(implied_mains) == 1:
         return [f'missing main transaction for fee-only group: {implied_mains[0]}']
@@ -253,14 +248,28 @@ def _fee_only_group_missing_main_reasons(transactions: pd.Series) -> list[str]:
     return []
 
 
+def _fee_only_group_implied_mains(transactions: pd.Series) -> list[str]:
+    normalized = transactions.fillna('').astype(str).str.strip().str.upper()
+    return sorted({
+        FEE_TRANSACTION_TO_MAIN[value]
+        for value in normalized
+        if value in FEE_TRANSACTION_TO_MAIN
+    })
+
+
+def _fee_only_group_excluded_from_summary(transactions: pd.Series) -> bool:
+    implied_mains = _fee_only_group_implied_mains(transactions)
+    return 'SELLTHRU' in implied_mains or len(implied_mains) != 1
+
+
 def _collect_fee_only_unusual_transactions(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, set[int]]:
     """
-    Return known fee-only non-reversal groups and their source indices.
+    Return known fee-only non-reversal groups and their excluded source indices.
 
-    Fee-only groups are excluded from summary because the fee cannot be matched
-    to a main transaction for that Transaction ID base group.
+    Recharge-type fee-only groups are flagged but included in summary. ST
+    fee-only groups are flagged and excluded because ST requires the main row.
     """
     source = df.copy()
     if 'base_id' not in source.columns:
@@ -284,13 +293,23 @@ def _collect_fee_only_unusual_transactions(
         if not reasons:
             continue
 
+        exclude_from_summary = _fee_only_group_excluded_from_summary(
+            non_reversal_transaction,
+        )
+        summary_status = (
+            'excluded from summary'
+            if exclude_from_summary
+            else 'included in summary'
+        )
+
         unusual_rows = non_reversal_group.copy()
         unusual_rows['base_id'] = base_id
         unusual_rows['unusual_reason'] = (
-            '; '.join(reasons) + '; excluded from summary'
+            '; '.join(reasons) + f'; {summary_status}'
         )
         invalid_parts.append(unusual_rows)
-        excluded_indices.update(non_reversal_group.index)
+        if exclude_from_summary:
+            excluded_indices.update(non_reversal_group.index)
 
     if invalid_parts:
         unusual_df = pd.concat(invalid_parts, ignore_index=True, sort=False)
@@ -429,7 +448,6 @@ def _validate_relabelled_reversal_group(
 
     if not has_main_row:
         reasons.append(REVERSAL_MAIN_MISSING_REASONS[main_transaction])
-        exclude_from_summary = True
 
     reasons.extend(_validate_transaction_group_rules(rows, main_transaction))
     return main_transaction, reasons, exclude_from_summary
@@ -502,9 +520,9 @@ def prepare_reversal_summary_transactions(
     """
     Relabel REVERSAL rows for summary and return unusual summary rows.
 
-    Invalid groups with a main NGRS or Recharge Out Cluster row stay in the
-    summary but are flagged. ST, fee-only, ambiguous, or unclassified groups are
-    flagged and excluded. Known non-reversal fee-only groups are also excluded.
+    Invalid NGRS, Recharge Out Cluster, and Recharge-type fee-only groups stay
+    in the summary but are flagged. ST, ambiguous, or unclassified groups are
+    flagged and excluded.
     """
     result = relabel_reversal_transactions(df)
     unusual_df, excluded_indices, categorized_counts = (
@@ -576,7 +594,7 @@ def _flag_fee_rule_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
         reasons = _validate_transaction_group_rules(non_reversal_group, txn_type)
         if reasons:
             unusual_rows = non_reversal_group.copy()
-            unusual_rows['unusual_reason'] = '; '.join(reasons)
+            unusual_rows['unusual_reason'] = '; '.join(reasons) + '; included in summary'
             unusual_parts.append(unusual_rows)
 
     if unusual_parts:

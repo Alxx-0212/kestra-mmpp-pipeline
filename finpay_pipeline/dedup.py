@@ -1,7 +1,7 @@
 """Minute-level duplicate detection and unusual duplicate reporting."""
 import pandas as pd
 
-DUPLICATE_UNUSUAL_REASON = "duplicate row removed from calculation"
+DUPLICATE_UNUSUAL_REASON = "duplicate row removed from calculation; excluded from summary"
 
 
 def _minute_level_dedup_key(df: pd.DataFrame) -> pd.DataFrame:

@@ -17,8 +17,8 @@ def make_gspread_client(sa_key_path: str):
 def open_or_create_finpay_spreadsheet(gspread_client, title: str):
     """
     Open the report spreadsheet, or create it with the service account if it is
-    missing. Access settings are synced on every call so recreated protections
-    and Drive permissions stay stable across workflow runs.
+    missing. Drive-level access settings are only synced for spreadsheets the
+    service account creates; existing owner-managed spreadsheets are opened as-is.
     """
     try:
         sh = gspread_client.open(title)
@@ -40,13 +40,12 @@ def _spreadsheet_writer_emails() -> list[str]:
 
 def _configure_spreadsheet_access(gspread_client, sh, created: bool = False) -> None:
     """
-    Keep the report private and prevent spreadsheet editors from sharing it.
-
-    If the service account is not allowed to manage Drive permissions on an
-    existing spreadsheet, these Drive-level settings can fail. The workflow can
-    still write sheet values, but the durable fix is to let the service account
-    create the workbook first.
+    Keep service-account-created reports private and prevent spreadsheet
+    editors from sharing them.
     """
+    if not created:
+        return
+
     try:
         locale = os.environ.get("FINPAY_SPREADSHEET_LOCALE", "en_GB").strip()
         timezone = os.environ.get("FINPAY_SPREADSHEET_TIMEZONE", "Asia/Makassar").strip()
@@ -81,7 +80,7 @@ def _configure_spreadsheet_access(gspread_client, sh, created: bool = False) -> 
     except Exception as exc:
         print(
             "Warning: could not fully sync spreadsheet Drive permissions. "
-            f"This is expected if the service account is not the owner: {exc}"
+            f"Check service account ownership and Drive API permissions: {exc}"
         )
 
 
@@ -113,6 +112,8 @@ def _service_account_email(gspread_client) -> str | None:
 
 def _split_email_list(value: str | None) -> list[str]:
     if not value:
+        return []
+    if value.strip().upper() == "__EMPTY__":
         return []
     return [
         email.strip()
