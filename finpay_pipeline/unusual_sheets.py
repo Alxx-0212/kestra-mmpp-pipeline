@@ -5,6 +5,7 @@ import pandas as pd
 from .sheets_common import (
     _add_protected_sheet_request,
     _delete_all_protected_range_requests,
+    ensure_row_capacity,
 )
 
 def append_unusual_to_gsheet(
@@ -147,6 +148,7 @@ def append_unusual_to_gsheet(
         ])
 
     write_end = insert_row + len(rows_to_append) - 1
+    ensure_row_capacity(sh, ws, write_end, buffer_rows=500, label=target_worksheet)
     ws.update(_range(insert_row, write_end), rows_to_append, value_input_option='USER_ENTERED')
 
     header_row = data_start - 1 if needs_header else 1

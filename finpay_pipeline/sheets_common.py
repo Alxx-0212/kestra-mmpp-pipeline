@@ -5,6 +5,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 
+DEFAULT_ROW_BUFFER = 200
+
+
 def make_gspread_client(sa_key_path: str):
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -100,6 +103,36 @@ def _delete_all_protected_range_requests(sh, ws) -> list[dict]:
                 }
             })
     return requests
+
+
+def ensure_row_capacity(
+    sh,
+    ws,
+    required_rows: int,
+    buffer_rows: int = DEFAULT_ROW_BUFFER,
+    label: str = "worksheet",
+) -> None:
+    """Expand worksheet rows before writing ranges near the grid boundary."""
+    current_rows = int(getattr(ws, "row_count", 0) or 0)
+    if current_rows >= required_rows:
+        return
+
+    target_rows = required_rows + buffer_rows
+    sh.batch_update({"requests": [
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"rowCount": target_rows},
+                },
+                "fields": "gridProperties.rowCount",
+            }
+        },
+    ]})
+    print(
+        f"Expanded {label} row capacity: "
+        f"{current_rows} -> {target_rows} rows"
+    )
 
 
 def _service_account_email(gspread_client) -> str | None:

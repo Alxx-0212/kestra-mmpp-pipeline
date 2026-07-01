@@ -15,40 +15,9 @@ from .sheets_common import (
     _add_protected_sheet_request,
     _delete_all_protected_range_requests,
     _mandiri_editor_emails,
+    ensure_row_capacity,
     open_or_create_finpay_spreadsheet,
 )
-
-SUMMARY_ROW_BUFFER = 200
-
-
-def _ensure_row_capacity(
-    sh,
-    ws,
-    required_rows: int,
-    buffer_rows: int = SUMMARY_ROW_BUFFER,
-) -> None:
-    """Expand worksheet rows before writing formulas that reference future rows."""
-    current_rows = int(getattr(ws, "row_count", 0) or 0)
-    if current_rows >= required_rows:
-        return
-
-    target_rows = required_rows + buffer_rows
-    sh.batch_update({"requests": [
-        {
-            "updateSheetProperties": {
-                "properties": {
-                    "sheetId": ws.id,
-                    "gridProperties": {"rowCount": target_rows},
-                },
-                "fields": "gridProperties.rowCount",
-            }
-        },
-    ]})
-    print(
-        "Expanded summary worksheet row capacity: "
-        f"{current_rows} -> {target_rows} rows"
-    )
-
 
 def setup_initial_headers_and_saldo(
     gspread_client,
@@ -400,7 +369,7 @@ def append_daily_to_gsheet(
     reconciliation_end = r
 
     required_rows = max(reconciliation_end, next_transfer_range_start)
-    _ensure_row_capacity(sh, ws, required_rows)
+    ensure_row_capacity(sh, ws, required_rows, label="summary worksheet")
     ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
 
     # Formatting

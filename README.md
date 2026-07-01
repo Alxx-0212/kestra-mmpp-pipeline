@@ -568,11 +568,13 @@ After `RUNNING TOTAL`, the block writes two reconciliation rows:
 | MANDIRI | Editable input cell in column C. It defaults to the next block's `TRANSFER MASUK DARI FINPAY` value from column D, or `0` when the next block does not exist yet. Users can overwrite it manually. |
 | SELISIH | Formula row where `SELISIH = MANDIRI - RUNNING TOTAL`; status shows `pending transfer`, `sesuai`, `lebih bayar`, or `kurang bayar`. |
 
-Before appending a daily block, the writer expands the worksheet if needed so
-the current block and the `MANDIRI` future-transfer lookup range fit inside the
-sheet grid. It adds a 200-row buffer when expansion is needed. The `MANDIRI`
-lookup skips blank future transfer cells to tolerate partial writes after
-transient Google Sheets errors.
+Before appending rows, sheet writers expand the worksheet if needed so the
+target range fits inside the sheet grid. Summary writes also include the
+`MANDIRI` future-transfer lookup range in the capacity check and add a 200-row
+buffer when expansion is needed. Detail and unusual sheet writes check their
+explicit output range and add a 500-row buffer. The `MANDIRI` lookup skips blank
+future transfer cells to tolerate partial writes after transient Google Sheets
+errors.
 
 The header row is frozen on each output worksheet; no separate dashboard range is written.
 
