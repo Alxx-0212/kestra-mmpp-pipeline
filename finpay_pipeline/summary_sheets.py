@@ -18,6 +18,38 @@ from .sheets_common import (
     open_or_create_finpay_spreadsheet,
 )
 
+SUMMARY_ROW_BUFFER = 200
+
+
+def _ensure_row_capacity(
+    sh,
+    ws,
+    required_rows: int,
+    buffer_rows: int = SUMMARY_ROW_BUFFER,
+) -> None:
+    """Expand worksheet rows before writing formulas that reference future rows."""
+    current_rows = int(getattr(ws, "row_count", 0) or 0)
+    if current_rows >= required_rows:
+        return
+
+    target_rows = required_rows + buffer_rows
+    sh.batch_update({"requests": [
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"rowCount": target_rows},
+                },
+                "fields": "gridProperties.rowCount",
+            }
+        },
+    ]})
+    print(
+        "Expanded summary worksheet row capacity: "
+        f"{current_rows} -> {target_rows} rows"
+    )
+
+
 def setup_initial_headers_and_saldo(
     gspread_client,
     target_spreadsheet: str,
@@ -346,10 +378,9 @@ def append_daily_to_gsheet(
     mandiri_row = r
     next_transfer_range_start = mandiri_row + 2
     mandiri_formula = (
-        f'=IFERROR(IF(INDEX(FILTER(D{next_transfer_range_start}:D,'
-        f'B{next_transfer_range_start}:B="TRANSFER MASUK DARI FINPAY"),1)="",'
-        f'0,INDEX(FILTER(D{next_transfer_range_start}:D,'
-        f'B{next_transfer_range_start}:B="TRANSFER MASUK DARI FINPAY"),1)),0)'
+        f'=IFERROR(INDEX(FILTER(D{next_transfer_range_start}:D,'
+        f'TRIM(B{next_transfer_range_start}:B)="TRANSFER MASUK DARI FINPAY",'
+        f'D{next_transfer_range_start}:D<>""),1),0)'
     )
     rows_to_append.append(["", "MANDIRI", mandiri_formula, "", ""])
     r += 1
@@ -368,6 +399,8 @@ def append_daily_to_gsheet(
     rows_to_append.append(["", "SELISIH", selisih_formula, selisih_status_formula, ""])
     reconciliation_end = r
 
+    required_rows = max(reconciliation_end, next_transfer_range_start)
+    _ensure_row_capacity(sh, ws, required_rows)
     ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
 
     # Formatting
