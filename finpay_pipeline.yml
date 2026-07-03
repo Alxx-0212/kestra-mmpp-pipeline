@@ -401,6 +401,7 @@ tasks:
         inputFiles:
           unusual.parquet: "{{ outputs.flag_unusual_transactions.outputFiles['unusual.parquet'] }}"
         env:
+          ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
           TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
           TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.unusual_worksheet }}"
           FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
@@ -434,9 +435,10 @@ tasks:
                   target_worksheet=os.environ["TARGET_WORKSHEET"],
                   unusual_df=unusual_df,
                   gspread_client=client,
+                  report_date=os.environ["ISO_DATE"],
               )
 
-              status = "success" if written else "skipped_duplicate"
+              status = "success"
               print(f"✅ Unusual transaction upload status: {status}. Rows: {len(unusual_df)}")
               Kestra.outputs({
                   "status": status,
@@ -621,6 +623,7 @@ tasks:
                     inputFiles:
                       qrisduwit.parquet: "{{ outputs.filter_qrisduwit_rows.outputFiles['qrisduwit.parquet'] }}"
                     env:
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
                       TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
                       TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.qrisduwit_worksheet }}"
                       FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
@@ -655,12 +658,13 @@ tasks:
                               detail_df=qrisduwit_df,
                               gspread_client=client,
                               include_disbursement_date=True,
+                              report_date=os.environ["ISO_DATE"],
                           )
 
                           if len(qrisduwit_df) == 0:
                               status = "no_rows"
                           else:
-                              status = "success" if written else "skipped_duplicate"
+                              status = "success"
                           print(f"✅ QRISDUWIT upload status: {status}. Rows: {len(qrisduwit_df)}")
                           Kestra.outputs({
                               "status": status,
@@ -770,6 +774,7 @@ tasks:
                     inputFiles:
                       reversal.parquet: "{{ outputs.filter_reversal_rows.outputFiles['reversal.parquet'] }}"
                     env:
+                      ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
                       TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
                       TARGET_WORKSHEET: "{{ outputs.parse_and_resolve.vars.reversal_worksheet }}"
                       FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
@@ -804,12 +809,13 @@ tasks:
                               detail_df=reversal_df,
                               gspread_client=client,
                               include_disbursement_date=False,
+                              report_date=os.environ["ISO_DATE"],
                           )
 
                           if len(reversal_df) == 0:
                               status = "no_rows"
                           else:
-                              status = "success" if written else "skipped_duplicate"
+                              status = "success"
                           print(f"✅ REVERSAL upload status: {status}. Rows: {len(reversal_df)}")
                           Kestra.outputs({
                               "status": status,
@@ -1023,20 +1029,13 @@ tasks:
                               gspread_client=client,
                           )
 
-                          if insert_row is None:
-                              print("⚠️  Sheet duplicate guard — date already exists.")
-                              Kestra.outputs({
-                                  "status": "skipped_duplicate",
-                                  "worksheet": os.environ["TARGET_WORKSHEET"],
-                              })
-                          else:
-                              print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
-                              Kestra.outputs({
-                                  "status": "success",
-                                  "worksheet": os.environ["TARGET_WORKSHEET"],
-                                  "insert_row": insert_row,
-                                  "footer_end": footer_end,
-                              })
+                          print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
+                          Kestra.outputs({
+                              "status": "success",
+                              "worksheet": os.environ["TARGET_WORKSHEET"],
+                              "insert_row": insert_row,
+                              "footer_end": footer_end,
+                          })
                       finally:
                           if sa_key_path and os.path.exists(sa_key_path):
                               os.unlink(sa_key_path)

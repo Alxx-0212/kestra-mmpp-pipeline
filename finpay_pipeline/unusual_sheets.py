@@ -5,6 +5,10 @@ import pandas as pd
 from .sheets_common import (
     _add_protected_sheet_request,
     _delete_all_protected_range_requests,
+    _delete_sheet_rows,
+    _horizontal_border_requests,
+    _insert_blank_sheet_rows,
+    _matching_report_date_rows,
     ensure_row_capacity,
 )
 
@@ -13,18 +17,15 @@ def append_unusual_to_gsheet(
     target_spreadsheet: str,
     target_worksheet: str,
     unusual_df: pd.DataFrame,
+    report_date: str | None = None,
 ) -> bool:
     """
     Appends unusual transaction rows to a dedicated sheet using a readable,
     fixed report layout instead of dumping raw DataFrame columns.
     - Writes formatted column headers on the first run.
-    - Duplicate guard: skips if the report date already exists.
-    Returns True on success, False if skipped (duplicate).
+    - Replaces existing rows for the same report date on reruns.
+    Returns True on success/no rows.
     """
-    if unusual_df.empty:
-        print('No unusual transactions — nothing to write.')
-        return True
-
     def _a1(row, col):
         col_letter = ""
         while col:
@@ -53,6 +54,16 @@ def append_unusual_to_gsheet(
             return ''
         return pd.to_datetime(value).strftime('%d/%m/%Y %H:%M:%S')
 
+    def _report_date_display() -> str:
+        if not unusual_df.empty:
+            return pd.to_datetime(unusual_df['Transaction Date']).dt.strftime('%d/%m/%Y').max()
+        if report_date:
+            parsed = pd.to_datetime(report_date, format='%Y-%m-%d', errors='coerce')
+            if pd.isna(parsed):
+                parsed = pd.to_datetime(report_date, dayfirst=True)
+            return parsed.strftime('%d/%m/%Y')
+        return ''
+
     HEADERS = [
         'REPORT DATE',
         'NO',
@@ -78,21 +89,16 @@ def append_unusual_to_gsheet(
     try:
         ws = sh.worksheet(target_worksheet)
     except gspread.WorksheetNotFound:
+        if unusual_df.empty:
+            print('No unusual transactions — nothing to write.')
+            return True
         ws = sh.add_worksheet(title=target_worksheet, rows=5000, cols=20)
 
-    def _protect_sheet() -> None:
-        protection_request = _add_protected_sheet_request(
-            gspread_client,
-            ws,
-            f"FinPay protected unusual sheet",
-        )
-        requests = [
-            *_delete_all_protected_range_requests(sh, ws),
-            protection_request,
-        ]
-        sh.batch_update({"requests": requests})
+    report_date_text = _report_date_display()
+    if unusual_df.empty and not report_date_text:
+        print('No unusual transactions — nothing to write.')
+        return True
 
-    report_date = pd.to_datetime(unusual_df['Transaction Date']).dt.strftime('%d/%m/%Y').max()
     existing = ws.get_all_values()
     meaningful_existing = [
         row for row in existing
@@ -101,22 +107,36 @@ def append_unusual_to_gsheet(
 
     if meaningful_existing:
         headers = meaningful_existing[0]
-        if 'REPORT DATE' in headers:
-            report_col = headers.index('REPORT DATE')
-            existing_dates = [row[report_col] for row in meaningful_existing[1:] if len(row) > report_col]
-            if report_date in existing_dates:
-                _protect_sheet()
-                print(f'⚠️  Unusual transactions for {report_date} already exist — skipping.')
-                return False
-        elif 'Transaction Date' in headers:
-            td_col = headers.index('Transaction Date')
-            existing_dates = [row[td_col] for row in meaningful_existing[1:] if len(row) > td_col]
-            if any(report_date in d for d in existing_dates):
-                _protect_sheet()
-                print(f'⚠️  Unusual transactions for {report_date} already exist — skipping.')
-                return False
+        matching_rows = _matching_report_date_rows(
+            existing,
+            headers,
+            report_date_text,
+            fallback_header="Transaction Date",
+        )
+        if matching_rows:
+            replacement_start = min(matching_rows)
+            _delete_sheet_rows(sh, ws, matching_rows)
+            print(
+                f'↻ Replacing {len(matching_rows)} existing unusual rows '
+                f'for {report_date_text}.'
+            )
+            existing = ws.get_all_values()
+            meaningful_existing = [
+                row for row in existing
+                if any(str(cell).strip() for cell in row)
+            ]
+        else:
+            replacement_start = None
+    else:
+        replacement_start = None
 
-    if not meaningful_existing:
+    if unusual_df.empty:
+        print(f'No unusual transactions for {report_date_text} — stale rows removed if present.')
+        return True
+
+    if replacement_start:
+        insert_row = replacement_start
+    elif not meaningful_existing:
         insert_row = 1
     else:
         insert_row = len(existing) + 1
@@ -132,7 +152,7 @@ def append_unusual_to_gsheet(
 
     for _, row in unusual_df.iterrows():
         rows_to_append.append([
-            report_date,
+            report_date_text,
             _number(row.get('No')),
             _datetime_display(row.get('Transaction Date')),
             str(_clean(row.get('Transaction ID'))),
@@ -148,7 +168,10 @@ def append_unusual_to_gsheet(
         ])
 
     write_end = insert_row + len(rows_to_append) - 1
-    ensure_row_capacity(sh, ws, write_end, buffer_rows=500, label=target_worksheet)
+    if replacement_start:
+        _insert_blank_sheet_rows(sh, ws, replacement_start, len(rows_to_append))
+    else:
+        ensure_row_capacity(sh, ws, write_end, buffer_rows=500, label=target_worksheet)
     ws.update(_range(insert_row, write_end), rows_to_append, value_input_option='USER_ENTERED')
 
     header_row = data_start - 1 if needs_header else 1
@@ -161,11 +184,16 @@ def append_unusual_to_gsheet(
     protection_request = _add_protected_sheet_request(
         gspread_client,
         ws,
-        f"FinPay protected unusual sheet {report_date}",
+        f"FinPay protected unusual sheet {report_date_text}",
     )
     sh.batch_update({"requests": [
         *_delete_all_protected_range_requests(sh, ws),
         *([protection_request] if protection_request else []),
+        {
+            "clearBasicFilter": {
+                "sheetId": ws.id,
+            }
+        },
         {
             "updateSheetProperties": {
                 "properties": {
@@ -175,6 +203,8 @@ def append_unusual_to_gsheet(
                 "fields": "gridProperties.frozenRowCount",
             }
         },
+        *_horizontal_border_requests(ws, header_row, header_row, 1, len(HEADERS)),
+        *_horizontal_border_requests(ws, data_start, data_end, 1, len(HEADERS)),
         *[
             {
                 "updateDimensionProperties": {
@@ -203,11 +233,7 @@ def append_unusual_to_gsheet(
     ws.format(f"C{data_start}:C{data_end}", {"numberFormat": {"type": "DATE_TIME", "pattern": "dd/mm/yyyy hh:mm:ss"}})
     ws.format(f"G{data_start}:J{data_end}", {"numberFormat": IDR})
     ws.format(f"L{data_start}:M{data_end}", {"wrapStrategy": "WRAP"})
-    ws.format(_range(data_start, data_start), {
-        "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
-    })
-
-    print(f'✓ Written {len(unusual_df)} unusual rows for {report_date}')
+    print(f'✓ Written {len(unusual_df)} unusual rows for {report_date_text}')
     return True
 
 
@@ -216,11 +242,16 @@ def process_unusual_upload(
     target_worksheet: str,
     unusual_df: pd.DataFrame,
     gspread_client,
+    report_date: str | None = None,
 ) -> bool:
     """
     Coordinator for the unusual-transactions upload step.
     Mirrors the interface of process_daily_upload.
     """
     return append_unusual_to_gsheet(
-        gspread_client, target_spreadsheet, target_worksheet, unusual_df
+        gspread_client,
+        target_spreadsheet,
+        target_worksheet,
+        unusual_df,
+        report_date=report_date,
     )

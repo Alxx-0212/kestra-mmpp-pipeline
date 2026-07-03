@@ -443,6 +443,14 @@ Fee validation currently monitors:
 | `RECHARGE` | `RECHARGEFEE` with total `Debet == 20`, unless exempt by the unusual out-cluster remark. |
 | `SELLTHRU` | `SELLTHRUFEE` with total `Debet == 100` and at least one `SELLTHRUSALESFEE` row. |
 
+Fee rows are capped per `base_id` before summary aggregation. For
+`RECHARGEFEE`, `RECHARGE OUT CLUSTER FEE`, `Reversal - NGRS FEE`, and
+`Reversal - Recharge Out Cluster FEE`, only fee rows up to the first `20` are
+included. For `SELLTHRUFEE`, only fee rows up to the first `100` are included.
+Rows beyond those caps are written to unusual with `excluded from summary` and
+removed from `summary_ready.parquet`. If the included fee total is below the
+expected amount, the group is still included but flagged unusual.
+
 Known fee rows without their main transaction are also flagged as unusual. `RECHARGEFEE` without `RECHARGE` is included in summary and its `unusual_reason` ends with `included in summary`. `SELLTHRUFEE` / `SELLTHRUSALESFEE` without `SELLTHRU` is excluded from summary and its `unusual_reason` ends with `excluded from summary`.
 
 Flagged rows include the original transaction rows plus:
@@ -486,13 +494,15 @@ PKY
 
 If the summary worksheet does not exist, it is created. If it is empty, the pipeline initializes:
 
-- Header row: `TANGGAL`, `KETERANGAN`, `DEBET`, `KREDIT`, `SALDO`
-- Opening balance row using the previous-month-end date
+- Header row: `REPORT DATE`, `SECTION`, `KETERANGAN`, `DEBET`, `KREDIT`, `SALDO`
+- Opening balance row using the previous-month-end date; its `SECTION` cell is intentionally blank
 - Default starting balance from the cluster config
 
-Each run appends a daily block. Duplicate-date guard checks column A for the formatted transaction date and skips if that date already exists.
+Each run writes one daily block. If the formatted transaction date already exists in column A, the pipeline deletes that existing daily block and rewrites the latest result in the same position.
 
-Daily data rows are written in this fixed order:
+Summary rows use a flat, filterable layout. `REPORT DATE` and `SECTION` are repeated on every row so filters keep the date and section visible. The first row of each section has higher-contrast styling, while repeated date/section cells inside that section are muted.
+
+Daily `DETAIL` rows are written in this fixed order:
 
 | Label | Summary transaction key |
 |---|---|
@@ -512,11 +522,13 @@ Daily data rows are written in this fixed order:
 | BIAYA FEE ST | `SELLTHRUFEE` |
 | BIAYA FEE BAR A. ST | `SELLTHRUSALESFEE` |
 
-Each daily block then writes three formula-based summary sections in this order:
+Each daily block then writes formula-based rows with these `SECTION` values in this order:
 
-1. `CASH IN TEAM REPORT`
-2. `ACCOUNTING REPORT`
-3. `FOOTER SUMMARY`
+1. `DETAIL`
+2. `CASH IN`
+3. `ACCOUNTING`
+4. `Summary`
+5. `Cash`
 
 Cash In Team rows:
 
@@ -565,7 +577,7 @@ After `RUNNING TOTAL`, the block writes two reconciliation rows:
 
 | Row | Behavior |
 |---|---|
-| MANDIRI | Editable input cell in column C. It defaults to the next block's `TRANSFER MASUK DARI FINPAY` value from column D, or `0` when the next block does not exist yet. Users can overwrite it manually. |
+| MANDIRI | Editable input cell in column D (`DEBET`). It defaults to the next block's `TRANSFER MASUK DARI FINPAY` value from column E (`KREDIT`), or `0` when the next block does not exist yet. Users can overwrite it manually. |
 | SELISIH | Formula row where `SELISIH = MANDIRI - RUNNING TOTAL`; status shows `pending transfer`, `sesuai`, `lebih bayar`, or `kurang bayar`. |
 
 Before appending rows, sheet writers expand the worksheet if needed so the
@@ -576,22 +588,28 @@ explicit output range and add a 500-row buffer. The `MANDIRI` lookup skips blank
 future transfer cells to tolerate partial writes after transient Google Sheets
 errors.
 
-The header row is frozen on each output worksheet; no separate dashboard range is written.
+The header row is frozen on each output worksheet; no separate dashboard range
+is written. The workflow clears shared basic filters from output worksheets, so
+users should use temporary filter views for personal filtering instead of
+changing shared sheet state. Output sheets use horizontal row borders only, with
+light row separators to keep filtered views readable without adding vertical
+grid noise. Summary sheets also keep stronger top borders on section starts,
+`Total`, and `SELISIH`.
 
 Drive-level ownership, sharing, and editor permission settings are managed by
 the spreadsheet owner, not by the workflow. The workflow only writes values,
 formats worksheets, and recreates worksheet protected ranges.
 
-Generated sheet ranges are protected after each write. Summary sheet columns A:E are locked for all generated rows except `MANDIRI` cells in column C, which remain editable for users with spreadsheet editor access. QRISDUWIT, Reversal, and Unusual worksheets are locked across their generated used ranges.
+Generated sheet ranges are protected after each write. Summary sheet columns A:F are locked for all generated rows except `MANDIRI` cells in column D, which remain editable for users with spreadsheet editor access. QRISDUWIT, Reversal, and Unusual worksheets are locked across their generated used ranges.
 
 Protection editors are recreated by the workflow on every sheet write.
 Configure them in `.env_encoded` with `SECRET_FINPAY_PROTECTION_EDITOR_EMAILS`.
 The workflow also auto-adds the authenticated service-account email to
 protected ranges. If `SECRET_FINPAY_MANDIRI_EDITOR_EMAILS` decodes to a
-comma-separated email list, the editable `MANDIRI` column C cells are also
+comma-separated email list, the editable `MANDIRI` column D cells are also
 protected so only those listed users and the protected-range editors can edit
 them. If it decodes to a blank value, any invited spreadsheet editor can edit
-`MANDIRI` column C cells.
+`MANDIRI` column D cells.
 
 ### Unusual worksheet
 
@@ -607,7 +625,7 @@ Example:
 PKY - Unusual
 ```
 
-The worksheet is created if missing. Blank sheets get formatted headers in row 1 and data from row 2. Sheets that already have the expected header append data only. If there are no unusual rows, no rows are appended. Duplicate-date guard checks whether the report date already exists in the unusual sheet.
+The worksheet is created if missing. Blank sheets get formatted headers in row 1 and data from row 2. Sheets that already have the expected header append data only. If the report date already exists, the existing unusual rows for that date are deleted and rewritten with the latest result. If a rerun has no unusual rows, any stale unusual rows for that report date are deleted.
 
 Current unusual report columns:
 
@@ -666,7 +684,7 @@ produces:
 04/06/2026
 ```
 
-Detail worksheets are created if missing. Blank sheets get formatted headers in row 1 and data from row 2. Duplicate-date guard checks whether the report date already exists in the detail sheet.
+Detail worksheets are created if missing. Blank sheets get formatted headers in row 1 and data from row 2. If the report date already exists, the existing detail rows for that date are deleted and rewritten with the latest result. If a rerun has no detail rows, any stale detail rows for that report date are deleted.
 
 ---
 

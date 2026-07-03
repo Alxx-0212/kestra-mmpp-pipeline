@@ -14,6 +14,9 @@ from .sheets_common import (
     _add_protected_range_request,
     _add_protected_sheet_request,
     _delete_all_protected_range_requests,
+    _delete_sheet_rows,
+    _horizontal_border_requests,
+    _insert_blank_sheet_rows,
     _mandiri_editor_emails,
     ensure_row_capacity,
     open_or_create_finpay_spreadsheet,
@@ -29,9 +32,23 @@ def setup_initial_headers_and_saldo(
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
 
+    col_header = {"red": 0.122, "green": 0.306, "blue": 0.471}
+
     # Column widths
-    widths = {0: 100, 1: 320, 2: 140, 3: 140, 4: 140}
+    widths = {
+        0: 110,  # REPORT DATE
+        1: 130,  # SECTION
+        2: 320,  # KETERANGAN
+        3: 140,  # DEBET
+        4: 140,  # KREDIT
+        5: 140,  # SALDO
+    }
     sh.batch_update({"requests": [
+        {
+            "clearBasicFilter": {
+                "sheetId": ws.id,
+            }
+        },
         {
             "updateSheetProperties": {
                 "properties": {
@@ -41,6 +58,10 @@ def setup_initial_headers_and_saldo(
                 "fields": "gridProperties.frozenRowCount",
             }
         },
+        *_horizontal_border_requests(
+            ws, 1, 1, 1, 6, style="SOLID_MEDIUM", color=col_header
+        ),
+        *_horizontal_border_requests(ws, 2, 2, 1, 6),
         *[
             {
                 "updateDimensionProperties": {
@@ -55,13 +76,13 @@ def setup_initial_headers_and_saldo(
     ]})
 
     date_display = pd.to_datetime(starting_date_str).strftime("%d/%m/%Y")
-    ws.update("A1:E2", [
-        ["TANGGAL", "KETERANGAN", "DEBET", "KREDIT", "SALDO"],
-        [date_display, f"SALDO {date_display}", "", "", starting_balance],
+    ws.update("A1:F2", [
+        ["REPORT DATE", "SECTION", "KETERANGAN", "DEBET", "KREDIT", "SALDO"],
+        [date_display, "", f"SALDO {date_display}", "", "", starting_balance],
     ], value_input_option="USER_ENTERED")
 
-    ws.format("A1:E1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
-    ws.format("E2", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}})
+    ws.format("A1:F1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
+    ws.format("F2", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}})
     protection_request = _add_protected_sheet_request(
         gspread_client,
         ws,
@@ -86,7 +107,8 @@ def append_daily_to_gsheet(
     summary_df: pd.DataFrame,
 ) -> tuple[int | None, int | None]:
     """
-    Returns (insert_row, footer_end) on success, (None, None) if duplicate.
+    Returns (insert_row, footer_end) on success.
+    Replaces the existing daily block for the same date on reruns.
     """
     target_date_str = summary_df["Transaction_Date"].max()
     formatted_date  = datetime.strptime(target_date_str, "%Y-%m-%d").strftime("%d/%m/%Y")
@@ -98,7 +120,7 @@ def append_daily_to_gsheet(
             col_letter = chr(65 + rem) + col_letter
         return f"{col_letter}{row}"
 
-    def _range(sr, er, sc=1, ec=5):
+    def _range(sr, er, sc=1, ec=6):
         return f"{_a1(sr, sc)}:{_a1(er, ec)}"
 
     COL_HEADER = {"red": 0.122, "green": 0.306, "blue": 0.471}
@@ -111,24 +133,63 @@ def append_daily_to_gsheet(
     COL_FOOTER_HEADER = {"red": 0.800, "green": 0.880, "blue": 0.950}
     COL_FOOTER_BODY = {"red": 0.900, "green": 0.940, "blue": 0.980}
     COL_INPUT = COL_STATUS
+    COL_MUTED_TEXT = {"red": 0.420, "green": 0.420, "blue": 0.420}
 
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
     existing_values = ws.get_all_values()
 
-    def _existing_mandiri_rows(values: list[list[str]]) -> list[int]:
-        return [
-            idx
+    def _existing_mandiri_cells(values: list[list[str]]) -> list[tuple[int, int]]:
+        cells = []
+        for idx, row in enumerate(values, start=1):
+            # New layout: KETERANGAN is column C and MANDIRI input is column D.
+            if len(row) > 2 and str(row[2]).strip().upper() == "MANDIRI":
+                if len(row) > 3 and str(row[3]).strip().upper() == "MANDIRI":
+                    # Previous 7-column layout kept TRANSACTION KEY in column D.
+                    cells.append((idx, 5))
+                else:
+                    cells.append((idx, 4))
+                continue
+
+            # Legacy layout: KETERANGAN was column B and MANDIRI input was column C.
+            if len(row) > 1 and str(row[1]).strip().upper() == "MANDIRI":
+                cells.append((idx, 3))
+        return cells
+
+    def _matching_summary_date_block_rows(
+        values: list[list[str]],
+        date_text: str,
+    ) -> list[int]:
+        markers = [
+            (idx, str(row[0]).strip())
             for idx, row in enumerate(values, start=1)
-            if len(row) > 1 and str(row[1]).strip().upper() == "MANDIRI"
+            if row and str(row[0]).strip()
         ]
+        rows_to_delete = []
+        i = 0
+        while i < len(markers):
+            row_number, marker_value = markers[i]
+            if marker_value != date_text:
+                i += 1
+                continue
+
+            start = row_number
+            j = i + 1
+            while j < len(markers) and markers[j][1] == date_text:
+                j += 1
+
+            end = markers[j][0] - 1 if j < len(markers) else len(values)
+            rows_to_delete.extend(range(start, end + 1))
+            i = j
+
+        return rows_to_delete
 
     def _summary_protection_requests(
         end_row: int,
-        mandiri_rows: list[int],
+        mandiri_cells: list[tuple[int, int]],
     ) -> list[dict]:
-        unique_mandiri_rows = [
-            row for row in sorted(set(mandiri_rows))
+        unique_mandiri_cells = [
+            (row, col) for row, col in sorted(set(mandiri_cells))
             if row <= end_row
         ]
         protection_request = _add_protected_sheet_request(
@@ -136,8 +197,8 @@ def append_daily_to_gsheet(
             ws,
             "FinPay protected summary sheet",
             unprotected_ranges=[
-                (row, row, 3, 3)
-                for row in unique_mandiri_rows
+                (row, row, col, col)
+                for row, col in unique_mandiri_cells
             ],
         )
         mandiri_editor_emails = _mandiri_editor_emails()
@@ -151,12 +212,12 @@ def append_daily_to_gsheet(
                         ws,
                         row,
                         row,
-                        3,
-                        3,
+                        col,
+                        col,
                         f"FinPay protected MANDIRI input row {row}",
                         extra_editor_emails=mandiri_editor_emails,
                     )
-                    for row in unique_mandiri_rows
+                    for row, col in unique_mandiri_cells
                 )
                 if request
             ]
@@ -166,16 +227,20 @@ def append_daily_to_gsheet(
             *mandiri_protection_requests,
         ]
 
-    # Duplicate guard — col A stores dates as DD/MM/YYYY, so compare using formatted_date
-    if any(row and str(row[0]).strip() == formatted_date for row in existing_values):
-        protection_requests = _summary_protection_requests(
-            len(existing_values),
-            _existing_mandiri_rows(existing_values),
+    replacement_rows = _matching_summary_date_block_rows(
+        existing_values,
+        formatted_date,
+    )
+    if replacement_rows:
+        replacement_start = min(replacement_rows)
+        _delete_sheet_rows(sh, ws, replacement_rows)
+        print(
+            f"↻ Replacing existing summary block for {formatted_date} "
+            f"({len(replacement_rows)} rows)."
         )
-        if protection_requests:
-            sh.batch_update({"requests": protection_requests})
-        print(f"⚠️  {formatted_date} already exists in sheet — skipping.")
-        return None, None
+        existing_values = ws.get_all_values()
+    else:
+        replacement_start = None
 
     # Build value map
     val_map = {
@@ -186,11 +251,21 @@ def append_daily_to_gsheet(
         for _, row in summary_df.iterrows()
     }
 
-    insert_row = len(existing_values) + 1
+    summary_headers = [
+        "REPORT DATE",
+        "SECTION",
+        "KETERANGAN",
+        "DEBET",
+        "KREDIT",
+        "SALDO",
+    ]
+    ws.update("A1:F1", [summary_headers], value_input_option="USER_ENTERED")
+
+    insert_row = replacement_start or len(existing_values) + 1
     r = insert_row
     rows_to_append = []
 
-    KETERANGAN = [
+    detail_rows = [
         ("TRANSFER MASUK DARI FINPAY", "CASHOUT APOLLO"),
         ("QRISDUWIT",                  "QRISDUWIT"),
         ("DISBURSEMENT",               "DISBURSEMENT"),
@@ -208,21 +283,39 @@ def append_daily_to_gsheet(
         ("BIAYA FEE BAR A. ST",        "SELLTHRUSALESFEE"),
     ]
 
+    def _summary_row(
+        section: str,
+        label: str,
+        debet="",
+        kredit="",
+        saldo="",
+    ) -> list:
+        return [formatted_date, section, label, debet, kredit, saldo]
+
+    detail_start = r
     first = True
-    for label, key in KETERANGAN:
+    for label, key in detail_rows:
         d = val_map.get(key, {})
         debet  = float(d.get("debet",  0))
         kredit = float(d.get("kredit", 0))
         if first:
-            prev   = f"E$1:E{r - 1}"
-            e_fmla = f"=IFERROR(INDEX({prev},MATCH(9.99E+307,{prev})),0)+C{r}-D{r}"
-            rows_to_append.append([formatted_date, label, kredit, debet, e_fmla])
+            prev_new = f"F$1:F{r - 1}"
+            prev_wide = f"G$1:G{r - 1}"
+            prev_legacy = f"E$1:E{r - 1}"
+            saldo_formula = (
+                f"=IFERROR(INDEX({prev_new},MATCH(9.99E+307,{prev_new})),"
+                f"IFERROR(INDEX({prev_wide},MATCH(9.99E+307,{prev_wide})),"
+                f"IFERROR(INDEX({prev_legacy},MATCH(9.99E+307,{prev_legacy})),0)))"
+                f"+D{r}-E{r}"
+            )
             first = False
         else:
-            rows_to_append.append(["", label, kredit, debet, f"=E{r - 1}+C{r}-D{r}"])
+            saldo_formula = f"=F{r - 1}+D{r}-E{r}"
+        rows_to_append.append(_summary_row("DETAIL", label, kredit, debet, saldo_formula))
         r += 1
+    detail_end = r - 1
 
-    # Row offsets from insert_row (matches KETERANGAN order):
+    # Row offsets from insert_row (matches detail_rows order):
     #  +1 QRISDUWIT  +2 DISBURSEMENT  +3 FeeTransaksi
     #  +4 RECHARGE   +5 RECHARGEFEE   +6 RECHARGE OUT CLUSTER
     #  +7 RECHARGE OUT CLUSTER FEE    +8 Reversal NGRS
@@ -236,78 +329,74 @@ def append_daily_to_gsheet(
         return f"=MAX(({expression}),0)", f"=MAX(-({expression}),0)"
 
     cash_report_rows = [
-        ("NGRS", *_split_net_formula(f"=C{ir+4}-D{ir+4}")),
-        ("Recharge Fee", *_split_net_formula(f"=C{ir+5}-D{ir+5}")),
-        ("Reversal - NGRS", *_split_net_formula(f"=C{ir+8}-D{ir+8}")),
-        ("Reversal - NGRS FEE", *_split_net_formula(f"=C{ir+9}-D{ir+9}")),
-        ("QRISDUWIT", *_split_net_formula(f"=C{ir+1}-D{ir+1}")),
+        ("NGRS", *_split_net_formula(f"=D{ir+4}-E{ir+4}")),
+        ("Recharge Fee", *_split_net_formula(f"=D{ir+5}-E{ir+5}")),
+        ("Reversal - NGRS", *_split_net_formula(f"=D{ir+8}-E{ir+8}")),
+        ("Reversal - NGRS FEE", *_split_net_formula(f"=D{ir+9}-E{ir+9}")),
+        ("QRISDUWIT", *_split_net_formula(f"=D{ir+1}-E{ir+1}")),
     ]
 
     accounting_report_rows = [
-        ("PPOB", *_split_net_formula(f"=C{ir+3}-D{ir+3}")),
-        ("DISBURSEMENT", *_split_net_formula(f"=C{ir+2}-D{ir+2}")),
-        ("Recharge Out Cluster", *_split_net_formula(f"=C{ir+6}-D{ir+6}")),
-        ("Recharge Out Cluster FEE", *_split_net_formula(f"=C{ir+7}-D{ir+7}")),
+        ("PPOB", *_split_net_formula(f"=D{ir+3}-E{ir+3}")),
+        ("DISBURSEMENT", *_split_net_formula(f"=D{ir+2}-E{ir+2}")),
+        ("Recharge Out Cluster", *_split_net_formula(f"=D{ir+6}-E{ir+6}")),
+        ("Recharge Out Cluster FEE", *_split_net_formula(f"=D{ir+7}-E{ir+7}")),
         (
             "Reversal - Recharge Out Cluster",
-            *_split_net_formula(f"=C{ir+10}-D{ir+10}"),
+            *_split_net_formula(f"=D{ir+10}-E{ir+10}"),
         ),
         (
             "Reversal - Recharge Out Cluster FEE",
-            *_split_net_formula(f"=C{ir+11}-D{ir+11}"),
+            *_split_net_formula(f"=D{ir+11}-E{ir+11}"),
         ),
-        ("ST", *_split_net_formula(f"=C{ir+12}-D{ir+12}")),
-        ("BIAYA FEE ST", *_split_net_formula(f"=C{ir+13}-D{ir+13}")),
-        ("BIAYA FEE BAR A. ST", *_split_net_formula(f"=C{ir+14}-D{ir+14}")),
+        ("ST", *_split_net_formula(f"=D{ir+12}-E{ir+12}")),
+        ("BIAYA FEE ST", *_split_net_formula(f"=D{ir+13}-E{ir+13}")),
+        ("BIAYA FEE BAR A. ST", *_split_net_formula(f"=D{ir+14}-E{ir+14}")),
     ]
 
     def _append_summary_section(
-        title: str,
+        section: str,
         report_rows: list[tuple[str, str, str]],
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int]:
         nonlocal r
-        header_row = r
-        rows_to_append.append([formatted_date, title, "", "", ""])
-        r += 1
         body_start = r
         for label, debet_formula, kredit_formula in report_rows:
-            rows_to_append.append(["", label, debet_formula, kredit_formula, ""])
+            rows_to_append.append(
+                _summary_row(section, label, debet_formula, kredit_formula)
+            )
             r += 1
         body_end = r - 1
-        return header_row, body_start, body_end
+        return body_start, body_end
 
-    cash_header, cash_start, cash_end = _append_summary_section(
-        "CASH IN REPORT",
+    cash_start, cash_end = _append_summary_section(
+        "CASH IN",
         cash_report_rows,
     )
-    accounting_header, accounting_start, accounting_end = _append_summary_section(
-        "ACCOUNTING REPORT",
+    accounting_start, accounting_end = _append_summary_section(
+        "ACCOUNTING",
         accounting_report_rows,
     )
 
-    footer_header = r
-    rows_to_append.append([formatted_date, "Transaction SUMMARY", "", "", ""])
-    r += 1
     footer_start = r
     footer_formulas = [
         # NGRS = net(RECHARGE - RECHARGEFEE)
-        f"=C{ir+4}-D{ir+4}+C{ir+5}-D{ir+5}",
+        f"=D{ir+4}-E{ir+4}+D{ir+5}-E{ir+5}",
         # Recharge Out Cluster = net(RECHARGE OUT CLUSTER - RECHARGE OUT CLUSTER FEE)
-        f"=C{ir+6}-D{ir+6}+C{ir+7}-D{ir+7}",
+        f"=D{ir+6}-E{ir+6}+D{ir+7}-E{ir+7}",
         # Reversal - NGRS = net(Reversal NGRS - Reversal NGRS fee)
-        f"=(C{ir+8}-D{ir+8})+(C{ir+9}-D{ir+9})",
+        f"=(D{ir+8}-E{ir+8})+(D{ir+9}-E{ir+9})",
         # Reversal - Recharge Out Cluster = net(out-cluster reversal - fee)
-        f"=(C{ir+10}-D{ir+10})+(C{ir+11}-D{ir+11})",
+        f"=(D{ir+10}-E{ir+10})+(D{ir+11}-E{ir+11})",
         # PPOB  = net(FeeTransaksi)
-        f"=C{ir+3}-D{ir+3}",
+        f"=D{ir+3}-E{ir+3}",
         # ST = net(SELLTHRU family only)
-        f"=C{ir+12}-D{ir+12}+C{ir+13}-D{ir+13}+C{ir+14}-D{ir+14}",
+        f"=D{ir+12}-E{ir+12}+D{ir+13}-E{ir+13}+D{ir+14}-E{ir+14}",
         # DISBURSEMENT
-        f"=C{ir+2}-D{ir+2}",
+        f"=D{ir+2}-E{ir+2}",
         # QRISDUWIT
-        f"=C{ir+1}-D{ir+1}",
+        f"=D{ir+1}-E{ir+1}",
     ]
-    FOOTER_LABELS = [
+    footer_rows = [
         "NGRS",
         "Recharge Out Cluster",
         "Reversal - NGRS",
@@ -319,115 +408,150 @@ def append_daily_to_gsheet(
         "Total",
     ]
     footer_formulas.append(
-        "=" + "+".join(f"C{footer_start + j}" for j in range(len(footer_formulas)))
+        "=" + "+".join(f"D{footer_start + j}" for j in range(len(footer_formulas)))
     )
-    for i, f_label in enumerate(FOOTER_LABELS):
-        rows_to_append.append(["", f_label, footer_formulas[i], "", ""])
+    for i, f_label in enumerate(footer_rows):
+        rows_to_append.append(
+            _summary_row("Summary", f_label, footer_formulas[i])
+        )
         r += 1
+    footer_end = r - 1
     total_row = r - 1
     running_total_row = r
     previous_mandiri_value = (
+        f'IFERROR(INDEX(FILTER(D$1:D{running_total_row - 1},'
+        f'C$1:C{running_total_row - 1}="MANDIRI",'
+        f'D$1:D{running_total_row - 1}<>"MANDIRI"),'
+        f'COUNTIFS(C$1:C{running_total_row - 1},"MANDIRI",'
+        f'D$1:D{running_total_row - 1},"<>MANDIRI")),'
+        f'IFERROR(INDEX(FILTER(E$1:E{running_total_row - 1},'
+        f'C$1:C{running_total_row - 1}="MANDIRI",'
+        f'D$1:D{running_total_row - 1}="MANDIRI"),'
+        f'COUNTIFS(C$1:C{running_total_row - 1},"MANDIRI",'
+        f'D$1:D{running_total_row - 1},"MANDIRI")),'
         f'IFERROR(INDEX(FILTER(C$1:C{running_total_row - 1},'
         f'B$1:B{running_total_row - 1}="MANDIRI"),'
-        f'COUNTIF(B$1:B{running_total_row - 1},"MANDIRI")),0)'
+        f'COUNTIF(B$1:B{running_total_row - 1},"MANDIRI")),0)))'
     )
     previous_running_total = (
+        f'IFERROR(INDEX(FILTER(D$1:D{running_total_row - 1},'
+        f'C$1:C{running_total_row - 1}="RUNNING TOTAL",'
+        f'D$1:D{running_total_row - 1}<>"RUNNING_TOTAL"),'
+        f'COUNTIFS(C$1:C{running_total_row - 1},"RUNNING TOTAL",'
+        f'D$1:D{running_total_row - 1},"<>RUNNING_TOTAL")),'
+        f'IFERROR(INDEX(FILTER(E$1:E{running_total_row - 1},'
+        f'C$1:C{running_total_row - 1}="RUNNING TOTAL",'
+        f'D$1:D{running_total_row - 1}="RUNNING_TOTAL"),'
+        f'COUNTIFS(C$1:C{running_total_row - 1},"RUNNING TOTAL",'
+        f'D$1:D{running_total_row - 1},"RUNNING_TOTAL")),'
         f'IFERROR(INDEX(FILTER(C$1:C{running_total_row - 1},'
         f'B$1:B{running_total_row - 1}="RUNNING TOTAL"),'
-        f'COUNTIF(B$1:B{running_total_row - 1},"RUNNING TOTAL")),0)'
+        f'COUNTIF(B$1:B{running_total_row - 1},"RUNNING TOTAL")),0)))'
     )
     running_total_formula = (
         f'=IF({previous_mandiri_value}>0,'
-        f'C{total_row},'
-        f'{previous_running_total}+C{total_row})'
+        f'D{total_row},'
+        f'{previous_running_total}+D{total_row})'
     )
-    rows_to_append.append(["", "RUNNING TOTAL", running_total_formula, "", ""])
+    rows_to_append.append(
+        _summary_row("Cash", "RUNNING TOTAL", running_total_formula)
+    )
     r += 1
-    footer_end = running_total_row
     mandiri_row = r
     next_transfer_range_start = mandiri_row + 2
     mandiri_formula = (
-        f'=IFERROR(INDEX(FILTER(D{next_transfer_range_start}:D,'
+        f'=IFERROR(INDEX(FILTER(E{next_transfer_range_start}:E,'
+        f'TRIM(C{next_transfer_range_start}:C)="TRANSFER MASUK DARI FINPAY",'
+        f'D{next_transfer_range_start}:D<>"CASHOUT APOLLO",'
+        f'E{next_transfer_range_start}:E<>""),1),'
+        f'IFERROR(INDEX(FILTER(F{next_transfer_range_start}:F,'
+        f'TRIM(C{next_transfer_range_start}:C)="TRANSFER MASUK DARI FINPAY",'
+        f'D{next_transfer_range_start}:D="CASHOUT APOLLO",'
+        f'F{next_transfer_range_start}:F<>""),1),'
+        f'IFERROR(INDEX(FILTER(D{next_transfer_range_start}:D,'
         f'TRIM(B{next_transfer_range_start}:B)="TRANSFER MASUK DARI FINPAY",'
-        f'D{next_transfer_range_start}:D<>""),1),0)'
+        f'D{next_transfer_range_start}:D<>""),1),0)))'
     )
-    rows_to_append.append(["", "MANDIRI", mandiri_formula, "", ""])
+    rows_to_append.append(
+        _summary_row("Cash", "MANDIRI", mandiri_formula)
+    )
     r += 1
     selisih_row = r
     selisih_formula = (
-        f'=IF(OR(C{mandiri_row}="",C{mandiri_row}=0),'
-        f'"",C{mandiri_row}-C{running_total_row})'
+        f'=IF(OR(D{mandiri_row}="",D{mandiri_row}=0),'
+        f'"",D{mandiri_row}-D{running_total_row})'
     )
     selisih_status_formula = (
-        f'=IF(OR(C{mandiri_row}="",C{mandiri_row}=0),"pending transfer",'
-        f'IF(C{selisih_row}=0,"sesuai",'
-        f'IF(C{selisih_row}>0,'
+        f'=IF(OR(D{mandiri_row}="",D{mandiri_row}=0),"pending transfer",'
+        f'IF(D{selisih_row}=0,"sesuai",'
+        f'IF(D{selisih_row}>0,'
         f'"lebih bayar",'
         f'"kurang bayar")))'
     )
-    rows_to_append.append(["", "SELISIH", selisih_formula, selisih_status_formula, ""])
+    rows_to_append.append(
+        _summary_row("Cash", "SELISIH", selisih_formula, selisih_status_formula)
+    )
     reconciliation_end = r
 
     required_rows = max(reconciliation_end, next_transfer_range_start)
-    ensure_row_capacity(sh, ws, required_rows, label="summary worksheet")
-    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+    if replacement_start:
+        _insert_blank_sheet_rows(sh, ws, replacement_start, len(rows_to_append))
+    else:
+        ensure_row_capacity(sh, ws, required_rows, label="summary worksheet")
+    ws.update(
+        _range(insert_row, insert_row + len(rows_to_append) - 1),
+        rows_to_append,
+        value_input_option="USER_ENTERED",
+    )
 
     # Formatting
     data_start = insert_row
-    data_end = insert_row + len(KETERANGAN) - 1
+    data_end = reconciliation_end
     IDR = {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}
 
     def _format_report_section(
-        header_row: int,
-        body_start: int,
-        body_end: int,
-        header_color: dict,
+        start_row: int,
+        end_row: int,
+        first_row_color: dict,
         body_color: dict,
     ) -> None:
-        ws.format(_range(header_row, header_row), {
-            "backgroundColor": header_color,
+        ws.format(_range(start_row, end_row), {"backgroundColor": body_color})
+        ws.format(f"D{start_row}:F{end_row}", {"numberFormat": IDR})
+        if end_row > start_row:
+            ws.format(f"A{start_row + 1}:B{end_row}", {
+                "textFormat": {"foregroundColor": COL_MUTED_TEXT},
+            })
+        ws.format(f"A{start_row}:B{start_row}", {
+            "backgroundColor": first_row_color,
             "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-            "horizontalAlignment": "CENTER",
-        })
-        ws.format(_range(body_start, body_end), {"backgroundColor": body_color})
-        ws.format(f"C{body_start}:D{body_end}", {"numberFormat": IDR})
-        ws.format(_range(header_row, header_row), {
-            "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
         })
 
     ws.format(_range(data_start, data_end), {"backgroundColor": COL_WHITE})
-    ws.format(f"C{data_start}:E{data_end}", {"numberFormat": IDR})
+    ws.format(f"D{data_start}:F{data_end}", {"numberFormat": IDR})
     _format_report_section(
-        cash_header, cash_start, cash_end, COL_CASH_HEADER, COL_CASH_BODY
+        detail_start, detail_end, COL_FOOTER_BODY, COL_WHITE
     )
     _format_report_section(
-        accounting_header,
+        cash_start, cash_end, COL_CASH_HEADER, COL_CASH_BODY
+    )
+    _format_report_section(
         accounting_start,
         accounting_end,
         COL_ACCOUNTING_HEADER,
         COL_ACCOUNTING_BODY,
     )
     _format_report_section(
-        footer_header, footer_start, footer_end, COL_FOOTER_HEADER, COL_FOOTER_BODY
+        footer_start, footer_end, COL_FOOTER_HEADER, COL_FOOTER_BODY
     )
-    ws.format(_range(footer_start, footer_end, ec=3), {
-        "backgroundColor": COL_FOOTER_BODY,
-        "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-    })
-    ws.format(f"C{footer_start}:D{footer_end}", {"numberFormat": IDR})
-    ws.format(_range(running_total_row, running_total_row), {
-        "backgroundColor": COL_INPUT,
-        "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-    })
-    ws.format(f"C{running_total_row}", {
-        "backgroundColor": COL_INPUT,
-        "numberFormat": IDR,
-    })
+    _format_report_section(
+        running_total_row, selisih_row, COL_INPUT, COL_STATUS
+    )
+    ws.format(f"D{running_total_row}:E{selisih_row}", {"numberFormat": IDR})
     ws.format(_range(mandiri_row, mandiri_row), {
         "backgroundColor": COL_INPUT,
         "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
     })
-    ws.format(f"C{mandiri_row}", {
+    ws.format(f"D{mandiri_row}", {
         "backgroundColor": COL_INPUT,
         "numberFormat": IDR,
     })
@@ -435,20 +559,8 @@ def append_daily_to_gsheet(
         "backgroundColor": COL_STATUS,
         "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
     })
-    ws.format(f"C{selisih_row}", {"numberFormat": IDR})
-    ws.format(f"D{selisih_row}", {"wrapStrategy": "WRAP"})
-    ws.format(f"C{selisih_row}", {
-        "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
-    })
-    ws.format(_range(data_start, data_start), {
-        "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
-    })
-    ws.format(f"A{insert_row}", {
-        "textFormat": {"bold": True, "foregroundColor": COL_HEADER, "fontSize": 10}
-    })
-    ws.format(f"C{total_row}", {
-        "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
-    })
+    ws.format(f"D{selisih_row}", {"numberFormat": IDR})
+    ws.format(f"E{selisih_row}", {"wrapStrategy": "WRAP"})
     old_dashboard_range = {
         "sheetId": ws.id,
         "startRowIndex": 0,
@@ -456,13 +568,33 @@ def append_daily_to_gsheet(
         "startColumnIndex": 6,
         "endColumnIndex": 15,
     }
-    summary_widths = {0: 100, 1: 320, 2: 140, 3: 140, 4: 140}
+    summary_widths = {
+        0: 110,
+        1: 130,
+        2: 320,
+        3: 140,
+        4: 140,
+        5: 140,
+    }
+    existing_mandiri_cells = _existing_mandiri_cells(existing_values)
+    if replacement_start:
+        inserted_row_count = len(rows_to_append)
+        existing_mandiri_cells = [
+            (row + inserted_row_count if row >= replacement_start else row, col)
+            for row, col in existing_mandiri_cells
+        ]
+    final_sheet_end = max(reconciliation_end, len(existing_values) + len(rows_to_append))
     protection_requests = _summary_protection_requests(
-        reconciliation_end,
-        [*_existing_mandiri_rows(existing_values), mandiri_row],
+        final_sheet_end,
+        [*existing_mandiri_cells, (mandiri_row, 4)],
     )
     sh.batch_update({"requests": [
         *protection_requests,
+        {
+            "clearBasicFilter": {
+                "sheetId": ws.id,
+            }
+        },
         {
             "updateSheetProperties": {
                 "properties": {
@@ -472,6 +604,50 @@ def append_daily_to_gsheet(
                 "fields": "gridProperties.frozenRowCount",
             }
         },
+        *_horizontal_border_requests(ws, 1, 1, 1, 6),
+        *_horizontal_border_requests(ws, data_start, data_end, 1, 6),
+        *[
+            request
+            for row in [
+                detail_start,
+                cash_start,
+                accounting_start,
+                footer_start,
+            ]
+            for request in _horizontal_border_requests(
+                ws,
+                row,
+                row,
+                1,
+                6,
+                top=True,
+                bottom=False,
+                style="SOLID_MEDIUM",
+                color=COL_HEADER,
+            )
+        ],
+        *_horizontal_border_requests(
+            ws,
+            total_row,
+            total_row,
+            4,
+            4,
+            top=True,
+            bottom=False,
+            style="SOLID_MEDIUM",
+            color=COL_HEADER,
+        ),
+        *_horizontal_border_requests(
+            ws,
+            selisih_row,
+            selisih_row,
+            4,
+            4,
+            top=True,
+            bottom=False,
+            style="SOLID_MEDIUM",
+            color=COL_HEADER,
+        ),
         {
             "updateCells": {
                 "range": old_dashboard_range,

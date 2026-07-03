@@ -13,6 +13,10 @@ from .classification import (
 from .sheets_common import (
     _add_protected_sheet_request,
     _delete_all_protected_range_requests,
+    _delete_sheet_rows,
+    _horizontal_border_requests,
+    _insert_blank_sheet_rows,
+    _matching_report_date_rows,
     ensure_row_capacity,
 )
 
@@ -114,15 +118,13 @@ def append_transaction_detail_to_gsheet(
     target_worksheet: str,
     detail_df: pd.DataFrame,
     include_disbursement_date: bool = False,
+    report_date: str | None = None,
 ) -> bool:
     """
     Appends filtered transaction detail rows to a dedicated worksheet.
-    Returns True on success/no rows, False if skipped by duplicate-date guard.
+    Replaces existing rows for the same report date on reruns.
+    Returns True on success/no rows.
     """
-    if detail_df.empty:
-        print(f"No rows for {target_worksheet} — nothing to write.")
-        return True
-
     def _a1(row, col):
         col_letter = ""
         while col:
@@ -163,6 +165,16 @@ def append_transaction_detail_to_gsheet(
             return ""
         return pd.to_datetime(value, dayfirst=True).strftime("%d/%m/%Y")
 
+    def _report_date_display() -> str:
+        if not detail_df.empty:
+            return pd.to_datetime(detail_df["Transaction Date"]).dt.strftime("%d/%m/%Y").max()
+        if report_date:
+            parsed = pd.to_datetime(report_date, format="%Y-%m-%d", errors="coerce")
+            if pd.isna(parsed):
+                parsed = pd.to_datetime(report_date, dayfirst=True)
+            return parsed.strftime("%d/%m/%Y")
+        return ""
+
     HEADERS = ["REPORT DATE"]
     if include_disbursement_date:
         HEADERS.append("DISBURSEMENT DATE")
@@ -188,21 +200,16 @@ def append_transaction_detail_to_gsheet(
     try:
         ws = sh.worksheet(target_worksheet)
     except gspread.WorksheetNotFound:
+        if detail_df.empty:
+            print(f"No rows for {target_worksheet} — nothing to write.")
+            return True
         ws = sh.add_worksheet(title=target_worksheet, rows=5000, cols=max(20, len(HEADERS)))
 
-    def _protect_sheet() -> None:
-        protection_request = _add_protected_sheet_request(
-            gspread_client,
-            ws,
-            f"FinPay protected {target_worksheet} sheet",
-        )
-        requests = [
-            *_delete_all_protected_range_requests(sh, ws),
-            protection_request,
-        ]
-        sh.batch_update({"requests": requests})
+    report_date_text = _report_date_display()
+    if detail_df.empty and not report_date_text:
+        print(f"No rows for {target_worksheet} — nothing to write.")
+        return True
 
-    report_date = pd.to_datetime(detail_df["Transaction Date"]).dt.strftime("%d/%m/%Y").max()
     existing = ws.get_all_values()
     meaningful_existing = [
         row for row in existing
@@ -211,18 +218,32 @@ def append_transaction_detail_to_gsheet(
 
     if meaningful_existing:
         headers = meaningful_existing[0]
-        if "REPORT DATE" in headers:
-            report_col = headers.index("REPORT DATE")
-            existing_dates = [
-                row[report_col] for row in meaningful_existing[1:]
-                if len(row) > report_col
+        matching_rows = _matching_report_date_rows(existing, headers, report_date_text)
+        if matching_rows:
+            replacement_start = min(matching_rows)
+            _delete_sheet_rows(sh, ws, matching_rows)
+            print(
+                f"↻ Replacing {len(matching_rows)} existing {target_worksheet} "
+                f"rows for {report_date_text}."
+            )
+            existing = ws.get_all_values()
+            meaningful_existing = [
+                row for row in existing
+                if any(str(cell).strip() for cell in row)
             ]
-            if report_date in existing_dates:
-                _protect_sheet()
-                print(f"⚠️  {target_worksheet} rows for {report_date} already exist — skipping.")
-                return False
+        else:
+            replacement_start = None
+    else:
+        replacement_start = None
 
-    insert_row = 1 if not meaningful_existing else len(existing) + 1
+    if detail_df.empty:
+        print(f"No rows for {target_worksheet} on {report_date_text} — stale rows removed if present.")
+        return True
+
+    if replacement_start:
+        insert_row = replacement_start
+    else:
+        insert_row = 1 if not meaningful_existing else len(existing) + 1
     needs_header = not meaningful_existing or meaningful_existing[0] != HEADERS
     rows_to_append = []
 
@@ -233,7 +254,7 @@ def append_transaction_detail_to_gsheet(
         data_start = insert_row
 
     for _, row in detail_df.iterrows():
-        output_row = [report_date]
+        output_row = [report_date_text]
         if include_disbursement_date:
             output_row.append(_date_display(row.get("Disbursement Date")))
         output_row.extend([
@@ -252,7 +273,10 @@ def append_transaction_detail_to_gsheet(
         rows_to_append.append(output_row)
 
     write_end = insert_row + len(rows_to_append) - 1
-    ensure_row_capacity(sh, ws, write_end, buffer_rows=500, label=target_worksheet)
+    if replacement_start:
+        _insert_blank_sheet_rows(sh, ws, replacement_start, len(rows_to_append))
+    else:
+        ensure_row_capacity(sh, ws, write_end, buffer_rows=500, label=target_worksheet)
     ws.update(_range(insert_row, write_end), rows_to_append, value_input_option="USER_ENTERED")
 
     header_row = data_start - 1 if needs_header else 1
@@ -276,11 +300,16 @@ def append_transaction_detail_to_gsheet(
     protection_request = _add_protected_sheet_request(
         gspread_client,
         ws,
-        f"FinPay protected {target_worksheet} sheet {report_date}",
+        f"FinPay protected {target_worksheet} sheet {report_date_text}",
     )
     sh.batch_update({"requests": [
         *_delete_all_protected_range_requests(sh, ws),
         *([protection_request] if protection_request else []),
+        {
+            "clearBasicFilter": {
+                "sheetId": ws.id,
+            }
+        },
         {
             "updateSheetProperties": {
                 "properties": {
@@ -290,6 +319,8 @@ def append_transaction_detail_to_gsheet(
                 "fields": "gridProperties.frozenRowCount",
             }
         },
+        *_horizontal_border_requests(ws, header_row, header_row, 1, len(HEADERS)),
+        *_horizontal_border_requests(ws, data_start, data_end, 1, len(HEADERS)),
         *[
             {
                 "updateDimensionProperties": {
@@ -340,11 +371,7 @@ def append_transaction_detail_to_gsheet(
     ws.format(f"{_a1(data_start, remarks_col)}:{_a1(data_end, remarks_col)}", {
         "wrapStrategy": "WRAP"
     })
-    ws.format(_range(data_start, data_start), {
-        "borders": {"top": {"style": "SOLID_MEDIUM", "color": COL_HEADER}}
-    })
-
-    print(f"✓ Written {len(detail_df)} rows to {target_worksheet} for {report_date}")
+    print(f"✓ Written {len(detail_df)} rows to {target_worksheet} for {report_date_text}")
     return True
 
 
@@ -354,6 +381,7 @@ def process_transaction_detail_upload(
     detail_df: pd.DataFrame,
     gspread_client,
     include_disbursement_date: bool = False,
+    report_date: str | None = None,
 ) -> bool:
     """
     Coordinator for QRISDUWIT and REVERSAL detail-row upload steps.
@@ -364,4 +392,5 @@ def process_transaction_detail_upload(
         target_worksheet,
         detail_df,
         include_disbursement_date=include_disbursement_date,
+        report_date=report_date,
     )

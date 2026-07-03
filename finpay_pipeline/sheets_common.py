@@ -6,6 +6,7 @@ from google.oauth2.service_account import Credentials
 
 
 DEFAULT_ROW_BUFFER = 200
+DEFAULT_BORDER_COLOR = {"red": 0.850, "green": 0.870, "blue": 0.890}
 
 
 def make_gspread_client(sa_key_path: str):
@@ -135,6 +136,88 @@ def ensure_row_capacity(
     )
 
 
+def _contiguous_row_runs(row_numbers: list[int]) -> list[tuple[int, int]]:
+    if not row_numbers:
+        return []
+
+    runs = []
+    start = previous = row_numbers[0]
+    for row_number in row_numbers[1:]:
+        if row_number == previous + 1:
+            previous = row_number
+            continue
+        runs.append((start, previous))
+        start = previous = row_number
+    runs.append((start, previous))
+    return runs
+
+
+def _delete_sheet_rows(sh, ws, row_numbers: list[int]) -> None:
+    """Delete 1-based worksheet rows, grouping adjacent rows per request."""
+    if not row_numbers:
+        return
+
+    requests = []
+    for start, end in reversed(_contiguous_row_runs(sorted(row_numbers))):
+        requests.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": start - 1,
+                    "endIndex": end,
+                }
+            }
+        })
+
+    sh.batch_update({"requests": requests})
+
+
+def _insert_blank_sheet_rows(sh, ws, start_row: int, row_count: int) -> None:
+    """Insert blank rows before a 1-based worksheet row."""
+    if row_count <= 0:
+        return
+
+    sh.batch_update({"requests": [{
+        "insertDimension": {
+            "range": {
+                "sheetId": ws.id,
+                "dimension": "ROWS",
+                "startIndex": start_row - 1,
+                "endIndex": start_row - 1 + row_count,
+            },
+            "inheritFromBefore": start_row > 1,
+        }
+    }]})
+
+
+def _matching_report_date_rows(
+    existing_rows: list[list[str]],
+    headers: list[str],
+    date_text: str,
+    primary_header: str = "REPORT DATE",
+    fallback_header: str | None = None,
+) -> list[int]:
+    """Return 1-based rows whose date column matches the report date."""
+    if primary_header in headers:
+        report_col = headers.index(primary_header)
+        return [
+            row_number
+            for row_number, row in enumerate(existing_rows[1:], start=2)
+            if len(row) > report_col and str(row[report_col]).strip() == date_text
+        ]
+
+    if fallback_header and fallback_header in headers:
+        fallback_col = headers.index(fallback_header)
+        return [
+            row_number
+            for row_number, row in enumerate(existing_rows[1:], start=2)
+            if len(row) > fallback_col and date_text in str(row[fallback_col])
+        ]
+
+    return []
+
+
 def _service_account_email(gspread_client) -> str | None:
     auth = getattr(gspread_client, "auth", None)
     return (
@@ -187,6 +270,46 @@ def _grid_range(
         "startColumnIndex": start_col - 1,
         "endColumnIndex": end_col,
     }
+
+
+def _horizontal_border_requests(
+    ws,
+    start_row: int,
+    end_row: int,
+    start_col: int,
+    end_col: int,
+    *,
+    top: bool = False,
+    bottom: bool = True,
+    style: str = "SOLID",
+    color: dict | None = None,
+) -> list[dict]:
+    """Build repeatCell requests for horizontal borders only."""
+    if start_row > end_row or start_col > end_col:
+        return []
+
+    border = {
+        "style": style,
+        "color": color or DEFAULT_BORDER_COLOR,
+    }
+    requests = []
+    for side, enabled in (("top", top), ("bottom", bottom)):
+        if not enabled:
+            continue
+        requests.append({
+            "repeatCell": {
+                "range": _grid_range(ws, start_row, end_row, start_col, end_col),
+                "cell": {
+                    "userEnteredFormat": {
+                        "borders": {
+                            side: border,
+                        }
+                    }
+                },
+                "fields": f"userEnteredFormat.borders.{side}",
+            }
+        })
+    return requests
 
 
 def _add_protected_sheet_request(

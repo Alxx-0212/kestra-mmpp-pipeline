@@ -105,6 +105,33 @@ FEE_TRANSACTION_TO_MAIN = {
     'SELLTHRUFEE': 'SELLTHRU',
     'SELLTHRUSALESFEE': 'SELLTHRU',
 }
+FEE_CAP_RULES = {
+    'RECHARGEFEE': {
+        'column': 'Debet',
+        'limit': 20,
+        'label': 'Recharge fee',
+    },
+    'RECHARGE OUT CLUSTER FEE': {
+        'column': 'Debet',
+        'limit': 20,
+        'label': 'Recharge out-cluster fee',
+    },
+    'SELLTHRUFEE': {
+        'column': 'Debet',
+        'limit': 100,
+        'label': 'Sellthru fee',
+    },
+    REVERSAL_NGRS_FEE_CATEGORY: {
+        'column': 'Kredit',
+        'limit': 20,
+        'label': 'Reversal NGRS fee',
+    },
+    REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY: {
+        'column': 'Kredit',
+        'limit': 20,
+        'label': 'Reversal recharge out-cluster fee',
+    },
+}
 
 REVERSAL_CATEGORY_TO_MAIN = {
     REVERSAL_NGRS_CATEGORY: REVERSAL_NGRS_CATEGORY,
@@ -176,6 +203,13 @@ def _numeric_sum(rows: pd.DataFrame, column: str) -> int | float:
     return float(total)
 
 
+def _numeric_value(value) -> int | float:
+    parsed = pd.to_numeric(pd.Series([value]), errors='coerce').fillna(0).iloc[0]
+    if float(parsed).is_integer():
+        return int(parsed)
+    return float(parsed)
+
+
 def _format_expected_text(rule: dict) -> str:
     if 'expected_text' in rule:
         return str(rule['expected_text'])
@@ -184,6 +218,72 @@ def _format_expected_text(rule: dict) -> str:
     if 'greater_than' in rule:
         return f"> {rule['greater_than']}"
     return 'present'
+
+
+def _collect_fee_cap_excess_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[int]]:
+    """
+    Return fee rows that exceed the per-base-id included fee cap.
+
+    The cap is row-based: rows are kept in source order until the configured
+    amount is reached. Rows that cross or exceed the cap are flagged and dropped
+    from summary calculations.
+    """
+    source = df.copy()
+    if 'base_id' not in source.columns:
+        source['base_id'] = _base_id_from_transaction_id(source['Transaction ID'])
+
+    invalid_parts = []
+    excluded_indices = set()
+    for base_id, group in source.groupby('base_id', sort=False):
+        for fee_transaction, rule in FEE_CAP_RULES.items():
+            fee_rows = group[group['Transaction'] == fee_transaction]
+            if fee_rows.empty:
+                continue
+
+            column = str(rule['column'])
+            limit = _numeric_value(rule['limit'])
+            total = _numeric_sum(fee_rows, column)
+            if total <= limit:
+                continue
+
+            cumulative = 0
+            excess_indices = []
+            for idx, row in fee_rows.iterrows():
+                amount = _numeric_value(row.get(column))
+                if amount <= 0:
+                    continue
+                cumulative += amount
+                if cumulative > limit:
+                    excess_indices.append(idx)
+
+            if not excess_indices:
+                continue
+
+            label = str(rule.get('label', fee_transaction))
+            unusual_rows = source.loc[excess_indices].copy()
+            unusual_rows['base_id'] = base_id
+            unusual_rows['unusual_reason'] = (
+                f'{label} {column} total={total} exceeds included limit {limit}; '
+                'excess fee row excluded from summary'
+            )
+            invalid_parts.append(unusual_rows)
+            excluded_indices.update(excess_indices)
+
+    if invalid_parts:
+        unusual_df = pd.concat(invalid_parts, ignore_index=True, sort=False)
+        sort_cols = [
+            col for col in ['base_id', 'No', 'unusual_reason']
+            if col in unusual_df.columns
+        ]
+        unusual_df = unusual_df.sort_values(sort_cols).reset_index(drop=True)
+    else:
+        unusual_df = source.iloc[0:0].copy()
+        unusual_df['base_id'] = pd.Series(dtype='object')
+        unusual_df['unusual_reason'] = pd.Series(dtype='object')
+
+    return unusual_df, excluded_indices
 
 
 def _validate_transaction_group_rules(
@@ -525,13 +625,25 @@ def prepare_reversal_summary_transactions(
     flagged and excluded.
     """
     result = relabel_reversal_transactions(df)
+    fee_cap_unusual_df, fee_cap_excluded_indices = (
+        _collect_fee_cap_excess_transactions(result)
+    )
+    validation_result = (
+        result.drop(index=sorted(fee_cap_excluded_indices))
+        if fee_cap_excluded_indices
+        else result
+    )
     unusual_df, excluded_indices, categorized_counts = (
-        _collect_reversal_unusual_transactions(result)
+        _collect_reversal_unusual_transactions(validation_result)
     )
     fee_only_unusual_df, fee_only_excluded_indices = (
-        _collect_fee_only_unusual_transactions(result)
+        _collect_fee_only_unusual_transactions(validation_result)
     )
-    all_excluded_indices = set(excluded_indices) | set(fee_only_excluded_indices)
+    all_excluded_indices = (
+        set(fee_cap_excluded_indices)
+        | set(excluded_indices)
+        | set(fee_only_excluded_indices)
+    )
 
     if all_excluded_indices:
         summary_ready = result.drop(index=sorted(all_excluded_indices)).reset_index(drop=True)
@@ -539,7 +651,7 @@ def prepare_reversal_summary_transactions(
         summary_ready = result.reset_index(drop=True)
 
     unusual_parts = [
-        part for part in (unusual_df, fee_only_unusual_df)
+        part for part in (fee_cap_unusual_df, unusual_df, fee_only_unusual_df)
         if not part.empty
     ]
     if unusual_parts:
@@ -555,6 +667,7 @@ def prepare_reversal_summary_transactions(
 
     print(f'Reversal rows categorized for summary: {categorized_counts}')
     print(f'Summary unusual rows flagged: {len(unusual_df)}')
+    print(f'Fee cap rows excluded from summary: {len(fee_cap_excluded_indices)}')
     print(f'Reversal rows excluded from summary: {len(excluded_indices)}')
     print(f'Fee-only rows excluded from summary: {len(fee_only_excluded_indices)}')
     return summary_ready, unusual_df
@@ -618,11 +731,25 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     positives. Downstream calculation tasks still perform their own dedup step.
     """
     deduplicated_df, duplicate_unusual_df = deduplicate_rows_by_minute_with_report(df)
-    fee_unusual_df = _flag_fee_rule_unusual_transactions(deduplicated_df)
-    reversal_unusual_df, _, _ = _collect_reversal_unusual_transactions(deduplicated_df)
+    fee_cap_unusual_df, fee_cap_excluded_indices = (
+        _collect_fee_cap_excess_transactions(deduplicated_df)
+    )
+    validation_df = (
+        deduplicated_df.drop(index=sorted(fee_cap_excluded_indices))
+        if fee_cap_excluded_indices
+        else deduplicated_df
+    )
+    fee_unusual_df = _flag_fee_rule_unusual_transactions(validation_df)
+    reversal_unusual_df, _, _ = _collect_reversal_unusual_transactions(validation_df)
 
     unusual_parts = [
-        part for part in (fee_unusual_df, duplicate_unusual_df, reversal_unusual_df)
+        part
+        for part in (
+            fee_cap_unusual_df,
+            fee_unusual_df,
+            duplicate_unusual_df,
+            reversal_unusual_df,
+        )
         if not part.empty
     ]
     if unusual_parts:
@@ -639,6 +766,7 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
         result = fee_unusual_df
 
     print(f'Combined unusual rows      : {len(result)}')
+    print(f'Fee cap unusual rows       : {len(fee_cap_unusual_df)}')
     print(f'Duplicate unusual rows     : {len(duplicate_unusual_df)}')
     print(f'Fee-rule unusual rows      : {len(fee_unusual_df)}')
     print(f'Reversal unusual rows      : {len(reversal_unusual_df)}')
