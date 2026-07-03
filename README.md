@@ -259,7 +259,7 @@ The first date in the filename becomes the file `iso_date` output. The summary w
 All clusters write to the spreadsheet:
 
 ```text
-MONITORING FINPAY
+FINPAY REPORT
 ```
 
 | Cluster ID | Summary worksheet | Unusual worksheet | QRISDUWIT worksheet | Reversal worksheet | Default starting balance |
@@ -594,7 +594,8 @@ users should use temporary filter views for personal filtering instead of
 changing shared sheet state. Output sheets use horizontal row borders only, with
 light row separators to keep filtered views readable without adding vertical
 grid noise. Summary sheets also keep stronger top borders on section starts,
-`Total`, and `SELISIH`.
+`Total`, and `SELISIH`. QRISDUWIT, Reversal, and Unusual sheets keep a stronger
+top border on the first data row of each report-date block.
 
 Drive-level ownership, sharing, and editor permission settings are managed by
 the spreadsheet owner, not by the workflow. The workflow only writes values,

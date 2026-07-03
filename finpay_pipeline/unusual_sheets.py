@@ -205,6 +205,17 @@ def append_unusual_to_gsheet(
         },
         *_horizontal_border_requests(ws, header_row, header_row, 1, len(HEADERS)),
         *_horizontal_border_requests(ws, data_start, data_end, 1, len(HEADERS)),
+        *_horizontal_border_requests(
+            ws,
+            data_start,
+            data_start,
+            1,
+            len(HEADERS),
+            top=True,
+            bottom=False,
+            style="SOLID_MEDIUM",
+            color=COL_HEADER,
+        ),
         *[
             {
                 "updateDimensionProperties": {
