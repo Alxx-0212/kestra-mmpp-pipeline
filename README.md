@@ -434,13 +434,13 @@ The pipeline intentionally uses two different remark phrases for two different p
 | Purpose | Phrase | Behavior |
 |---|---|---|
 | Preprocessing relabeling | `fee pembelian recharge out cluster` | Before unusual detection, matching `RECHARGE` groups are relabeled to `RECHARGE OUT CLUSTER`, and matching fee rows are relabeled to `RECHARGE OUT CLUSTER FEE`. |
-| Unusual exemption | `biaya pembelian recharge out cluster` | In unusual detection, matching `RECHARGE` rows are exempt from the missing `RECHARGEFEE` rule. |
+| Pembelian out-cluster relabeling | `biaya pembelian recharge out cluster` | Before unusual detection, matching `RECHARGE` rows are relabeled to `PEMBELIAN RECHARGE OUT CLUSTER`, and matching `REVERSAL` rows are relabeled to `Reversal - PEMBELIAN RECHARGE OUT CLUSTER`. |
 
 Fee validation currently monitors:
 
 | Transaction | Expected fee rows |
 |---|---|
-| `RECHARGE` | `RECHARGEFEE` with total `Debet == 20`, unless exempt by the unusual out-cluster remark. |
+| `RECHARGE` | `RECHARGEFEE` with total `Debet == 20`. Rows with `biaya pembelian recharge out cluster` are relabeled before this rule runs. |
 | `SELLTHRU` | `SELLTHRUFEE` with total `Debet == 100` and at least one `SELLTHRUSALESFEE` row. |
 
 Fee rows are capped per `base_id` before summary aggregation. For
@@ -466,8 +466,9 @@ Reversal rows are classified for summary from `Remarks`:
 
 | Summary category | Required remarks and Kredit rules |
 |---|---|
-| `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`. Rows containing `biaya pembelian recharge out cluster` are exempt from the fee requirement. |
+| `Reversal - NGRS` | Main reversal rows with `Biaya Pembelian recharge`, excluding rows containing `biaya pembelian recharge out cluster`. |
 | `Reversal - NGRS FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-`; total `Kredit` must be `20` unless the group is out-cluster exempt. |
+| `Reversal - PEMBELIAN RECHARGE OUT CLUSTER` | Main reversal rows with `biaya pembelian recharge out cluster`. |
 | `Reversal - Recharge Out Cluster` | Main reversal rows with `Fee Pembelian recharge out cluster`. Invalid groups with this main row are still included in summary. |
 | `Reversal - Recharge Out Cluster FEE` | Fee rows with `Platform Fee Recharge Rp. 20,-` in the same out-cluster reversal group; total `Kredit` must be `20`. |
 | `Reversal - ST*` | Any ST reversal row is unusual-only and excluded from summary. This includes `Sellthru Sales Fee`, `Platform Fee Sellthru Rp. 100,-`, `Fee Transaksi Sellthru sejumlah 100 rupiah`, and `Sales Hold Transaksi Sellthru`. |
@@ -512,15 +513,25 @@ Daily `DETAIL` rows are written in this fixed order:
 | PPOB | `FeeTransaksi` |
 | NGRS | `RECHARGE` |
 | BIAYA FEE NGRS | `RECHARGEFEE` |
+| Pembelian Recharge Out Cluster | `PEMBELIAN RECHARGE OUT CLUSTER` |
 | RECHARGE OUT CLUSTER | `RECHARGE OUT CLUSTER` |
 | RECHARGE OUT CLUSTER FEE | `RECHARGE OUT CLUSTER FEE` |
 | REVERSAL NGRS | `Reversal - NGRS` |
 | REVERSAL NGRS FEE | `Reversal - NGRS FEE` |
+| Reversal - PEMBELIAN RECHARGE OUT CLUSTER | `Reversal - PEMBELIAN RECHARGE OUT CLUSTER` |
 | REVERSAL RECHARGE OUT CLUSTER | `Reversal - Recharge Out Cluster` |
 | REVERSAL RECHARGE OUT CLUSTER FEE | `Reversal - Recharge Out Cluster FEE` |
 | ST | `SELLTHRU` |
 | BIAYA FEE ST | `SELLTHRUFEE` |
 | BIAYA FEE BAR A. ST | `SELLTHRUSALESFEE` |
+| Jumlah Pembelian Recharge Out Cluster | Count of `PEMBELIAN RECHARGE OUT CLUSTER` rows. |
+| Expected Biaya Pembelian Recharge Out Cluster FEE | `Jumlah Pembelian Recharge Out Cluster * 200`. |
+| Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER | Count of `Reversal - PEMBELIAN RECHARGE OUT CLUSTER` rows. |
+| Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE | `Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER * 200`. |
+
+The `Jumlah ...` and `Expected Biaya ... FEE` detail helper rows are written at
+the bottom of the `DETAIL` section with blank `SALDO`, so they do not affect the
+running detail balance.
 
 Each daily block then writes formula-based rows with these `SECTION` values in this order:
 
@@ -538,8 +549,12 @@ Cash In values are split across `DEBET` and `KREDIT`: positive net values are wr
 |---|---|
 | NGRS | Net value of `RECHARGE`. |
 | Recharge Fee | Net value of `RECHARGEFEE`. |
+| Pembelian Recharge Out Cluster | Net value of `PEMBELIAN RECHARGE OUT CLUSTER`. |
+| Expected Biaya Pembelian Recharge Out Cluster FEE | Expected fee row calculated from `Jumlah Pembelian Recharge Out Cluster * 200`. |
 | Reversal - NGRS | Net value of `Reversal - NGRS`. |
 | Reversal - NGRS FEE | Net value of `Reversal - NGRS FEE`. |
+| Reversal - PEMBELIAN RECHARGE OUT CLUSTER | Net value of `Reversal - PEMBELIAN RECHARGE OUT CLUSTER`. |
+| Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE | Expected fee row calculated from `Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER * 200`. |
 | QRISDUWIT | Net of `QRISDUWIT`. |
 
 Accounting rows:
@@ -593,9 +608,11 @@ is written. The workflow clears shared basic filters from output worksheets, so
 users should use temporary filter views for personal filtering instead of
 changing shared sheet state. Output sheets use horizontal row borders only, with
 light row separators to keep filtered views readable without adding vertical
-grid noise. Summary sheets also keep stronger top borders on section starts,
-`Total`, and `SELISIH`. QRISDUWIT, Reversal, and Unusual sheets keep a stronger
-top border on the first data row of each report-date block.
+grid noise. Summary sheets widen the current `KETERANGAN` column (`C`) for
+longer pembelian out-cluster labels. Summary sheets also keep stronger top
+borders on section starts, `Total`, and `SELISIH`. QRISDUWIT, Reversal, and
+Unusual sheets keep a stronger top border on the first data row of each
+report-date block.
 
 Drive-level ownership, sharing, and editor permission settings are managed by
 the spreadsheet owner, not by the workflow. The workflow only writes values,

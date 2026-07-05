@@ -10,6 +10,7 @@ def summarize_by_transaction(df: pd.DataFrame, transaction: str | None = None) -
         .agg(
             Sum_of_Kredit=("Kredit", "sum"),
             Sum_of_Debet=("Debet", "sum"),
+            Transaction_Count=("Transaction", "size"),
             Transaction_Date=(
                 "Transaction Date",
                 lambda s: pd.to_datetime(s).dt.strftime("%Y-%m-%d").max(),

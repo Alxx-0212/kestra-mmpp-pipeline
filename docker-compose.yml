@@ -15,7 +15,7 @@ networks:
 
 services:
   postgres:
-    image: postgres:18
+    image: postgres:latest
     networks:
       - finpay-network
     volumes:
@@ -31,7 +31,7 @@ services:
       retries: 10
 
   finpay-postgres:
-    image: postgres:18
+    image: postgres:latest
     networks:
       - finpay-network
     volumes:

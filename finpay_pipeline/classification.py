@@ -5,10 +5,14 @@ from .dedup import deduplicate_rows_by_minute_with_report
 
 SUMMARY_OUT_CLUSTER_REMARK = 'fee pembelian recharge out cluster'
 UNUSUAL_RECHARGE_EXEMPT_REMARK = 'biaya pembelian recharge out cluster'
+PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY = 'PEMBELIAN RECHARGE OUT CLUSTER'
 
 REVERSAL_TRANSACTION = 'REVERSAL'
 REVERSAL_NGRS_CATEGORY = 'Reversal - NGRS'
 REVERSAL_NGRS_FEE_CATEGORY = 'Reversal - NGRS FEE'
+REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY = (
+    'Reversal - PEMBELIAN RECHARGE OUT CLUSTER'
+)
 REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY = 'Reversal - Recharge Out Cluster'
 REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY = 'Reversal - Recharge Out Cluster FEE'
 REVERSAL_ST_CATEGORY = 'Reversal - ST'
@@ -136,6 +140,9 @@ FEE_CAP_RULES = {
 REVERSAL_CATEGORY_TO_MAIN = {
     REVERSAL_NGRS_CATEGORY: REVERSAL_NGRS_CATEGORY,
     REVERSAL_NGRS_FEE_CATEGORY: REVERSAL_NGRS_CATEGORY,
+    REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY: (
+        REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY
+    ),
     REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY: REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_ST_CATEGORY: REVERSAL_ST_CATEGORY,
@@ -149,6 +156,9 @@ REVERSAL_ST_UNSUPPORTED_CATEGORIES = {
 }
 REVERSAL_MAIN_MISSING_REASONS = {
     REVERSAL_NGRS_CATEGORY: f'missing reversal remark: {REVERSAL_NGRS_MAIN_REMARK}',
+    REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY: (
+        f'missing reversal remark: {UNUSUAL_RECHARGE_EXEMPT_REMARK}'
+    ),
     REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: (
         f'missing reversal remark: {REVERSAL_RECHARGE_OUT_CLUSTER_MAIN_REMARK}'
     ),
@@ -188,6 +198,25 @@ def relabel_out_cluster_transactions(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[in_group & (df['Transaction'] == 'RECHARGEFEE'), 'Transaction'] = 'RECHARGE OUT CLUSTER FEE'
     print(f'Out-cluster groups relabeled: {len(out_cluster_base_ids)}')
     return df.drop(columns='_base_id')
+
+
+def relabel_pembelian_recharge_out_cluster_transactions(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Relabel RECHARGE rows whose Remarks contain the separate pembelian
+    out-cluster phrase so they are summarized outside regular NGRS.
+    """
+    result = df.copy()
+    pembelian_mask = (
+        (result['Transaction'] == 'RECHARGE')
+        & _remarks_contain(result['Remarks'], UNUSUAL_RECHARGE_EXEMPT_REMARK)
+    )
+    result.loc[pembelian_mask, 'Transaction'] = (
+        PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY
+    )
+    print(f'Pembelian recharge out-cluster rows relabeled: {int(pembelian_mask.sum())}')
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -440,6 +469,10 @@ def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
     reversal_base_ids = _base_id_from_transaction_id(
         result.loc[reversal_mask, 'Transaction ID']
     )
+    pembelian_recharge_out_cluster_mask = _remarks_contain(
+        remarks,
+        UNUSUAL_RECHARGE_EXEMPT_REMARK,
+    )
     recharge_out_cluster_mask = _remarks_contain(
         remarks,
         REVERSAL_RECHARGE_OUT_CLUSTER_MAIN_REMARK,
@@ -455,9 +488,15 @@ def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
         REVERSAL_NGRS_PLATFORM_FEE_REMARK,
     )
     category_masks = {
-        REVERSAL_NGRS_CATEGORY: _remarks_contain(remarks, REVERSAL_NGRS_MAIN_REMARK),
+        REVERSAL_NGRS_CATEGORY: (
+            _remarks_contain(remarks, REVERSAL_NGRS_MAIN_REMARK)
+            & ~pembelian_recharge_out_cluster_mask
+        ),
         REVERSAL_NGRS_FEE_CATEGORY: (
             recharge_platform_fee_mask & ~in_recharge_out_cluster_group
+        ),
+        REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY: (
+            pembelian_recharge_out_cluster_mask
         ),
         REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: recharge_out_cluster_mask,
         REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY: (
@@ -504,6 +543,7 @@ def preprocess_transaction_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
     result = relabel_reversal_transactions(df)
     result = relabel_out_cluster_transactions(result)
+    result = relabel_pembelian_recharge_out_cluster_transactions(result)
     return result
 
 

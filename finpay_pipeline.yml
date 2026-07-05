@@ -272,7 +272,12 @@ tasks:
       after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
 
       out_cluster_rows = int(
-          df["Transaction"].isin(["RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"]).sum()
+          df["Transaction"].isin([
+              "PEMBELIAN RECHARGE OUT CLUSTER",
+              "Reversal - PEMBELIAN RECHARGE OUT CLUSTER",
+              "RECHARGE OUT CLUSTER",
+              "RECHARGE OUT CLUSTER FEE",
+          ]).sum()
       )
       reversal_rows = int(
           df["Transaction"].astype(str).str.startswith("Reversal - ").sum()
@@ -852,7 +857,12 @@ tasks:
                       df, summary_unusual_df = prepare_reversal_summary_transactions(df)
                       after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
                       out_cluster_rows = int(
-                          df["Transaction"].isin(["RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"]).sum()
+                          df["Transaction"].isin([
+                              "PEMBELIAN RECHARGE OUT CLUSTER",
+                              "Reversal - PEMBELIAN RECHARGE OUT CLUSTER",
+                              "RECHARGE OUT CLUSTER",
+                              "RECHARGE OUT CLUSTER FEE",
+                          ]).sum()
                       )
                       reversal_rows = int(
                           df["Transaction"].astype(str).str.startswith("Reversal - ").sum()

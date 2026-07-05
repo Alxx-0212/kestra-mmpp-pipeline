@@ -5,8 +5,10 @@ import gspread
 import pandas as pd
 
 from .classification import (
+    PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_NGRS_CATEGORY,
     REVERSAL_NGRS_FEE_CATEGORY,
+    REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY,
 )
@@ -38,7 +40,7 @@ def setup_initial_headers_and_saldo(
     widths = {
         0: 110,  # REPORT DATE
         1: 130,  # SECTION
-        2: 320,  # KETERANGAN
+        2: 520,  # KETERANGAN
         3: 140,  # DEBET
         4: 140,  # KREDIT
         5: 140,  # SALDO
@@ -247,6 +249,7 @@ def append_daily_to_gsheet(
         str(row["Transaction"]).strip(): {
             "debet":  float(row.get("Sum_of_Debet",  0) or 0),
             "kredit": float(row.get("Sum_of_Kredit", 0) or 0),
+            "count":  int(row.get("Transaction_Count", 0) or 0),
         }
         for _, row in summary_df.iterrows()
     }
@@ -265,22 +268,73 @@ def append_daily_to_gsheet(
     r = insert_row
     rows_to_append = []
 
+    pembelian_count = val_map.get(
+        PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+        {},
+    ).get("count", 0)
+    reversal_pembelian_count = val_map.get(
+        REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+        {},
+    ).get("count", 0)
+
     detail_rows = [
-        ("TRANSFER MASUK DARI FINPAY", "CASHOUT APOLLO"),
-        ("QRISDUWIT",                  "QRISDUWIT"),
-        ("DISBURSEMENT",               "DISBURSEMENT"),
-        ("PPOB",                       "FeeTransaksi"),
-        ("NGRS",                       "RECHARGE"),
-        ("BIAYA FEE NGRS",             "RECHARGEFEE"),
-        ("RECHARGE OUT CLUSTER",       "RECHARGE OUT CLUSTER"),
-        ("RECHARGE OUT CLUSTER FEE",   "RECHARGE OUT CLUSTER FEE"),
-        ("REVERSAL NGRS",              REVERSAL_NGRS_CATEGORY),
-        ("REVERSAL NGRS FEE",          REVERSAL_NGRS_FEE_CATEGORY),
-        ("REVERSAL RECHARGE OUT CLUSTER", REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY),
-        ("REVERSAL RECHARGE OUT CLUSTER FEE", REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY),
-        ("ST",                         "SELLTHRU"),
-        ("BIAYA FEE ST",               "SELLTHRUFEE"),
-        ("BIAYA FEE BAR A. ST",        "SELLTHRUSALESFEE"),
+        {"label": "TRANSFER MASUK DARI FINPAY", "key": "CASHOUT APOLLO"},
+        {"label": "QRISDUWIT",                  "key": "QRISDUWIT"},
+        {"label": "DISBURSEMENT",               "key": "DISBURSEMENT"},
+        {"label": "PPOB",                       "key": "FeeTransaksi"},
+        {"label": "NGRS",                       "key": "RECHARGE"},
+        {"label": "BIAYA FEE NGRS",             "key": "RECHARGEFEE"},
+        {
+            "label": "Pembelian Recharge Out Cluster",
+            "key": PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+        },
+        {"label": "RECHARGE OUT CLUSTER",       "key": "RECHARGE OUT CLUSTER"},
+        {"label": "RECHARGE OUT CLUSTER FEE",   "key": "RECHARGE OUT CLUSTER FEE"},
+        {"label": "REVERSAL NGRS",              "key": REVERSAL_NGRS_CATEGORY},
+        {"label": "REVERSAL NGRS FEE",          "key": REVERSAL_NGRS_FEE_CATEGORY},
+        {
+            "label": "Reversal - PEMBELIAN RECHARGE OUT CLUSTER",
+            "key": REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+        },
+        {
+            "label": "REVERSAL RECHARGE OUT CLUSTER",
+            "key": REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
+        },
+        {
+            "label": "REVERSAL RECHARGE OUT CLUSTER FEE",
+            "key": REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY,
+        },
+        {"label": "ST",                         "key": "SELLTHRU"},
+        {"label": "BIAYA FEE ST",               "key": "SELLTHRUFEE"},
+        {"label": "BIAYA FEE BAR A. ST",        "key": "SELLTHRUSALESFEE"},
+        {
+            "label": "Jumlah Pembelian Recharge Out Cluster",
+            "debet": pembelian_count,
+            "kredit": "",
+            "balance": "empty",
+        },
+        {
+            "label": "Expected Biaya Pembelian Recharge Out Cluster FEE",
+            "debet": "",
+            "kredit": lambda row_by_label: (
+                f"=D{row_by_label['Jumlah Pembelian Recharge Out Cluster']}*200"
+            ),
+            "balance": "empty",
+        },
+        {
+            "label": "Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER",
+            "debet": reversal_pembelian_count,
+            "kredit": "",
+            "balance": "empty",
+        },
+        {
+            "label": "Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE",
+            "debet": lambda row_by_label: (
+                f"=D{row_by_label['Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER']}*200"
+            ),
+            "kredit": "",
+            "balance": "empty",
+        },
     ]
 
     def _summary_row(
@@ -294,10 +348,33 @@ def append_daily_to_gsheet(
 
     detail_start = r
     first = True
-    for label, key in detail_rows:
-        d = val_map.get(key, {})
-        debet  = float(d.get("debet",  0))
-        kredit = float(d.get("kredit", 0))
+    detail_row_by_key = {}
+    detail_row_by_label = {
+        row["label"] if isinstance(row, dict) else row[0]: insert_row + idx
+        for idx, row in enumerate(detail_rows)
+    }
+
+    def _resolve_detail_cell(value):
+        return value(detail_row_by_label) if callable(value) else value
+
+    for row in detail_rows:
+        if isinstance(row, dict):
+            label = str(row["label"])
+            key = row.get("key")
+            if key is not None:
+                detail_row_by_key[str(key)] = r
+                d = val_map.get(str(key), {})
+                debet = float(d.get("debet", 0))
+                kredit = float(d.get("kredit", 0))
+                debet_cell = kredit
+                kredit_cell = debet
+            else:
+                debet_cell = _resolve_detail_cell(row.get("debet", ""))
+                kredit_cell = _resolve_detail_cell(row.get("kredit", ""))
+        else:
+            label, debet_cell, kredit_cell = row
+            debet_cell = _resolve_detail_cell(debet_cell)
+            kredit_cell = _resolve_detail_cell(kredit_cell)
         if first:
             prev_new = f"F$1:F{r - 1}"
             prev_wide = f"G$1:G{r - 1}"
@@ -309,49 +386,96 @@ def append_daily_to_gsheet(
                 f"+D{r}-E{r}"
             )
             first = False
+        elif isinstance(row, dict) and row.get("balance") == "empty":
+            saldo_formula = ""
         else:
             saldo_formula = f"=F{r - 1}+D{r}-E{r}"
-        rows_to_append.append(_summary_row("DETAIL", label, kredit, debet, saldo_formula))
+        rows_to_append.append(
+            _summary_row("DETAIL", label, debet_cell, kredit_cell, saldo_formula)
+        )
         r += 1
     detail_end = r - 1
-
-    # Row offsets from insert_row (matches detail_rows order):
-    #  +1 QRISDUWIT  +2 DISBURSEMENT  +3 FeeTransaksi
-    #  +4 RECHARGE   +5 RECHARGEFEE   +6 RECHARGE OUT CLUSTER
-    #  +7 RECHARGE OUT CLUSTER FEE    +8 Reversal NGRS
-    #  +9 Reversal NGRS FEE  +10 Reversal Recharge Out Cluster
-    #  +11 Reversal Recharge Out Cluster FEE
-    #  +12 SELLTHRU  +13 SELLTHRUFEE  +14 SELLTHRUSALESFEE
-    ir = insert_row
 
     def _split_net_formula(net_formula: str) -> tuple[str, str]:
         expression = net_formula[1:] if net_formula.startswith("=") else net_formula
         return f"=MAX(({expression}),0)", f"=MAX(-({expression}),0)"
 
+    def _detail_net_formula(key: str) -> str:
+        row = detail_row_by_key[key]
+        return f"=D{row}-E{row}"
+
+    def _detail_label_net_formula(label: str) -> str:
+        row = detail_row_by_label[label]
+        return f"=D{row}-E{row}"
+
     cash_report_rows = [
-        ("NGRS", *_split_net_formula(f"=D{ir+4}-E{ir+4}")),
-        ("Recharge Fee", *_split_net_formula(f"=D{ir+5}-E{ir+5}")),
-        ("Reversal - NGRS", *_split_net_formula(f"=D{ir+8}-E{ir+8}")),
-        ("Reversal - NGRS FEE", *_split_net_formula(f"=D{ir+9}-E{ir+9}")),
-        ("QRISDUWIT", *_split_net_formula(f"=D{ir+1}-E{ir+1}")),
+        ("NGRS", *_split_net_formula(_detail_net_formula("RECHARGE"))),
+        ("Recharge Fee", *_split_net_formula(_detail_net_formula("RECHARGEFEE"))),
+        (
+            "Pembelian Recharge Out Cluster",
+            *_split_net_formula(
+                _detail_net_formula(PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY)
+            ),
+        ),
+        (
+            "Expected Biaya Pembelian Recharge Out Cluster FEE",
+            *_split_net_formula(
+                _detail_label_net_formula(
+                    "Expected Biaya Pembelian Recharge Out Cluster FEE"
+                )
+            ),
+        ),
+        ("Reversal - NGRS", *_split_net_formula(_detail_net_formula(REVERSAL_NGRS_CATEGORY))),
+        (
+            "Reversal - NGRS FEE",
+            *_split_net_formula(_detail_net_formula(REVERSAL_NGRS_FEE_CATEGORY)),
+        ),
+        (
+            "Reversal - PEMBELIAN RECHARGE OUT CLUSTER",
+            *_split_net_formula(
+                _detail_net_formula(REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY)
+            ),
+        ),
+        (
+            "Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE",
+            *_split_net_formula(
+                _detail_label_net_formula(
+                    "Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE"
+                )
+            ),
+        ),
+        ("QRISDUWIT", *_split_net_formula(_detail_net_formula("QRISDUWIT"))),
     ]
 
     accounting_report_rows = [
-        ("PPOB", *_split_net_formula(f"=D{ir+3}-E{ir+3}")),
-        ("DISBURSEMENT", *_split_net_formula(f"=D{ir+2}-E{ir+2}")),
-        ("Recharge Out Cluster", *_split_net_formula(f"=D{ir+6}-E{ir+6}")),
-        ("Recharge Out Cluster FEE", *_split_net_formula(f"=D{ir+7}-E{ir+7}")),
+        ("PPOB", *_split_net_formula(_detail_net_formula("FeeTransaksi"))),
+        ("DISBURSEMENT", *_split_net_formula(_detail_net_formula("DISBURSEMENT"))),
+        (
+            "Recharge Out Cluster",
+            *_split_net_formula(_detail_net_formula("RECHARGE OUT CLUSTER")),
+        ),
+        (
+            "Recharge Out Cluster FEE",
+            *_split_net_formula(_detail_net_formula("RECHARGE OUT CLUSTER FEE")),
+        ),
         (
             "Reversal - Recharge Out Cluster",
-            *_split_net_formula(f"=D{ir+10}-E{ir+10}"),
+            *_split_net_formula(
+                _detail_net_formula(REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY)
+            ),
         ),
         (
             "Reversal - Recharge Out Cluster FEE",
-            *_split_net_formula(f"=D{ir+11}-E{ir+11}"),
+            *_split_net_formula(
+                _detail_net_formula(REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY)
+            ),
         ),
-        ("ST", *_split_net_formula(f"=D{ir+12}-E{ir+12}")),
-        ("BIAYA FEE ST", *_split_net_formula(f"=D{ir+13}-E{ir+13}")),
-        ("BIAYA FEE BAR A. ST", *_split_net_formula(f"=D{ir+14}-E{ir+14}")),
+        ("ST", *_split_net_formula(_detail_net_formula("SELLTHRU"))),
+        ("BIAYA FEE ST", *_split_net_formula(_detail_net_formula("SELLTHRUFEE"))),
+        (
+            "BIAYA FEE BAR A. ST",
+            *_split_net_formula(_detail_net_formula("SELLTHRUSALESFEE")),
+        ),
     ]
 
     def _append_summary_section(
@@ -380,21 +504,39 @@ def append_daily_to_gsheet(
     footer_start = r
     footer_formulas = [
         # NGRS = net(RECHARGE - RECHARGEFEE)
-        f"=D{ir+4}-E{ir+4}+D{ir+5}-E{ir+5}",
+        (
+            _detail_net_formula("RECHARGE")
+            + _detail_net_formula("RECHARGEFEE").replace("=", "+")
+        ),
         # Recharge Out Cluster = net(RECHARGE OUT CLUSTER - RECHARGE OUT CLUSTER FEE)
-        f"=D{ir+6}-E{ir+6}+D{ir+7}-E{ir+7}",
+        (
+            _detail_net_formula("RECHARGE OUT CLUSTER")
+            + _detail_net_formula("RECHARGE OUT CLUSTER FEE").replace("=", "+")
+        ),
         # Reversal - NGRS = net(Reversal NGRS - Reversal NGRS fee)
-        f"=(D{ir+8}-E{ir+8})+(D{ir+9}-E{ir+9})",
+        (
+            _detail_net_formula(REVERSAL_NGRS_CATEGORY)
+            + _detail_net_formula(REVERSAL_NGRS_FEE_CATEGORY).replace("=", "+")
+        ),
         # Reversal - Recharge Out Cluster = net(out-cluster reversal - fee)
-        f"=(D{ir+10}-E{ir+10})+(D{ir+11}-E{ir+11})",
+        (
+            _detail_net_formula(REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY)
+            + _detail_net_formula(
+                REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY
+            ).replace("=", "+")
+        ),
         # PPOB  = net(FeeTransaksi)
-        f"=D{ir+3}-E{ir+3}",
+        _detail_net_formula("FeeTransaksi"),
         # ST = net(SELLTHRU family only)
-        f"=D{ir+12}-E{ir+12}+D{ir+13}-E{ir+13}+D{ir+14}-E{ir+14}",
+        (
+            _detail_net_formula("SELLTHRU")
+            + _detail_net_formula("SELLTHRUFEE").replace("=", "+")
+            + _detail_net_formula("SELLTHRUSALESFEE").replace("=", "+")
+        ),
         # DISBURSEMENT
-        f"=D{ir+2}-E{ir+2}",
+        _detail_net_formula("DISBURSEMENT"),
         # QRISDUWIT
-        f"=D{ir+1}-E{ir+1}",
+        _detail_net_formula("QRISDUWIT"),
     ]
     footer_rows = [
         "NGRS",
@@ -571,7 +713,7 @@ def append_daily_to_gsheet(
     summary_widths = {
         0: 110,
         1: 130,
-        2: 320,
+        2: 520,
         3: 140,
         4: 140,
         5: 140,
