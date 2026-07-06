@@ -1,4 +1,4 @@
-`id: finpay_daily_pipeline_v5
+id: finpay_daily_pipeline_v5
 namespace: finance.finpay
 
 # ── MANUAL RUN WITH FILE UPLOAD ─────────────────────────────────────────────────
@@ -118,7 +118,7 @@ tasks:
       print(f"💰 Balance dt : {starting_balance_date}")
       Kestra.outputs(outputs)
 
-  # ── TASK 2 ─ Determine run date + monthly summary worksheet ─────────────────
+  # ── TASK 2 ─ Determine run date + stable summary worksheet ──────────────────
   - id: determine_current_date
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-pipeline:3.11
@@ -126,34 +126,28 @@ tasks:
     timeout: PT1M
     env:
       BASE_WORKSHEET: "{{ outputs.parse_and_resolve.vars.target_worksheet }}"
-      REPORT_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
       RUN_TIMEZONE: "Asia/Makassar"
     script: |
       import os
-      from datetime import datetime, date
+      from datetime import datetime
       from zoneinfo import ZoneInfo
       from kestra import Kestra
 
       timezone = os.environ["RUN_TIMEZONE"]
       base_worksheet = os.environ["BASE_WORKSHEET"]
-      report_date = date.fromisoformat(os.environ["REPORT_DATE"])
-      report_month = report_date.strftime("%Y-%m")
       now = datetime.now(ZoneInfo(timezone))
-      summary_worksheet = f"{base_worksheet} - {report_month}"
+      summary_worksheet = base_worksheet
 
       outputs = {
           "run_date": now.date().isoformat(),
           "run_timestamp": now.isoformat(),
           "run_year": now.strftime("%Y"),
           "run_month": now.strftime("%m"),
-          "report_month": report_month,
-          "summary_base_worksheet": base_worksheet,
           "timezone": timezone,
           "summary_worksheet": summary_worksheet,
       }
 
       print(f"🕒 Run date          : {outputs['run_date']} ({timezone})")
-      print(f"📅 Report month      : {report_month}")
       print(f"📊 Summary worksheet : {summary_worksheet}")
       Kestra.outputs(outputs)
 
@@ -1008,9 +1002,6 @@ tasks:
                     env:
                       TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
                       TARGET_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_worksheet }}"
-                      SUMMARY_BASE_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_base_worksheet }}"
-                      SUMMARY_MONTH: "{{ outputs.determine_current_date.vars.report_month }}"
-                      AUTO_HIDE_OLD_MONTHLY_SUMMARY_SHEETS: "true"
                       STARTING_BALANCE_DATE: "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
                       DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
                       FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
@@ -1046,14 +1037,6 @@ tasks:
                               starting_balance_date=os.environ["STARTING_BALANCE_DATE"],
                               default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
                               gspread_client=client,
-                              summary_base_worksheet=os.environ["SUMMARY_BASE_WORKSHEET"],
-                              summary_month=os.environ["SUMMARY_MONTH"],
-                              auto_hide_old_monthly_sheets=(
-                                  os.environ.get("AUTO_HIDE_OLD_MONTHLY_SUMMARY_SHEETS", "")
-                                  .strip()
-                                  .lower()
-                                  in {"1", "true", "yes", "y"}
-                              ),
                           )
 
                           print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
@@ -1090,4 +1073,3 @@ errors:
       print(f"   Flow      : {namespace}.{flow_id}")
       print(f"   Execution : {execution_id}")
       print(f"   Logs      : /ui/executions/{execution_id}")
-`

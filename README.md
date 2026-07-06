@@ -20,7 +20,7 @@ Upload CSV/XLS/XLSX
       v
 [2] determine_current_date
       - compute current run date
-      - choose the report-month summary worksheet, e.g. PKY - 2026-06
+      - choose the stable cluster summary worksheet, e.g. PKY
       |
       v
 [3] load_and_validate
@@ -241,8 +241,7 @@ PY
 ## Design Notes
 
 - Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `finpay_pipeline/`.
-- The summary worksheet is split by report month using `<base worksheet> - YYYY-MM`.
-- Monthly summary uploads auto-hide older monthly summary tabs for the same cluster prefix.
+- The summary worksheet is stable per cluster and continues across month boundaries.
 - The starting balance date is the last day of the previous month, computed at runtime.
 - Deduplication compares all columns except `No`, and normalizes `Transaction Date` to minute precision for duplicate detection.
 - Transaction relabeling runs before unusual detection, calculation deduplication, detail exports, and summary aggregation.

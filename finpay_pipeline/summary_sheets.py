@@ -1,5 +1,5 @@
 """Google Sheets writer for the daily summary worksheet."""
-from datetime import date, datetime
+from datetime import datetime
 
 import gspread
 import pandas as pd
@@ -24,87 +24,6 @@ from .sheets_common import (
     open_or_create_finpay_spreadsheet,
     uppercase_sheet_rows,
 )
-
-
-def _month_start(month_text: str) -> date:
-    return datetime.strptime(month_text, "%Y-%m").date().replace(day=1)
-
-
-def _monthly_summary_parts(title: str) -> tuple[str, str] | None:
-    base, separator, month_text = title.rpartition(" - ")
-    if not separator or not base:
-        return None
-    try:
-        _month_start(month_text)
-    except ValueError:
-        return None
-    return base, month_text
-
-
-def _sync_monthly_summary_visibility(
-    sh,
-    base_worksheet: str,
-    current_month: str,
-) -> None:
-    """
-    Hide older monthly summary worksheets for one cluster.
-
-    Only worksheets named '<base_worksheet> - YYYY-MM' are touched, so the
-    legacy base worksheet and detail/unusual/reversal worksheets remain visible.
-    """
-    current_month_start = _month_start(current_month)
-    metadata = sh.fetch_sheet_metadata({
-        "fields": "sheets(properties(sheetId,title,hidden))",
-    })
-
-    hide_requests = []
-    unhide_requests = []
-    hidden_count = 0
-    unhidden_count = 0
-    for sheet in metadata.get("sheets", []):
-        properties = sheet.get("properties", {})
-        title = str(properties.get("title", ""))
-        parts = _monthly_summary_parts(title)
-        if not parts:
-            continue
-
-        sheet_base, sheet_month = parts
-        if sheet_base != base_worksheet:
-            continue
-
-        desired_hidden = _month_start(sheet_month) < current_month_start
-        current_hidden = bool(properties.get("hidden", False))
-        if current_hidden == desired_hidden:
-            continue
-
-        request = {
-            "updateSheetProperties": {
-                "properties": {
-                    "sheetId": properties["sheetId"],
-                    "hidden": desired_hidden,
-                },
-                "fields": "hidden",
-            }
-        }
-        if desired_hidden:
-            hidden_count += 1
-            hide_requests.append(request)
-        else:
-            unhidden_count += 1
-            unhide_requests.append(request)
-
-    requests = [*unhide_requests, *hide_requests]
-    if not requests:
-        return
-
-    try:
-        sh.batch_update({"requests": requests})
-        print(
-            "Monthly summary visibility synced: "
-            f"{hidden_count} hidden, {unhidden_count} unhidden."
-        )
-    except Exception as exc:
-        print(f"Warning: could not hide old monthly summary worksheets: {exc}")
 
 
 def setup_initial_headers_and_saldo(
@@ -907,9 +826,6 @@ def process_daily_upload(
     starting_balance_date: str,
     default_starting_balance: int,
     gspread_client,
-    summary_base_worksheet: str | None = None,
-    summary_month: str | None = None,
-    auto_hide_old_monthly_sheets: bool = False,
 ) -> tuple[int | None, int | None]:
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
 
@@ -925,26 +841,6 @@ def process_daily_upload(
             starting_balance=default_starting_balance,
         )
 
-    result = append_daily_to_gsheet(
+    return append_daily_to_gsheet(
         gspread_client, target_spreadsheet, target_worksheet, summary_df
     )
-
-    if auto_hide_old_monthly_sheets:
-        if not summary_base_worksheet or not summary_month:
-            parts = _monthly_summary_parts(target_worksheet)
-            if parts:
-                summary_base_worksheet, summary_month = parts
-
-        if summary_base_worksheet and summary_month:
-            _sync_monthly_summary_visibility(
-                sh,
-                summary_base_worksheet,
-                summary_month,
-            )
-        else:
-            print(
-                "Warning: old monthly summary worksheets were not hidden "
-                f"because '{target_worksheet}' is not a monthly summary title."
-            )
-
-    return result

@@ -64,7 +64,7 @@ services:
         condition: service_healthy
 
   kestra:
-    image: kestra/kestra@sha256:956f128e7ed6665feb56eb007f4939514c5b25ed0500c74d405f11be1a6ac090
+    image: kestra/kestra:v1.3.26
     networks:
       - finpay-network
     stop_grace_period: 6m
