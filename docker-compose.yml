@@ -15,7 +15,7 @@ networks:
 
 services:
   postgres:
-    image: postgres:latest
+    image: postgres:18.4
     networks:
       - finpay-network
     volumes:
@@ -31,7 +31,7 @@ services:
       retries: 10
 
   finpay-postgres:
-    image: postgres:latest
+    image: postgres:18.4
     networks:
       - finpay-network
     volumes:
@@ -49,7 +49,7 @@ services:
       retries: 10
 
   finpay-pgadmin:
-    image: dpage/pgadmin4:latest
+    image: dpage/pgadmin4:9.16
     networks:
       - finpay-network
     environment:
@@ -64,10 +64,9 @@ services:
         condition: service_healthy
 
   kestra:
-    image: kestra/kestra:latest
+    image: kestra/kestra@sha256:956f128e7ed6665feb56eb007f4939514c5b25ed0500c74d405f11be1a6ac090
     networks:
       - finpay-network
-    pull_policy: always
     stop_grace_period: 6m
     user: "root"
     command: server standalone

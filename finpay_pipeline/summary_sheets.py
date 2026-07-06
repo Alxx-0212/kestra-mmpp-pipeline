@@ -1,5 +1,5 @@
 """Google Sheets writer for the daily summary worksheet."""
-from datetime import datetime
+from datetime import date, datetime
 
 import gspread
 import pandas as pd
@@ -22,7 +22,90 @@ from .sheets_common import (
     _mandiri_editor_emails,
     ensure_row_capacity,
     open_or_create_finpay_spreadsheet,
+    uppercase_sheet_rows,
 )
+
+
+def _month_start(month_text: str) -> date:
+    return datetime.strptime(month_text, "%Y-%m").date().replace(day=1)
+
+
+def _monthly_summary_parts(title: str) -> tuple[str, str] | None:
+    base, separator, month_text = title.rpartition(" - ")
+    if not separator or not base:
+        return None
+    try:
+        _month_start(month_text)
+    except ValueError:
+        return None
+    return base, month_text
+
+
+def _sync_monthly_summary_visibility(
+    sh,
+    base_worksheet: str,
+    current_month: str,
+) -> None:
+    """
+    Hide older monthly summary worksheets for one cluster.
+
+    Only worksheets named '<base_worksheet> - YYYY-MM' are touched, so the
+    legacy base worksheet and detail/unusual/reversal worksheets remain visible.
+    """
+    current_month_start = _month_start(current_month)
+    metadata = sh.fetch_sheet_metadata({
+        "fields": "sheets(properties(sheetId,title,hidden))",
+    })
+
+    hide_requests = []
+    unhide_requests = []
+    hidden_count = 0
+    unhidden_count = 0
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        title = str(properties.get("title", ""))
+        parts = _monthly_summary_parts(title)
+        if not parts:
+            continue
+
+        sheet_base, sheet_month = parts
+        if sheet_base != base_worksheet:
+            continue
+
+        desired_hidden = _month_start(sheet_month) < current_month_start
+        current_hidden = bool(properties.get("hidden", False))
+        if current_hidden == desired_hidden:
+            continue
+
+        request = {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": properties["sheetId"],
+                    "hidden": desired_hidden,
+                },
+                "fields": "hidden",
+            }
+        }
+        if desired_hidden:
+            hidden_count += 1
+            hide_requests.append(request)
+        else:
+            unhidden_count += 1
+            unhide_requests.append(request)
+
+    requests = [*unhide_requests, *hide_requests]
+    if not requests:
+        return
+
+    try:
+        sh.batch_update({"requests": requests})
+        print(
+            "Monthly summary visibility synced: "
+            f"{hidden_count} hidden, {unhidden_count} unhidden."
+        )
+    except Exception as exc:
+        print(f"Warning: could not hide old monthly summary worksheets: {exc}")
+
 
 def setup_initial_headers_and_saldo(
     gspread_client,
@@ -42,7 +125,7 @@ def setup_initial_headers_and_saldo(
         1: 130,  # SECTION
         2: 520,  # KETERANGAN
         3: 140,  # DEBET
-        4: 140,  # KREDIT
+        4: 190,  # KREDIT
         5: 140,  # SALDO
     }
     sh.batch_update({"requests": [
@@ -78,10 +161,10 @@ def setup_initial_headers_and_saldo(
     ]})
 
     date_display = pd.to_datetime(starting_date_str).strftime("%d/%m/%Y")
-    ws.update("A1:F2", [
+    ws.update("A1:F2", uppercase_sheet_rows([
         ["REPORT DATE", "SECTION", "KETERANGAN", "DEBET", "KREDIT", "SALDO"],
         [date_display, "", f"SALDO {date_display}", "", "", starting_balance],
-    ], value_input_option="USER_ENTERED")
+    ]), value_input_option="USER_ENTERED")
 
     ws.format("A1:F1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
     ws.format("F2", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}})
@@ -262,7 +345,7 @@ def append_daily_to_gsheet(
         "KREDIT",
         "SALDO",
     ]
-    ws.update("A1:F1", [summary_headers], value_input_option="USER_ENTERED")
+    ws.update("A1:F1", uppercase_sheet_rows([summary_headers]), value_input_option="USER_ENTERED")
 
     insert_row = replacement_start or len(existing_values) + 1
     r = insert_row
@@ -324,14 +407,6 @@ def append_daily_to_gsheet(
         {
             "label": "Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER",
             "debet": reversal_pembelian_count,
-            "kredit": "",
-            "balance": "empty",
-        },
-        {
-            "label": "Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE",
-            "debet": lambda row_by_label: (
-                f"=D{row_by_label['Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER']}*200"
-            ),
             "kredit": "",
             "balance": "empty",
         },
@@ -436,14 +511,6 @@ def append_daily_to_gsheet(
                 _detail_net_formula(REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY)
             ),
         ),
-        (
-            "Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE",
-            *_split_net_formula(
-                _detail_label_net_formula(
-                    "Expected Biaya Reversal - PEMBELIAN RECHARGE OUT CLUSTER FEE"
-                )
-            ),
-        ),
         ("QRISDUWIT", *_split_net_formula(_detail_net_formula("QRISDUWIT"))),
     ]
 
@@ -503,10 +570,13 @@ def append_daily_to_gsheet(
 
     footer_start = r
     footer_formulas = [
-        # NGRS = net(RECHARGE - RECHARGEFEE)
+        # NGRS = net(RECHARGE - RECHARGEFEE + pembelian recharge out-cluster)
         (
             _detail_net_formula("RECHARGE")
             + _detail_net_formula("RECHARGEFEE").replace("=", "+")
+            + _detail_net_formula(
+                PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY
+            ).replace("=", "+")
         ),
         # Recharge Out Cluster = net(RECHARGE OUT CLUSTER - RECHARGE OUT CLUSTER FEE)
         (
@@ -518,6 +588,8 @@ def append_daily_to_gsheet(
             _detail_net_formula(REVERSAL_NGRS_CATEGORY)
             + _detail_net_formula(REVERSAL_NGRS_FEE_CATEGORY).replace("=", "+")
         ),
+        # Reversal - Pembelian Recharge Out Cluster
+        _detail_net_formula(REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY),
         # Reversal - Recharge Out Cluster = net(out-cluster reversal - fee)
         (
             _detail_net_formula(REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY)
@@ -542,6 +614,7 @@ def append_daily_to_gsheet(
         "NGRS",
         "Recharge Out Cluster",
         "Reversal - NGRS",
+        "Reversal - Pembelian Recharge Out Cluster",
         "Reversal - Recharge Out Cluster",
         "PPOB",
         "ST",
@@ -624,11 +697,11 @@ def append_daily_to_gsheet(
         f'"",D{mandiri_row}-D{running_total_row})'
     )
     selisih_status_formula = (
-        f'=IF(OR(D{mandiri_row}="",D{mandiri_row}=0),"pending transfer",'
-        f'IF(D{selisih_row}=0,"sesuai",'
+        f'=IF(OR(D{mandiri_row}="",D{mandiri_row}=0),"PENDING TRANSFER",'
+        f'IF(D{selisih_row}=0,"SESUAI",'
         f'IF(D{selisih_row}>0,'
-        f'"lebih bayar",'
-        f'"kurang bayar")))'
+        f'"LEBIH BAYAR",'
+        f'"KURANG BAYAR")))'
     )
     rows_to_append.append(
         _summary_row("Cash", "SELISIH", selisih_formula, selisih_status_formula)
@@ -642,7 +715,7 @@ def append_daily_to_gsheet(
         ensure_row_capacity(sh, ws, required_rows, label="summary worksheet")
     ws.update(
         _range(insert_row, insert_row + len(rows_to_append) - 1),
-        rows_to_append,
+        uppercase_sheet_rows(rows_to_append),
         value_input_option="USER_ENTERED",
     )
 
@@ -715,7 +788,7 @@ def append_daily_to_gsheet(
         1: 130,
         2: 520,
         3: 140,
-        4: 140,
+        4: 190,
         5: 140,
     }
     existing_mandiri_cells = _existing_mandiri_cells(existing_values)
@@ -834,6 +907,9 @@ def process_daily_upload(
     starting_balance_date: str,
     default_starting_balance: int,
     gspread_client,
+    summary_base_worksheet: str | None = None,
+    summary_month: str | None = None,
+    auto_hide_old_monthly_sheets: bool = False,
 ) -> tuple[int | None, int | None]:
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
 
@@ -849,6 +925,26 @@ def process_daily_upload(
             starting_balance=default_starting_balance,
         )
 
-    return append_daily_to_gsheet(
+    result = append_daily_to_gsheet(
         gspread_client, target_spreadsheet, target_worksheet, summary_df
     )
+
+    if auto_hide_old_monthly_sheets:
+        if not summary_base_worksheet or not summary_month:
+            parts = _monthly_summary_parts(target_worksheet)
+            if parts:
+                summary_base_worksheet, summary_month = parts
+
+        if summary_base_worksheet and summary_month:
+            _sync_monthly_summary_visibility(
+                sh,
+                summary_base_worksheet,
+                summary_month,
+            )
+        else:
+            print(
+                "Warning: old monthly summary worksheets were not hidden "
+                f"because '{target_worksheet}' is not a monthly summary title."
+            )
+
+    return result

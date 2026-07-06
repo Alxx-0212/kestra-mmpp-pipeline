@@ -18,6 +18,7 @@ from .sheets_common import (
     _insert_blank_sheet_rows,
     _matching_report_date_rows,
     ensure_row_capacity,
+    uppercase_sheet_rows,
 )
 
 def extract_disbursement_date_from_remarks(remarks) -> str:
@@ -277,7 +278,11 @@ def append_transaction_detail_to_gsheet(
         _insert_blank_sheet_rows(sh, ws, replacement_start, len(rows_to_append))
     else:
         ensure_row_capacity(sh, ws, write_end, buffer_rows=500, label=target_worksheet)
-    ws.update(_range(insert_row, write_end), rows_to_append, value_input_option="USER_ENTERED")
+    ws.update(
+        _range(insert_row, write_end),
+        uppercase_sheet_rows(rows_to_append),
+        value_input_option="USER_ENTERED",
+    )
 
     header_row = data_start - 1 if needs_header else 1
     data_end = data_start + len(detail_df) - 1

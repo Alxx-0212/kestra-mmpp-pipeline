@@ -9,6 +9,25 @@ DEFAULT_ROW_BUFFER = 200
 DEFAULT_BORDER_COLOR = {"red": 0.850, "green": 0.870, "blue": 0.890}
 
 
+def uppercase_sheet_value(value):
+    """Uppercase literal text before writing it to Google Sheets."""
+    if not isinstance(value, str):
+        return value
+    if value.startswith("="):
+        return value
+    if value.startswith("'"):
+        return "'" + value[1:].upper()
+    return value.upper()
+
+
+def uppercase_sheet_rows(rows: list[list]) -> list[list]:
+    """Uppercase literal text cells while preserving formulas and numbers."""
+    return [
+        [uppercase_sheet_value(value) for value in row]
+        for row in rows
+    ]
+
+
 def make_gspread_client(sa_key_path: str):
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",

@@ -127,6 +127,11 @@ FINPAY_DB_SOURCE_COLUMN_MAP = {
     "unusual_reason": "unusual_reason",
 }
 
+FINPAY_DB_LABEL_COLUMNS = {
+    "raw_transaction_label",
+    "processed_transaction_label",
+}
+
 
 def postgres_dsn_from_env(prefix: str = "FINPAY_DB_") -> str:
     host = os.environ.get(f"{prefix}HOST", "localhost")
@@ -323,6 +328,8 @@ def _db_value(value, column: str):
         return None if pd.isna(parsed) else parsed.date()
     if column in {"saldo_awal", "kredit", "debet", "saldo_akhir"}:
         return float(value)
+    if column in FINPAY_DB_LABEL_COLUMNS:
+        return str(value).lower()
     return str(value)
 
 
@@ -423,4 +430,3 @@ def write_finpay_dataframe_to_postgres(
         conn.commit()
 
     return len(rows)
-
