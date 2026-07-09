@@ -435,7 +435,7 @@ tasks:
               unusual_df = pd.read_parquet("unusual.parquet")
               client     = make_gspread_client(sa_key_path)
 
-              written = process_unusual_upload(
+              process_unusual_upload(
                   target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
                   target_worksheet=os.environ["TARGET_WORKSHEET"],
                   unusual_df=unusual_df,
@@ -657,7 +657,7 @@ tasks:
                           qrisduwit_df = pd.read_parquet("qrisduwit.parquet")
                           client = make_gspread_client(sa_key_path)
 
-                          written = process_transaction_detail_upload(
+                          process_transaction_detail_upload(
                               target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
                               target_worksheet=os.environ["TARGET_WORKSHEET"],
                               detail_df=qrisduwit_df,
@@ -808,7 +808,7 @@ tasks:
                           reversal_df = pd.read_parquet("reversal.parquet")
                           client = make_gspread_client(sa_key_path)
 
-                          written = process_transaction_detail_upload(
+                          process_transaction_detail_upload(
                               target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
                               target_worksheet=os.environ["TARGET_WORKSHEET"],
                               detail_df=reversal_df,
@@ -1030,7 +1030,7 @@ tasks:
                           summary_df = pd.read_parquet("summary.parquet")
                           client     = make_gspread_client(sa_key_path)
 
-                          insert_row, footer_end = process_daily_upload(
+                          insert_row, block_end = process_daily_upload(
                               target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
                               target_worksheet=os.environ["TARGET_WORKSHEET"],
                               summary_df=summary_df,
@@ -1039,12 +1039,12 @@ tasks:
                               gspread_client=client,
                           )
 
-                          print(f"✅ Written to sheet rows {insert_row}–{footer_end}.")
+                          print(f"✅ Written to sheet rows {insert_row}–{block_end}.")
                           Kestra.outputs({
                               "status": "success",
                               "worksheet": os.environ["TARGET_WORKSHEET"],
                               "insert_row": insert_row,
-                              "footer_end": footer_end,
+                              "block_end": block_end,
                           })
                       finally:
                           if sa_key_path and os.path.exists(sa_key_path):

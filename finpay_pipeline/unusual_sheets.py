@@ -4,12 +4,21 @@ import pandas as pd
 
 from .sheets_common import (
     _add_protected_sheet_request,
+    _clear_background_color_request,
+    _delete_all_banded_range_requests,
     _delete_all_protected_range_requests,
     _delete_sheet_rows,
     _horizontal_border_requests,
     _insert_blank_sheet_rows,
     _matching_report_date_rows,
+    _row_banding_request,
+    clean_sheet_value,
+    datetime_sheet_display,
     ensure_row_capacity,
+    number_sheet_value,
+    open_or_create_finpay_spreadsheet,
+    report_date_display,
+    sheet_range,
     uppercase_sheet_rows,
 )
 
@@ -27,43 +36,8 @@ def append_unusual_to_gsheet(
     - Replaces existing rows for the same report date on reruns.
     Returns True on success/no rows.
     """
-    def _a1(row, col):
-        col_letter = ""
-        while col:
-            col, rem = divmod(col - 1, 26)
-            col_letter = chr(65 + rem) + col_letter
-        return f"{col_letter}{row}"
-
     def _range(sr, er, sc=1, ec=None):
-        ec = ec or len(HEADERS)
-        return f"{_a1(sr, sc)}:{_a1(er, ec)}"
-
-    def _clean(value):
-        if value is None or (not isinstance(value, str) and pd.isna(value)):
-            return ''
-        return value
-
-    def _number(value):
-        value = _clean(value)
-        if value == '':
-            return ''
-        return int(value)
-
-    def _datetime_display(value):
-        value = _clean(value)
-        if value == '':
-            return ''
-        return pd.to_datetime(value).strftime('%d/%m/%Y %H:%M:%S')
-
-    def _report_date_display() -> str:
-        if not unusual_df.empty:
-            return pd.to_datetime(unusual_df['Transaction Date']).dt.strftime('%d/%m/%Y').max()
-        if report_date:
-            parsed = pd.to_datetime(report_date, format='%Y-%m-%d', errors='coerce')
-            if pd.isna(parsed):
-                parsed = pd.to_datetime(report_date, dayfirst=True)
-            return parsed.strftime('%d/%m/%Y')
-        return ''
+        return sheet_range(sr, er, sc, ec or len(HEADERS))
 
     HEADERS = [
         'REPORT DATE',
@@ -86,7 +60,7 @@ def append_unusual_to_gsheet(
     COL        = {"red": 0.741, "green": 0.843, "blue": 0.933}
     IDR        = {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}
 
-    sh = gspread_client.open(target_spreadsheet)
+    sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     try:
         ws = sh.worksheet(target_worksheet)
     except gspread.WorksheetNotFound:
@@ -95,7 +69,7 @@ def append_unusual_to_gsheet(
             return True
         ws = sh.add_worksheet(title=target_worksheet, rows=5000, cols=20)
 
-    report_date_text = _report_date_display()
+    report_date_text = report_date_display(unusual_df, report_date)
     if unusual_df.empty and not report_date_text:
         print('No unusual transactions — nothing to write.')
         return True
@@ -154,18 +128,18 @@ def append_unusual_to_gsheet(
     for _, row in unusual_df.iterrows():
         rows_to_append.append([
             report_date_text,
-            _number(row.get('No')),
-            _datetime_display(row.get('Transaction Date')),
-            str(_clean(row.get('Transaction ID'))),
-            str(_clean(row.get('base_id'))),
-            str(_clean(row.get('Transaction'))),
-            _number(row.get('Kredit')),
-            _number(row.get('Debet')),
-            _number(row.get('Saldo Awal')),
-            _number(row.get('Saldo Akhir')),
-            str(_clean(row.get('Nomor RS'))),
-            str(_clean(row.get('Remarks'))),
-            str(_clean(row.get('unusual_reason'))),
+            number_sheet_value(row.get('No')),
+            datetime_sheet_display(row.get('Transaction Date')),
+            str(clean_sheet_value(row.get('Transaction ID'))),
+            str(clean_sheet_value(row.get('base_id'))),
+            str(clean_sheet_value(row.get('Transaction'))),
+            number_sheet_value(row.get('Kredit')),
+            number_sheet_value(row.get('Debet')),
+            number_sheet_value(row.get('Saldo Awal')),
+            number_sheet_value(row.get('Saldo Akhir')),
+            str(clean_sheet_value(row.get('Nomor RS'))),
+            str(clean_sheet_value(row.get('Remarks'))),
+            str(clean_sheet_value(row.get('unusual_reason'))),
         ])
 
     write_end = insert_row + len(rows_to_append) - 1
@@ -181,19 +155,42 @@ def append_unusual_to_gsheet(
 
     header_row = data_start - 1 if needs_header else 1
     data_end = data_start + len(unusual_df) - 1
+    table_end = max(write_end, len(existing) + len(rows_to_append))
 
     widths = {
-        0: 110, 1: 70, 2: 165, 3: 220, 4: 220, 5: 320, 6: 120,
-        7: 120, 8: 130, 9: 130, 10: 130, 11: 420, 12: 320,
+        0: 110, 1: 70, 2: 165, 3: 300, 4: 220, 5: 410, 6: 120,
+        7: 120, 8: 130, 9: 130, 10: 130, 11: 420, 12: 480,
     }
     protection_request = _add_protected_sheet_request(
         gspread_client,
         ws,
         f"FinPay protected unusual sheet {report_date_text}",
     )
+    banding_request = _row_banding_request(
+        ws,
+        header_row,
+        table_end,
+        1,
+        len(HEADERS),
+        COL_HEADER,
+    )
+    clear_data_background_request = _clear_background_color_request(
+        ws,
+        data_start,
+        table_end,
+        1,
+        len(HEADERS),
+    )
     sh.batch_update({"requests": [
         *_delete_all_protected_range_requests(sh, ws),
+        *_delete_all_banded_range_requests(sh, ws),
+        *(
+            [clear_data_background_request]
+            if clear_data_background_request
+            else []
+        ),
         *([protection_request] if protection_request else []),
+        *([banding_request] if banding_request else []),
         {
             "clearBasicFilter": {
                 "sheetId": ws.id,
@@ -242,7 +239,6 @@ def append_unusual_to_gsheet(
         "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
     })
     ws.format(_range(data_start, data_end), {
-        "backgroundColor": COL_WHITE,
         "verticalAlignment": "TOP",
     })
     ws.format(f"A{data_start}:A{data_end}", {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}})

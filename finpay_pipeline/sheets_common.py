@@ -2,11 +2,14 @@
 import os
 
 import gspread
+import pandas as pd
 from google.oauth2.service_account import Credentials
 
 
 DEFAULT_ROW_BUFFER = 200
 DEFAULT_BORDER_COLOR = {"red": 0.850, "green": 0.870, "blue": 0.890}
+DEFAULT_ZEBRA_STRIPE_COLOR = {"red": 0.900, "green": 0.945, "blue": 1.000}
+DEFAULT_WHITE_COLOR = {"red": 1, "green": 1, "blue": 1}
 
 
 def uppercase_sheet_value(value):
@@ -26,6 +29,81 @@ def uppercase_sheet_rows(rows: list[list]) -> list[list]:
         [uppercase_sheet_value(value) for value in row]
         for row in rows
     ]
+
+
+def a1_cell(row: int, col: int) -> str:
+    """Return an A1-style cell reference for 1-based row/column numbers."""
+    col_letter = ""
+    while col:
+        col, rem = divmod(col - 1, 26)
+        col_letter = chr(65 + rem) + col_letter
+    return f"{col_letter}{row}"
+
+
+def sheet_range(
+    start_row: int,
+    end_row: int,
+    start_col: int = 1,
+    end_col: int | None = None,
+) -> str:
+    """Return an A1-style range for 1-based row/column numbers."""
+    end_col = end_col or start_col
+    return f"{a1_cell(start_row, start_col)}:{a1_cell(end_row, end_col)}"
+
+
+def clean_sheet_value(value):
+    """Normalize pandas/None missing values before writing to Sheets."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    return value
+
+
+def number_sheet_value(value):
+    """Return an integer-like value for Sheets, or blank for missing input."""
+    value = clean_sheet_value(value)
+    if value == "":
+        return ""
+    return int(value)
+
+
+def sheet_text_value(value):
+    """Force a value to be interpreted as text by Google Sheets."""
+    value = clean_sheet_value(value)
+    if value == "":
+        return ""
+    return f"'{str(value)}"
+
+
+def datetime_sheet_display(value) -> str:
+    """Format a timestamp-like value for display in report sheets."""
+    value = clean_sheet_value(value)
+    if value == "":
+        return ""
+    return pd.to_datetime(value).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def date_sheet_display(value) -> str:
+    """Format a date-like value for display in report sheets."""
+    value = clean_sheet_value(value)
+    if value == "":
+        return ""
+    return pd.to_datetime(value, dayfirst=True).strftime("%d/%m/%Y")
+
+
+def report_date_display(
+    df: pd.DataFrame,
+    report_date: str | None = None,
+    date_column: str = "Transaction Date",
+) -> str:
+    """Resolve the report date used to replace rerun rows in detail sheets."""
+    if not df.empty:
+        return pd.to_datetime(df[date_column]).dt.strftime("%d/%m/%Y").max()
+    if report_date:
+        parsed = pd.to_datetime(report_date, format="%Y-%m-%d", errors="coerce")
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(report_date, dayfirst=True)
+        return parsed.strftime("%d/%m/%Y")
+    return ""
 
 
 def make_gspread_client(sa_key_path: str):
@@ -120,6 +198,24 @@ def _delete_all_protected_range_requests(sh, ws) -> list[dict]:
             requests.append({
                 "deleteProtectedRange": {
                     "protectedRangeId": protected_range["protectedRangeId"],
+                }
+            })
+    return requests
+
+
+def _delete_all_banded_range_requests(sh, ws) -> list[dict]:
+    """Build requests that remove every banded range on one worksheet."""
+    metadata = sh.fetch_sheet_metadata({
+        "fields": "sheets(properties(sheetId),bandedRanges(bandedRangeId))",
+    })
+    requests = []
+    for sheet in metadata.get("sheets", []):
+        if sheet.get("properties", {}).get("sheetId") != ws.id:
+            continue
+        for banded_range in sheet.get("bandedRanges", []):
+            requests.append({
+                "deleteBanding": {
+                    "bandedRangeId": banded_range["bandedRangeId"],
                 }
             })
     return requests
@@ -329,6 +425,56 @@ def _horizontal_border_requests(
             }
         })
     return requests
+
+
+def _clear_background_color_request(
+    ws,
+    start_row: int,
+    end_row: int,
+    start_col: int,
+    end_col: int,
+) -> dict | None:
+    """Build a request that clears explicit background colors from a range."""
+    if start_row > end_row or start_col > end_col:
+        return None
+
+    return {
+        "repeatCell": {
+            "range": _grid_range(ws, start_row, end_row, start_col, end_col),
+            "cell": {"userEnteredFormat": {}},
+            "fields": "userEnteredFormat.backgroundColor",
+        }
+    }
+
+
+def _row_banding_request(
+    ws,
+    header_row: int,
+    end_row: int,
+    start_col: int,
+    end_col: int,
+    header_color: dict,
+    first_band_color: dict | None = None,
+    second_band_color: dict | None = None,
+) -> dict | None:
+    """Build an addBanding request for zebra-striped report rows."""
+    if header_row > end_row or start_col > end_col:
+        return None
+
+    return {
+        "addBanding": {
+            "bandedRange": {
+                "range": _grid_range(ws, header_row, end_row, start_col, end_col),
+                "rowProperties": {
+                    "headerColor": header_color,
+                    "firstBandColor": first_band_color or DEFAULT_WHITE_COLOR,
+                    "secondBandColor": (
+                        second_band_color or DEFAULT_ZEBRA_STRIPE_COLOR
+                    ),
+                },
+            }
+        }
+    }
 
 
 def _add_protected_sheet_request(

@@ -42,10 +42,15 @@ def setup_initial_headers_and_saldo(
     widths = {
         0: 110,  # REPORT DATE
         1: 130,  # SECTION
-        2: 520,  # KETERANGAN
+        2: 410,  # KETERANGAN
         3: 140,  # DEBET
         4: 190,  # KREDIT
         5: 140,  # SALDO
+        6: 56,   # spacer
+        7: 110,  # INVOICE REPORT DATE
+        8: 410,  # INVOICE REPORT
+        9: 140,  # INVOICE DEBET
+        10: 140, # INVOICE KREDIT
     }
     sh.batch_update({"requests": [
         {
@@ -63,9 +68,9 @@ def setup_initial_headers_and_saldo(
             }
         },
         *_horizontal_border_requests(
-            ws, 1, 1, 1, 6, style="SOLID_MEDIUM", color=col_header
+            ws, 1, 1, 1, 11, style="SOLID_MEDIUM", color=col_header
         ),
-        *_horizontal_border_requests(ws, 2, 2, 1, 6),
+        *_horizontal_border_requests(ws, 2, 2, 1, 11),
         *[
             {
                 "updateDimensionProperties": {
@@ -80,12 +85,16 @@ def setup_initial_headers_and_saldo(
     ]})
 
     date_display = pd.to_datetime(starting_date_str).strftime("%d/%m/%Y")
-    ws.update("A1:F2", uppercase_sheet_rows([
-        ["REPORT DATE", "SECTION", "KETERANGAN", "DEBET", "KREDIT", "SALDO"],
-        [date_display, "", f"SALDO {date_display}", "", "", starting_balance],
+    ws.update("A1:K2", uppercase_sheet_rows([
+        [
+            "REPORT DATE", "SECTION", "KETERANGAN", "DEBET", "KREDIT", "SALDO",
+            "", "REPORT DATE", "INVOICE REPORT", "DEBET", "KREDIT",
+        ],
+        [date_display, "", f"SALDO {date_display}", "", "", starting_balance,
+         "", "", "", "", ""],
     ]), value_input_option="USER_ENTERED")
 
-    ws.format("A1:F1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
+    ws.format("A1:K1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
     ws.format("F2", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}})
     protection_request = _add_protected_sheet_request(
         gspread_client,
@@ -111,7 +120,7 @@ def append_daily_to_gsheet(
     summary_df: pd.DataFrame,
 ) -> tuple[int | None, int | None]:
     """
-    Returns (insert_row, footer_end) on success.
+    Returns (insert_row, block_end) on success.
     Replaces the existing daily block for the same date on reruns.
     """
     target_date_str = summary_df["Transaction_Date"].max()
@@ -129,10 +138,12 @@ def append_daily_to_gsheet(
 
     COL_HEADER = {"red": 0.122, "green": 0.306, "blue": 0.471}
     COL_WHITE  = {"red": 1,     "green": 1,     "blue": 1}
+    COL_DETAIL_ALT = {"red": 0.965, "green": 0.980, "blue": 0.992}
     COL_CASH_HEADER = {"red": 0.820, "green": 0.910, "blue": 0.800}
     COL_CASH_BODY = {"red": 0.925, "green": 0.973, "blue": 0.910}
     COL_ACCOUNTING_HEADER = {"red": 0.980, "green": 0.900, "blue": 0.700}
     COL_ACCOUNTING_BODY = {"red": 1.000, "green": 0.965, "blue": 0.840}
+    COL_TABLE_BORDER = {"red": 0.650, "green": 0.700, "blue": 0.750}
     COL_STATUS = {"red": 0.965, "green": 0.930, "blue": 0.990}
     COL_FOOTER_HEADER = {"red": 0.800, "green": 0.880, "blue": 0.950}
     COL_FOOTER_BODY = {"red": 0.900, "green": 0.940, "blue": 0.980}
@@ -142,6 +153,201 @@ def append_daily_to_gsheet(
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
     existing_values = ws.get_all_values()
+
+    def _grid_range(sr: int, er: int, sc: int, ec: int) -> dict:
+        return {
+            "sheetId": ws.id,
+            "startRowIndex": sr - 1,
+            "endRowIndex": er,
+            "startColumnIndex": sc - 1,
+            "endColumnIndex": ec,
+        }
+
+    def _invoice_table_border_requests(
+        start_row: int,
+        end_row: int,
+    ) -> list[dict]:
+        if start_row > end_row:
+            return []
+
+        outer = {"style": "SOLID_MEDIUM", "color": COL_HEADER}
+        inner = {"style": "SOLID", "color": COL_TABLE_BORDER}
+        return [{
+            "updateBorders": {
+                "range": _grid_range(start_row, end_row, 8, 11),
+                "top": outer,
+                "bottom": outer,
+                "left": outer,
+                "right": outer,
+                "innerHorizontal": inner,
+                "innerVertical": inner,
+            }
+        }]
+
+    def _cell_grid_border_requests(
+        start_row: int,
+        end_row: int,
+        start_col: int,
+        end_col: int,
+    ) -> list[dict]:
+        if start_row > end_row or start_col > end_col:
+            return []
+
+        border = {"style": "SOLID", "color": COL_TABLE_BORDER}
+        return [{
+            "updateBorders": {
+                "range": _grid_range(start_row, end_row, start_col, end_col),
+                "top": border,
+                "bottom": border,
+                "left": border,
+                "right": border,
+                "innerHorizontal": border,
+                "innerVertical": border,
+            }
+        }]
+
+    def _merge_range_requests(
+        start_row: int,
+        end_row: int,
+        start_col: int,
+        end_col: int,
+    ) -> list[dict]:
+        merge_range = _grid_range(start_row, end_row, start_col, end_col)
+        return [
+            {"unmergeCells": {"range": merge_range}},
+            {"mergeCells": {"range": merge_range, "mergeType": "MERGE_ALL"}},
+        ]
+
+    def _unmerge_range_requests(
+        start_row: int,
+        end_row: int,
+        start_col: int,
+        end_col: int,
+    ) -> list[dict]:
+        return [{
+            "unmergeCells": {
+                "range": _grid_range(start_row, end_row, start_col, end_col),
+            }
+        }]
+
+    def _has_blank_invoice_cells(row: list) -> bool:
+        return all(
+            str(row[idx]).strip() == "" if idx < len(row) else True
+            for idx in range(7, 11)
+        )
+
+    def _blank_invoice_block_ranges(
+        start_row: int,
+        rows: list[list],
+    ) -> list[tuple[int, int]]:
+        blocks = []
+        block_start = None
+        for offset, row in enumerate(rows):
+            row_number = start_row + offset
+            if _has_blank_invoice_cells(row):
+                if block_start is None:
+                    block_start = row_number
+                continue
+
+            if block_start is not None:
+                blocks.append((block_start, row_number - 1))
+                block_start = None
+
+        if block_start is not None:
+            blocks.append((block_start, start_row + len(rows) - 1))
+
+        return blocks
+
+    def _blank_invoice_block_merge_requests(
+        blocks: list[tuple[int, int]],
+    ) -> list[dict]:
+        requests = []
+        for start_row, end_row in blocks:
+            requests.extend(_merge_range_requests(start_row, end_row, 8, 11))
+        return requests
+
+    def _blank_invoice_block_border_requests(
+        blocks: list[tuple[int, int]],
+    ) -> list[dict]:
+        clear_border = {"style": "NONE"}
+        side_border = {"style": "SOLID_MEDIUM", "color": COL_HEADER}
+        requests = []
+        for block_index, (start_row, end_row) in enumerate(blocks):
+            requests.append({
+                "updateBorders": {
+                    "range": _grid_range(start_row, end_row, 8, 11),
+                    "top": side_border if block_index == 0 else clear_border,
+                    "bottom": clear_border,
+                    "left": side_border,
+                    "right": side_border,
+                    "innerHorizontal": clear_border,
+                    "innerVertical": clear_border,
+                }
+            })
+        return requests
+
+    def _daily_detail_start_rows(values: list[list[str]]) -> list[int]:
+        starts = []
+        previous_date = ""
+        previous_section = ""
+        for idx, row in enumerate(values, start=1):
+            date_text = str(row[0]).strip() if row else ""
+            section = str(row[1]).strip().upper() if len(row) > 1 else ""
+            if (
+                date_text
+                and section == "DETAIL"
+                and (previous_date != date_text or previous_section != "DETAIL")
+            ):
+                starts.append(idx)
+            previous_date = date_text
+            previous_section = section
+        return starts
+
+    def _summary_block_top_border_requests(
+        detail_start_rows: list[int],
+        max_row: int,
+    ) -> list[dict]:
+        requests = []
+        for row in sorted(set(detail_start_rows)):
+            if row > max_row:
+                continue
+            requests.extend(_horizontal_border_requests(
+                ws,
+                row,
+                row,
+                1,
+                6,
+                top=True,
+                bottom=False,
+                style="SOLID_MEDIUM",
+                color=COL_HEADER,
+            ))
+            requests.extend(_horizontal_border_requests(
+                ws,
+                row,
+                row,
+                8,
+                11,
+                top=True,
+                bottom=False,
+                style="SOLID_MEDIUM",
+                color=COL_HEADER,
+            ))
+
+            invoice_table_row = row + 3
+            if invoice_table_row <= max_row:
+                requests.extend(_horizontal_border_requests(
+                    ws,
+                    invoice_table_row,
+                    invoice_table_row,
+                    8,
+                    11,
+                    top=True,
+                    bottom=False,
+                    style="SOLID_MEDIUM",
+                    color=COL_HEADER,
+                ))
+        return requests
 
     def _existing_mandiri_cells(values: list[list[str]]) -> list[tuple[int, int]]:
         cells = []
@@ -237,6 +443,16 @@ def append_daily_to_gsheet(
     )
     if replacement_rows:
         replacement_start = min(replacement_rows)
+        sh.batch_update({"requests": [{
+            "unmergeCells": {
+                "range": _grid_range(
+                    max(2, replacement_start - 1),
+                    max(replacement_rows),
+                    8,
+                    11,
+                )
+            }
+        }]})
         _delete_sheet_rows(sh, ws, replacement_rows)
         print(
             f"↻ Replacing existing summary block for {formatted_date} "
@@ -263,8 +479,13 @@ def append_daily_to_gsheet(
         "DEBET",
         "KREDIT",
         "SALDO",
+        "",
+        "REPORT DATE",
+        "INVOICE REPORT",
+        "DEBET",
+        "KREDIT",
     ]
-    ws.update("A1:F1", uppercase_sheet_rows([summary_headers]), value_input_option="USER_ENTERED")
+    ws.update("A1:K1", uppercase_sheet_rows([summary_headers]), value_input_option="USER_ENTERED")
 
     insert_row = replacement_start or len(existing_values) + 1
     r = insert_row
@@ -419,17 +640,6 @@ def append_daily_to_gsheet(
                 )
             ),
         ),
-        ("Reversal - NGRS", *_split_net_formula(_detail_net_formula(REVERSAL_NGRS_CATEGORY))),
-        (
-            "Reversal - NGRS FEE",
-            *_split_net_formula(_detail_net_formula(REVERSAL_NGRS_FEE_CATEGORY)),
-        ),
-        (
-            "Reversal - PEMBELIAN RECHARGE OUT CLUSTER",
-            *_split_net_formula(
-                _detail_net_formula(REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY)
-            ),
-        ),
         ("QRISDUWIT", *_split_net_formula(_detail_net_formula("QRISDUWIT"))),
     ]
 
@@ -464,28 +674,13 @@ def append_daily_to_gsheet(
         ),
     ]
 
-    def _append_summary_section(
-        section: str,
-        report_rows: list[tuple[str, str, str]],
-    ) -> tuple[int, int]:
-        nonlocal r
-        body_start = r
-        for label, debet_formula, kredit_formula in report_rows:
-            rows_to_append.append(
-                _summary_row(section, label, debet_formula, kredit_formula)
-            )
-            r += 1
-        body_end = r - 1
-        return body_start, body_end
-
-    cash_start, cash_end = _append_summary_section(
-        "CASH IN",
-        cash_report_rows,
-    )
-    accounting_start, accounting_end = _append_summary_section(
-        "ACCOUNTING",
-        accounting_report_rows,
-    )
+    invoice_rows = [
+        [formatted_date, "CASH IN", "", ""],
+        *[[formatted_date, *row] for row in cash_report_rows],
+        ["", "", "", ""],
+        [formatted_date, "ACCOUNTING", "", ""],
+        *[[formatted_date, *row] for row in accounting_report_rows],
+    ]
 
     footer_start = r
     footer_formulas = [
@@ -546,7 +741,7 @@ def append_daily_to_gsheet(
     )
     for i, f_label in enumerate(footer_rows):
         rows_to_append.append(
-            _summary_row("Summary", f_label, footer_formulas[i])
+            _summary_row("MANDIRI", f_label, footer_formulas[i])
         )
         r += 1
     footer_end = r - 1
@@ -563,9 +758,10 @@ def append_daily_to_gsheet(
         f'D$1:D{running_total_row - 1}="MANDIRI"),'
         f'COUNTIFS(C$1:C{running_total_row - 1},"MANDIRI",'
         f'D$1:D{running_total_row - 1},"MANDIRI")),'
-        f'IFERROR(INDEX(FILTER(C$1:C{running_total_row - 1},'
-        f'B$1:B{running_total_row - 1}="MANDIRI"),'
-        f'COUNTIF(B$1:B{running_total_row - 1},"MANDIRI")),0)))'
+        f'IFERROR(LOOKUP(2,1/('
+        f'B$1:B{running_total_row - 1}="MANDIRI")/'
+        f'ISNUMBER(C$1:C{running_total_row - 1}),'
+        f'C$1:C{running_total_row - 1}),0)))'
     )
     previous_running_total = (
         f'IFERROR(INDEX(FILTER(D$1:D{running_total_row - 1},'
@@ -626,21 +822,55 @@ def append_daily_to_gsheet(
         _summary_row("Cash", "SELISIH", selisih_formula, selisih_status_formula)
     )
     reconciliation_end = r
+    cash_flow_rows = rows_to_append
+    invoice_start = detail_start + 3
+    invoice_offset = invoice_start - insert_row
+    block_row_count = max(len(cash_flow_rows), invoice_offset + len(invoice_rows))
+    rows_to_append = []
+    for idx in range(block_row_count):
+        left = (
+            cash_flow_rows[idx]
+            if idx < len(cash_flow_rows)
+            else [formatted_date, "", "", "", "", ""]
+        )
+        invoice_idx = idx - invoice_offset
+        right = (
+            invoice_rows[invoice_idx]
+            if 0 <= invoice_idx < len(invoice_rows)
+            else ["", "", "", ""]
+        )
+        rows_to_append.append([*left, "", *right])
+    block_end = insert_row + len(rows_to_append) - 1
+    cash_invoice_header_row = invoice_start
+    cash_invoice_end = cash_invoice_header_row + len(cash_report_rows)
+    invoice_separator_row = cash_invoice_end + 1
+    accounting_invoice_header_row = cash_invoice_end + 2
+    invoice_end = accounting_invoice_header_row + len(accounting_report_rows)
+    blank_invoice_blocks = _blank_invoice_block_ranges(
+        insert_row,
+        rows_to_append,
+    )
+    blank_invoice_merge_requests = _blank_invoice_block_merge_requests(
+        blank_invoice_blocks,
+    )
+    blank_invoice_border_requests = _blank_invoice_block_border_requests(
+        blank_invoice_blocks,
+    )
 
-    required_rows = max(reconciliation_end, next_transfer_range_start)
+    required_rows = max(block_end, next_transfer_range_start)
     if replacement_start:
         _insert_blank_sheet_rows(sh, ws, replacement_start, len(rows_to_append))
     else:
         ensure_row_capacity(sh, ws, required_rows, label="summary worksheet")
     ws.update(
-        _range(insert_row, insert_row + len(rows_to_append) - 1),
+        _range(insert_row, block_end, 1, 11),
         uppercase_sheet_rows(rows_to_append),
         value_input_option="USER_ENTERED",
     )
 
     # Formatting
     data_start = insert_row
-    data_end = reconciliation_end
+    data_end = block_end
     IDR = {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}
 
     def _format_report_section(
@@ -660,20 +890,23 @@ def append_daily_to_gsheet(
             "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
         })
 
-    ws.format(_range(data_start, data_end), {"backgroundColor": COL_WHITE})
+    def _format_detail_stripes(start_row: int, end_row: int) -> None:
+        for row_number in range(start_row, end_row + 1, 2):
+            stripe_start_col = 3 if row_number == start_row else 1
+            ws.format(_range(row_number, row_number, stripe_start_col, 6), {
+                "backgroundColor": COL_DETAIL_ALT,
+            })
+
+    ws.format(_range(data_start, data_end, 1, 11), {"backgroundColor": COL_WHITE})
     ws.format(f"D{data_start}:F{data_end}", {"numberFormat": IDR})
+    ws.format(f"H{data_start}:H{data_end}", {
+        "numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"},
+    })
+    ws.format(f"J{data_start}:K{data_end}", {"numberFormat": IDR})
     _format_report_section(
-        detail_start, detail_end, COL_FOOTER_BODY, COL_WHITE
+        detail_start, detail_end, COL_FOOTER_HEADER, COL_WHITE
     )
-    _format_report_section(
-        cash_start, cash_end, COL_CASH_HEADER, COL_CASH_BODY
-    )
-    _format_report_section(
-        accounting_start,
-        accounting_end,
-        COL_ACCOUNTING_HEADER,
-        COL_ACCOUNTING_BODY,
-    )
+    _format_detail_stripes(detail_start, detail_end)
     _format_report_section(
         footer_start, footer_end, COL_FOOTER_HEADER, COL_FOOTER_BODY
     )
@@ -695,29 +928,88 @@ def append_daily_to_gsheet(
     })
     ws.format(f"D{selisih_row}", {"numberFormat": IDR})
     ws.format(f"E{selisih_row}", {"wrapStrategy": "WRAP"})
+    if invoice_rows:
+        ws.format(_range(cash_invoice_header_row, cash_invoice_header_row, 8, 11), {
+            "backgroundColor": COL_CASH_HEADER,
+            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+            "horizontalAlignment": "CENTER",
+        })
+        ws.format(_range(cash_invoice_header_row + 1, cash_invoice_end, 8, 11), {
+            "backgroundColor": COL_CASH_BODY,
+        })
+        ws.format(_range(invoice_separator_row, invoice_separator_row, 8, 11), {
+            "backgroundColor": COL_WHITE,
+        })
+        ws.format(
+            _range(accounting_invoice_header_row, accounting_invoice_header_row, 8, 11),
+            {
+                "backgroundColor": COL_ACCOUNTING_HEADER,
+                "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+                "horizontalAlignment": "CENTER",
+            },
+        )
+        ws.format(_range(accounting_invoice_header_row + 1, invoice_end, 8, 11), {
+            "backgroundColor": COL_ACCOUNTING_BODY,
+        })
+        ws.format(f"I{invoice_start}:I{invoice_end}", {
+            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+            "horizontalAlignment": "LEFT",
+            "wrapStrategy": "CLIP",
+        })
+        ws.format(f"H{invoice_start}:H{invoice_end}", {
+            "horizontalAlignment": "CENTER",
+            "wrapStrategy": "CLIP",
+        })
+        ws.format(f"J{invoice_start}:K{invoice_end}", {
+            "horizontalAlignment": "RIGHT",
+        })
+        ws.format(f"I{cash_invoice_header_row}", {"horizontalAlignment": "CENTER"})
+        ws.format(f"I{accounting_invoice_header_row}", {"horizontalAlignment": "CENTER"})
+    ws.format("A1:F1", {
+        "backgroundColor": COL_HEADER,
+        "horizontalAlignment": "CENTER",
+        "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
+    })
+    ws.format("G1", {"backgroundColor": COL_WHITE})
+    ws.format("H1:K1", {
+        "backgroundColor": COL_HEADER,
+        "horizontalAlignment": "CENTER",
+        "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
+    })
     old_dashboard_range = {
         "sheetId": ws.id,
         "startRowIndex": 0,
         "endRowIndex": 1,
-        "startColumnIndex": 6,
+        "startColumnIndex": 11,
         "endColumnIndex": 15,
     }
     summary_widths = {
         0: 110,
         1: 130,
-        2: 520,
+        2: 410,
         3: 140,
         4: 190,
         5: 140,
+        6: 56,
+        7: 110,
+        8: 410,
+        9: 140,
+        10: 140,
     }
     existing_mandiri_cells = _existing_mandiri_cells(existing_values)
+    existing_detail_start_rows = _daily_detail_start_rows(existing_values)
     if replacement_start:
         inserted_row_count = len(rows_to_append)
         existing_mandiri_cells = [
             (row + inserted_row_count if row >= replacement_start else row, col)
             for row, col in existing_mandiri_cells
         ]
-    final_sheet_end = max(reconciliation_end, len(existing_values) + len(rows_to_append))
+        existing_detail_start_rows = [
+            row + inserted_row_count if row >= replacement_start else row
+            for row in existing_detail_start_rows
+        ]
+    final_sheet_end = max(block_end, len(existing_values) + len(rows_to_append))
+    detail_start_rows = [*existing_detail_start_rows, detail_start]
     protection_requests = _summary_protection_requests(
         final_sheet_end,
         [*existing_mandiri_cells, (mandiri_row, 4)],
@@ -738,14 +1030,25 @@ def append_daily_to_gsheet(
                 "fields": "gridProperties.frozenRowCount",
             }
         },
-        *_horizontal_border_requests(ws, 1, 1, 1, 6),
-        *_horizontal_border_requests(ws, data_start, data_end, 1, 6),
+        *_unmerge_range_requests(cash_invoice_header_row, cash_invoice_header_row, 9, 11),
+        *_unmerge_range_requests(
+            accounting_invoice_header_row,
+            accounting_invoice_header_row,
+            9,
+            11,
+        ),
+        *_unmerge_range_requests(2, 2, 8, 11),
+        *blank_invoice_merge_requests,
+        *_cell_grid_border_requests(1, 1, 1, 11),
+        *_cell_grid_border_requests(2, 2, 1, 11),
+        *_cell_grid_border_requests(data_start, data_end, 1, 11),
+        *_horizontal_border_requests(ws, 1, 1, 1, 11),
+        *_horizontal_border_requests(ws, data_start, data_end, 1, 11),
+        *blank_invoice_border_requests,
         *[
             request
             for row in [
                 detail_start,
-                cash_start,
-                accounting_start,
                 footer_start,
             ]
             for request in _horizontal_border_requests(
@@ -760,6 +1063,59 @@ def append_daily_to_gsheet(
                 color=COL_HEADER,
             )
         ],
+        *_horizontal_border_requests(
+            ws,
+            invoice_start,
+            invoice_start,
+            8,
+            11,
+            top=True,
+            bottom=False,
+            style="SOLID_MEDIUM",
+            color=COL_HEADER,
+        ),
+        *_horizontal_border_requests(
+            ws,
+            invoice_start,
+            invoice_start,
+            8,
+            11,
+            top=False,
+            bottom=True,
+            style="SOLID_MEDIUM",
+            color=COL_HEADER,
+        ),
+        *_horizontal_border_requests(
+            ws,
+            accounting_invoice_header_row,
+            accounting_invoice_header_row,
+            8,
+            11,
+            top=True,
+            bottom=False,
+            style="SOLID_MEDIUM",
+            color=COL_HEADER,
+        ),
+        *_horizontal_border_requests(
+            ws,
+            accounting_invoice_header_row,
+            accounting_invoice_header_row,
+            8,
+            11,
+            top=False,
+            bottom=True,
+            style="SOLID_MEDIUM",
+            color=COL_HEADER,
+        ),
+        *_invoice_table_border_requests(
+            invoice_start,
+            cash_invoice_end,
+        ),
+        *_invoice_table_border_requests(
+            accounting_invoice_header_row,
+            invoice_end,
+        ),
+        *_summary_block_top_border_requests(detail_start_rows, final_sheet_end),
         *_horizontal_border_requests(
             ws,
             total_row,
@@ -785,7 +1141,7 @@ def append_daily_to_gsheet(
         {
             "updateCells": {
                 "range": old_dashboard_range,
-                "rows": [{"values": [{} for _ in range(9)]}],
+                "rows": [{"values": [{} for _ in range(4)]}],
                 "fields": "userEnteredValue",
             }
         },
@@ -812,7 +1168,7 @@ def append_daily_to_gsheet(
             for i, px in summary_widths.items()
         ],
     ]})
-    return insert_row, reconciliation_end
+    return insert_row, block_end
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -362,6 +362,48 @@ def _db_raw_source_value(row: pd.Series, db_column: str):
     return None
 
 
+def _db_source_value(
+    row: pd.Series,
+    table_name: str,
+    db_column: str,
+    source_by_db_column: dict[str, str],
+):
+    if table_name == "finpay_raw_transactions":
+        return _db_raw_source_value(row, db_column)
+    source_column = source_by_db_column.get(db_column)
+    if source_column and source_column in row.index:
+        return row[source_column]
+    return None
+
+
+def _db_insert_rows(
+    df: pd.DataFrame,
+    table_name: str,
+    cluster_id: str,
+    report_date_value,
+    insert_columns: list[str],
+    source_by_db_column: dict[str, str],
+) -> list[tuple]:
+    rows = []
+    for _, row in df.iterrows():
+        db_row = {
+            "cluster_id": cluster_id,
+            "report_date": report_date_value,
+        }
+        for db_col in insert_columns:
+            if db_col in db_row:
+                continue
+            value = _db_source_value(
+                row,
+                table_name,
+                db_col,
+                source_by_db_column,
+            )
+            db_row[db_col] = _db_value(value, db_col)
+        rows.append(tuple(db_row.get(col) for col in insert_columns))
+    return rows
+
+
 def write_finpay_dataframe_to_postgres(
     df: pd.DataFrame,
     table_name: str,
@@ -383,23 +425,14 @@ def write_finpay_dataframe_to_postgres(
     db_df = _db_enriched_dataframe(df)
     schema, source_by_db_column = _finpay_db_schema_for_write(table_name, db_df)
     insert_columns = [column_name for column_name, _ in schema]
-
-    rows = []
-    for _, row in db_df.iterrows():
-        db_row = {
-            "cluster_id": cluster_id,
-            "report_date": report_date_value,
-        }
-        for db_col in insert_columns:
-            if db_col in db_row:
-                continue
-            if table_name == "finpay_raw_transactions":
-                value = _db_raw_source_value(row, db_col)
-            else:
-                source_column = source_by_db_column.get(db_col)
-                value = row[source_column] if source_column in row.index else None
-            db_row[db_col] = _db_value(value, db_col)
-        rows.append(tuple(db_row.get(col) for col in insert_columns))
+    rows = _db_insert_rows(
+        db_df,
+        table_name,
+        cluster_id,
+        report_date_value,
+        insert_columns,
+        source_by_db_column,
+    )
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:

@@ -7,17 +7,29 @@ import pandas as pd
 from .classification import (
     REVERSAL_CATEGORY_TO_MAIN,
     REVERSAL_TRANSACTION,
+    ensure_reversal_labels_prepared,
     _is_reversal_transaction_label,
-    relabel_reversal_transactions,
 )
 from .sheets_common import (
     _add_protected_sheet_request,
+    _clear_background_color_request,
+    _delete_all_banded_range_requests,
     _delete_all_protected_range_requests,
     _delete_sheet_rows,
     _horizontal_border_requests,
     _insert_blank_sheet_rows,
     _matching_report_date_rows,
+    _row_banding_request,
+    a1_cell,
+    clean_sheet_value,
+    date_sheet_display,
+    datetime_sheet_display,
     ensure_row_capacity,
+    number_sheet_value,
+    open_or_create_finpay_spreadsheet,
+    report_date_display,
+    sheet_range,
+    sheet_text_value,
     uppercase_sheet_rows,
 )
 
@@ -75,13 +87,13 @@ def prepare_transaction_detail_export(
 
 def prepare_reversal_detail_export(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Filters REVERSAL rows and relabels rows into reversal detail categories
-    using the same remark rules as the summary transform.
+    Filter reversal rows using labels prepared by the preprocessing step.
+    Raw legacy callers still fall back to the reversal remark classifier.
     """
     if "Transaction" not in df.columns:
         raise KeyError("Transaction column is required for detail export.")
 
-    prepared = relabel_reversal_transactions(df)
+    prepared = ensure_reversal_labels_prepared(df)
     reversal_mask = prepared['Transaction'].apply(_is_reversal_transaction_label)
     result = prepared.loc[reversal_mask].copy()
 
@@ -126,55 +138,8 @@ def append_transaction_detail_to_gsheet(
     Replaces existing rows for the same report date on reruns.
     Returns True on success/no rows.
     """
-    def _a1(row, col):
-        col_letter = ""
-        while col:
-            col, rem = divmod(col - 1, 26)
-            col_letter = chr(65 + rem) + col_letter
-        return f"{col_letter}{row}"
-
     def _range(sr, er, sc=1, ec=None):
-        ec = ec or len(HEADERS)
-        return f"{_a1(sr, sc)}:{_a1(er, ec)}"
-
-    def _clean(value):
-        if value is None or (not isinstance(value, str) and pd.isna(value)):
-            return ""
-        return value
-
-    def _number(value):
-        value = _clean(value)
-        if value == "":
-            return ""
-        return int(value)
-
-    def _sheet_text(value):
-        value = _clean(value)
-        if value == "":
-            return ""
-        return f"'{str(value)}"
-
-    def _datetime_display(value):
-        value = _clean(value)
-        if value == "":
-            return ""
-        return pd.to_datetime(value).strftime("%d/%m/%Y %H:%M:%S")
-
-    def _date_display(value):
-        value = _clean(value)
-        if value == "":
-            return ""
-        return pd.to_datetime(value, dayfirst=True).strftime("%d/%m/%Y")
-
-    def _report_date_display() -> str:
-        if not detail_df.empty:
-            return pd.to_datetime(detail_df["Transaction Date"]).dt.strftime("%d/%m/%Y").max()
-        if report_date:
-            parsed = pd.to_datetime(report_date, format="%Y-%m-%d", errors="coerce")
-            if pd.isna(parsed):
-                parsed = pd.to_datetime(report_date, dayfirst=True)
-            return parsed.strftime("%d/%m/%Y")
-        return ""
+        return sheet_range(sr, er, sc, ec or len(HEADERS))
 
     HEADERS = ["REPORT DATE"]
     if include_disbursement_date:
@@ -197,7 +162,7 @@ def append_transaction_detail_to_gsheet(
     COL_WHITE  = {"red": 1,     "green": 1,     "blue": 1}
     IDR        = {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}
 
-    sh = gspread_client.open(target_spreadsheet)
+    sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     try:
         ws = sh.worksheet(target_worksheet)
     except gspread.WorksheetNotFound:
@@ -206,7 +171,7 @@ def append_transaction_detail_to_gsheet(
             return True
         ws = sh.add_worksheet(title=target_worksheet, rows=5000, cols=max(20, len(HEADERS)))
 
-    report_date_text = _report_date_display()
+    report_date_text = report_date_display(detail_df, report_date)
     if detail_df.empty and not report_date_text:
         print(f"No rows for {target_worksheet} — nothing to write.")
         return True
@@ -257,19 +222,19 @@ def append_transaction_detail_to_gsheet(
     for _, row in detail_df.iterrows():
         output_row = [report_date_text]
         if include_disbursement_date:
-            output_row.append(_date_display(row.get("Disbursement Date")))
+            output_row.append(date_sheet_display(row.get("Disbursement Date")))
         output_row.extend([
-            _number(row.get("No")),
-            _datetime_display(row.get("Transaction Date")),
-            str(_clean(row.get("Transaction ID"))),
-            str(_clean(row.get("Transaction Type"))),
-            str(_clean(row.get("Transaction"))),
-            _number(row.get("Kredit")),
-            _number(row.get("Debet")),
-            _number(row.get("Saldo Awal")),
-            _number(row.get("Saldo Akhir")),
-            _sheet_text(row.get("Nomor RS")),
-            str(_clean(row.get("Remarks"))),
+            number_sheet_value(row.get("No")),
+            datetime_sheet_display(row.get("Transaction Date")),
+            str(clean_sheet_value(row.get("Transaction ID"))),
+            str(clean_sheet_value(row.get("Transaction Type"))),
+            str(clean_sheet_value(row.get("Transaction"))),
+            number_sheet_value(row.get("Kredit")),
+            number_sheet_value(row.get("Debet")),
+            number_sheet_value(row.get("Saldo Awal")),
+            number_sheet_value(row.get("Saldo Akhir")),
+            sheet_text_value(row.get("Nomor RS")),
+            str(clean_sheet_value(row.get("Remarks"))),
         ])
         rows_to_append.append(output_row)
 
@@ -286,15 +251,16 @@ def append_transaction_detail_to_gsheet(
 
     header_row = data_start - 1 if needs_header else 1
     data_end = data_start + len(detail_df) - 1
+    table_end = max(write_end, len(existing) + len(rows_to_append))
 
     widths_by_header = {
         "REPORT DATE": 110,
         "DISBURSEMENT DATE": 145,
         "NO": 70,
         "TRANSACTION DATE": 165,
-        "TRANSACTION ID": 220,
+        "TRANSACTION ID": 300,
         "TRANSACTION TYPE": 150,
-        "TRANSACTION": 320,
+        "TRANSACTION": 410,
         "KREDIT": 120,
         "DEBET": 120,
         "SALDO AWAL": 130,
@@ -307,9 +273,31 @@ def append_transaction_detail_to_gsheet(
         ws,
         f"FinPay protected {target_worksheet} sheet {report_date_text}",
     )
+    banding_request = _row_banding_request(
+        ws,
+        header_row,
+        table_end,
+        1,
+        len(HEADERS),
+        COL_HEADER,
+    )
+    clear_data_background_request = _clear_background_color_request(
+        ws,
+        data_start,
+        table_end,
+        1,
+        len(HEADERS),
+    )
     sh.batch_update({"requests": [
         *_delete_all_protected_range_requests(sh, ws),
+        *_delete_all_banded_range_requests(sh, ws),
+        *(
+            [clear_data_background_request]
+            if clear_data_background_request
+            else []
+        ),
         *([protection_request] if protection_request else []),
+        *([banding_request] if banding_request else []),
         {
             "clearBasicFilter": {
                 "sheetId": ws.id,
@@ -358,33 +346,35 @@ def append_transaction_detail_to_gsheet(
         "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
     })
     ws.format(_range(data_start, data_end), {
-        "backgroundColor": COL_WHITE,
         "verticalAlignment": "TOP",
     })
 
     for header in ["REPORT DATE", "DISBURSEMENT DATE"]:
         if header in HEADERS:
             col = HEADERS.index(header) + 1
-            ws.format(f"{_a1(data_start, col)}:{_a1(data_end, col)}", {
+            ws.format(f"{a1_cell(data_start, col)}:{a1_cell(data_end, col)}", {
                 "numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}
             })
 
     date_col = HEADERS.index("TRANSACTION DATE") + 1
-    ws.format(f"{_a1(data_start, date_col)}:{_a1(data_end, date_col)}", {
+    ws.format(f"{a1_cell(data_start, date_col)}:{a1_cell(data_end, date_col)}", {
         "numberFormat": {"type": "DATE_TIME", "pattern": "dd/mm/yyyy hh:mm:ss"}
     })
 
     for header in ["KREDIT", "DEBET", "SALDO AWAL", "SALDO AKHIR"]:
         col = HEADERS.index(header) + 1
-        ws.format(f"{_a1(data_start, col)}:{_a1(data_end, col)}", {"numberFormat": IDR})
+        ws.format(
+            f"{a1_cell(data_start, col)}:{a1_cell(data_end, col)}",
+            {"numberFormat": IDR},
+        )
 
     nomor_rs_col = HEADERS.index("NOMOR RS") + 1
-    ws.format(f"{_a1(data_start, nomor_rs_col)}:{_a1(data_end, nomor_rs_col)}", {
+    ws.format(f"{a1_cell(data_start, nomor_rs_col)}:{a1_cell(data_end, nomor_rs_col)}", {
         "numberFormat": {"type": "TEXT"}
     })
 
     remarks_col = HEADERS.index("REMARKS") + 1
-    ws.format(f"{_a1(data_start, remarks_col)}:{_a1(data_end, remarks_col)}", {
+    ws.format(f"{a1_cell(data_start, remarks_col)}:{a1_cell(data_end, remarks_col)}", {
         "wrapStrategy": "WRAP"
     })
     print(f"✓ Written {len(detail_df)} rows to {target_worksheet} for {report_date_text}")

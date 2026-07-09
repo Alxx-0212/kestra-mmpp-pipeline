@@ -1,8 +1,12 @@
 # FinPay Daily Pipeline
 
-Kestra flow for processing daily FinPay exports. The pipeline loads a CSV/XLS/XLSX file, validates the FinPay schema, flags unusual fee groups, summarizes transactions, and writes results to Google Sheets.
+Kestra flow for processing daily FinPay exports. The pipeline loads one
+CSV/XLS/XLSX file, validates the FinPay schema, flags unusual rows, persists
+selected workflow outputs to Postgres, summarizes transactions, and writes
+Google Sheets reports.
 
-The flow is currently designed for manual runs with a file upload. Runtime dates use the `Asia/Makassar` timezone.
+The flow is designed for manual runs with a file upload. Runtime dates use the
+`Asia/Makassar` timezone.
 
 ---
 
@@ -14,12 +18,12 @@ Upload CSV/XLS/XLSX
       v
 [1] parse_and_resolve
       - extract cluster_id and file date from filename
-      - resolve spreadsheet and cluster base worksheet
+      - resolve spreadsheet and base worksheet
       - compute starting_balance_date as the last day of the previous month
       |
       v
 [2] determine_current_date
-      - compute current run date
+      - compute current run timestamp
       - choose the stable cluster summary worksheet, e.g. PKY
       |
       v
@@ -34,31 +38,42 @@ Upload CSV/XLS/XLSX
       - enforce Debet/Kredit mutual exclusivity
       |
       v
-[5] preprocess_transaction_labels
+[5] persist_raw_transactions_to_db
+      - production only
+      - write raw validated rows to finpay_raw_transactions
+      |
+      v
+[6] preprocess_transaction_labels
+      - preserve raw_transaction_label
       - relabel Reversal rows from Remarks
       - relabel Recharge Out Cluster groups
       - write preprocessed.parquet
       |
       v
-[6] flag_unusual_transactions
-      - run on preprocessed, pre-dedup data
+[7] flag_unusual_transactions
+      - run on preprocessed, pre-calculation-dedup data
       - flag duplicate rows before they are removed from calculations
       - validate fee rules and reversal rules on a deduped view
       - write unusual.parquet
       |
       v
-[7] branch_after_unusual_flag
-      +-- upload_unusual_to_sheets
-      |     - writes to one unusual worksheet per cluster
+[8] branch_after_unusual_flag
+      +-- unusual outputs
+      |     - persist_unusual_to_db
+      |     - upload_unusual_to_sheets
+      |     - notify_unusual_telegram when unusual rows exist
       |
       +-- downstream_processing_branch
             - deduplicate rows for calculations/details
             - export QRISDUWIT and REVERSAL detail rows
-            - remove reversal rows excluded from summary
+            - remove reversal/fee rows excluded from summary
             - summarize and upload the daily summary block
 ```
 
-`dry_run=true` still runs validation, integrity checks, unusual detection, relabeling, and summary generation. Google Sheets uploads are skipped.
+`dry_run=true` still runs validation, integrity checks, relabeling, unusual
+detection, calculation deduplication, detail filtering, and summary generation.
+Production side effects are skipped: Postgres writes, Google Sheets uploads,
+and Telegram alerts.
 
 ---
 
@@ -66,15 +81,16 @@ Upload CSV/XLS/XLSX
 
 ```text
 kestra-mmpp-pipeline/
+├── AGENTS.md                # Architecture and editing guide for coding agents
 ├── pipeline.py              # Kestra compatibility shim: re-exports finpay_pipeline
 ├── pipeline_refactored.py   # Backward-compatible shim for older local imports
 ├── finpay_pipeline/         # Split Python implementation modules
 ├── finpay_pipeline.yml      # Kestra flow definition
-├── Dockerfile               # Builds finpay-pipeline:3.11 and copies Python runtime files into /app
+├── Dockerfile               # Builds finpay-pipeline:3.11
 ├── docker-compose.yml       # Kestra + PostgreSQL + pgAdmin local stack
 ├── requirements.txt         # Python dependencies for the Docker image
+├── tests/                   # Regression tests for refactor contracts
 ├── README.md
-├── LLM_CONTEXT.md           # Code/module map for future LLM-assisted changes
 ├── .gitignore
 ├── .env.example             # Safe local environment template
 ├── .env                     # Local Docker Compose env file, ignored by git
@@ -89,10 +105,13 @@ kestra-mmpp-pipeline/
 
 - Docker and Docker Compose
 - A GCP service account with Google Sheets API and Google Drive API enabled
-- The service account shared as Editor on the target spreadsheet
+- The service account shared as Editor on the target spreadsheet, unless the
+  pipeline should create the spreadsheet itself
 - The local Docker image `finpay-pipeline:3.11`
 - A Kestra secret named `GCP_SA_KEY` containing the full service-account JSON
-- Optional Telegram alerting secrets: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
+- FinPay database Kestra secrets
+- Optional Telegram alerting secrets: `TELEGRAM_BOT_TOKEN` and
+  `TELEGRAM_CHAT_ID`
 
 ---
 
@@ -138,15 +157,11 @@ Kestra UI:
 http://localhost:8080
 ```
 
-Use the Kestra basic-auth credentials configured in `.env`.
-
 FinPay pgAdmin UI:
 
 ```text
 http://localhost:5050
 ```
-
-Use the pgAdmin credentials configured in `.env`.
 
 Register the FinPay database server in pgAdmin with:
 
@@ -166,9 +181,11 @@ From the host machine, FinPay Postgres is exposed at `localhost:5433`.
 docker build -t finpay-pipeline:3.11 .
 ```
 
-The image installs `requirements.txt`, including `psycopg`, and copies `pipeline.py`, `pipeline_refactored.py`, and the `finpay_pipeline/` package into `/app`. Kestra tasks continue to import through `from pipeline import ...`.
+The image installs `requirements.txt`, including `psycopg`, and copies
+`pipeline.py`, `pipeline_refactored.py`, and the `finpay_pipeline/` package
+into `/app`. Kestra tasks continue to import through `from pipeline import ...`.
 
-### 4. Configure Google Sheets credentials
+### 4. Configure Kestra secrets
 
 Create a Kestra secret named:
 
@@ -176,19 +193,14 @@ Create a Kestra secret named:
 GCP_SA_KEY
 ```
 
-The value must be the full JSON body of the GCP service account key. Keep local env/secret files out of git; `.env_encoded` is already ignored.
+The value must be the full JSON body of the GCP service account key. Keep local
+env/secret files out of git; `.env_encoded` is already ignored.
 
-For the local open-source Docker Compose setup, `.env_encoded` must store the base64-encoded value with Kestra's environment prefix:
+For the local open-source Docker Compose setup, `.env_encoded` must store
+base64-encoded values with Kestra's environment secret prefix:
 
 ```text
 SECRET_GCP_SA_KEY=<base64-encoded-service-account-json>
-```
-
-The flow still references it as `{{ secret('GCP_SA_KEY') }}`. Do not include the `SECRET_` prefix inside `secret(...)`; the prefix is only used in the environment variable name.
-
-The same pattern is used for FinPay database and Google Sheets workflow values:
-
-```text
 SECRET_FINPAY_DB_HOST=<base64-encoded-value>
 SECRET_FINPAY_DB_PORT=<base64-encoded-value>
 SECRET_FINPAY_DB_NAME=<base64-encoded-value>
@@ -201,23 +213,100 @@ SECRET_FINPAY_PROTECTION_EDITOR_EMAILS=<base64-encoded-value>
 SECRET_FINPAY_MANDIRI_EDITOR_EMAILS=<base64-encoded-value>
 ```
 
-### 3b. Configure Telegram unusual-row alerts
+Do not include the `SECRET_` prefix inside `secret(...)`; the prefix is only
+used in the environment variable name.
 
-Telegram alerts are sent only when `dry_run=false` and `flag_unuduplicated, "QRISDUWIT", include_disbursement_date=True)
-reversal = prepare_reversal_detail_export(deduplicated)
-summary = summarize_by_transaction(summary_ready)
-print({
-    "rows": len(integrity_checked),
-    "preprocessed_rows": len(preprocessed),
-    "deduplicated_rows": len(deduplicated),
-    "reversal_unusual_rows": len(reversal_unusual),
-    "summary_ready_rows": len(summary_ready),
-    "unusual_rows": len(unusual),
-    "qrisduwit_rows": len(qrisduwit),
-    "reversal_rows": len(reversal),
-    "summary_rows": len(summary),
-})
-PY
+### 5. Configure Telegram alerts
+
+Telegram alerts are optional. They are sent only when `dry_run=false` and
+`flag_unusual_transactions` reports one or more unusual rows.
+
+Add these secrets only if Telegram alerts should run:
+
+```text
+SECRET_TELEGRAM_BOT_TOKEN=<base64-encoded-value>
+SECRET_TELEGRAM_CHAT_ID=<base64-encoded-value>
+```
+
+---
+
+## Outputs
+
+### Postgres tables
+
+Production runs replace the current `cluster_id + report_date` batch in each
+pipeline-owned table:
+
+| Table | Source |
+|---|---|
+| `finpay_raw_transactions` | `integrity_checked.parquet` |
+| `finpay_unusual_transactions` | `unusual.parquet` |
+| `finpay_qrisduwit_transactions` | `qrisduwit.parquet` |
+| `finpay_reversal_transactions` | `reversal.parquet` |
+| `finpay_transactions` | `summary_ready.parquet` |
+
+`finpay_transactions` contains only rows included in summary calculations.
+Excluded unusual rows are not written there.
+
+### Google Sheets
+
+Target spreadsheet name from current cluster config: `FINPAY REPORT`.
+
+Each configured cluster uses stable worksheet names:
+
+```text
+<base worksheet>
+<base worksheet> - Unusual
+<base worksheet> - QRISDUWIT
+<base worksheet> - Reversal
+```
+
+All sheet writers now use the shared
+`open_or_create_finpay_spreadsheet(...)` path. If the target spreadsheet is
+missing, the service account creates it and attempts to apply locale,
+timezone, sharing, and protection settings.
+
+The summary worksheet uses:
+
+- columns `A:F` for FinPay cash flow
+- column `G` as a spacer
+- columns `H:K` for a compact invoice report panel
+
+Detail and unusual sheets replace existing rows for the same report date on
+rerun. Literal text cells are uppercased before writing; formulas and numeric
+values are preserved. QRISDUWIT, Reversal, and Unusual sheets use zebra-striped
+data rows for readability.
+
+---
+
+## Development Checks
+
+Run syntax checks after editing Python:
+
+```bash
+python3 -m compileall -q pipeline.py pipeline_refactored.py finpay_pipeline tests
+```
+
+Run the regression tests in an environment with `requirements.txt` installed:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+In a bare host interpreter without project dependencies, tests that import
+`pandas`/`gspread` may skip. The Docker image or a local virtualenv with
+`requirements.txt` is the expected runtime environment.
+
+Check whitespace before committing:
+
+```bash
+git diff --check
+```
+
+When dependencies or Docker-copied source files change, rebuild:
+
+```bash
+docker build -t finpay-pipeline:3.11 .
 ```
 
 ---
@@ -240,14 +329,28 @@ PY
 
 ## Design Notes
 
-- Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets logic lives in `finpay_pipeline/`.
-- The summary worksheet is stable per cluster and continues across month boundaries.
-- The starting balance date is the last day of the previous month, computed at runtime.
-- Deduplication compares all columns except `No`, and normalizes `Transaction Date` to minute precision for duplicate detection.
-- Transaction relabeling runs before unusual detection, calculation deduplication, detail exports, and summary aggregation.
-- Postgres `raw_transaction_label` and `processed_transaction_label` values are stored lowercase.
-- Sheet writes run sequentially after unusual detection to reduce Google Sheets rate-limit pressure.
-- Google Sheets writes uppercase literal text cells while preserving formulas and numeric values.
-- Parquet files are used between Kestra tasks to avoid passing large datasets through variables.
+- Orchestration lives in `finpay_pipeline.yml`; reusable data and Google Sheets
+  logic lives in `finpay_pipeline/`.
+- `pipeline.py` keeps the Kestra import contract stable. Do not remove it
+  unless every workflow import changes.
+- `pipeline_refactored.py` remains for older local scripts/notebooks.
+- The summary worksheet is stable per cluster and continues across month
+  boundaries.
+- Deduplication compares all columns except `No`, and normalizes
+  `Transaction Date` to minute precision for duplicate detection.
+- Transaction relabeling runs once in `preprocess_transaction_labels`.
+  Downstream reversal summary/detail helpers trust `processed_transaction_label`
+  when present and keep a fallback for raw legacy callers.
+- Unusual detection intentionally runs before calculation dedup so duplicate
+  rows can still be reported.
+- Later summary-only unusual checks are not appended to the unusual sheet.
+- ST reversal categories are intentionally unusual/excluded and are not
+  summarized.
+- Postgres `raw_transaction_label` and `processed_transaction_label` values are
+  stored lowercase.
+- Sheet writes run sequentially after unusual detection to reduce Google Sheets
+  rate-limit pressure.
+- Parquet files are used between Kestra tasks to avoid passing large datasets
+  through variables.
 - Google Sheets footer totals are live formulas, not Python-computed totals.
-- Dry runs execute all compute steps and skip only Google Sheets writes.
+- Agent-specific architecture notes live in `AGENTS.md`.

@@ -26,6 +26,7 @@ REVERSAL_ST_PLATFORM_FEE_REMARK = 'platform fee sellthru rp. 100,-'
 REVERSAL_ST_TRANSACTION_FEE_REMARK = 'fee transaksi sellthru sejumlah 100 rupiah'
 REVERSAL_ST_SALES_HOLD_REMARK = 'sales hold transaksi sellthru'
 REVERSAL_ST_UNSUPPORTED_REASON = 'unsupported reversal ST category'
+PROCESSED_TRANSACTION_LABEL_COLUMN = 'processed_transaction_label'
 
 # Transaction group validation rules. A group is keyed by Transaction ID with
 # fee suffixes removed, then the main transaction determines the required rows.
@@ -536,6 +537,20 @@ def relabel_reversal_transactions(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def ensure_reversal_labels_prepared(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return rows whose reversal labels are ready for summary/detail consumers.
+
+    The Kestra flow preprocesses labels once and carries
+    processed_transaction_label downstream. For that normal path, trust the
+    prepared labels and avoid running the remark classifier again. External
+    callers that pass raw legacy data still get the original relabel behavior.
+    """
+    if PROCESSED_TRANSACTION_LABEL_COLUMN in df.columns:
+        return df.copy()
+    return relabel_reversal_transactions(df)
+
+
 def preprocess_transaction_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
     Apply all transaction relabeling before unusual detection and downstream
@@ -658,13 +673,13 @@ def prepare_reversal_summary_transactions(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Relabel REVERSAL rows for summary and return unusual summary rows.
+    Prepare reversal labels for summary and return unusual summary rows.
 
     Invalid NGRS, Recharge Out Cluster, and Recharge-type fee-only groups stay
     in the summary but are flagged. ST, ambiguous, or unclassified groups are
     flagged and excluded.
     """
-    result = relabel_reversal_transactions(df)
+    result = ensure_reversal_labels_prepared(df)
     fee_cap_unusual_df, fee_cap_excluded_indices = (
         _collect_fee_cap_excess_transactions(result)
     )
