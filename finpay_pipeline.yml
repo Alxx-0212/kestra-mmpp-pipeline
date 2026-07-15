@@ -999,6 +999,7 @@ tasks:
                       maxAttempts: 3
                     inputFiles:
                       summary.parquet: "{{ outputs.summarize.outputFiles['summary.parquet'] }}"
+                      qrisduwit.parquet: "{{ outputs.filter_qrisduwit_rows.outputFiles['qrisduwit.parquet'] }}"
                     env:
                       TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
                       TARGET_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_worksheet }}"
@@ -1028,6 +1029,7 @@ tasks:
                               sa_key_path = f.name
 
                           summary_df = pd.read_parquet("summary.parquet")
+                          qrisduwit_df = pd.read_parquet("qrisduwit.parquet")
                           client     = make_gspread_client(sa_key_path)
 
                           insert_row, block_end = process_daily_upload(
@@ -1037,6 +1039,7 @@ tasks:
                               starting_balance_date=os.environ["STARTING_BALANCE_DATE"],
                               default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
                               gspread_client=client,
+                              qrisduwit_df=qrisduwit_df,
                           )
 
                           print(f"✅ Written to sheet rows {insert_row}–{block_end}.")

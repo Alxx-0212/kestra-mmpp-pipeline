@@ -270,7 +270,8 @@ The summary worksheet uses:
 
 - columns `A:F` for FinPay cash flow
 - column `G` as a spacer
-- columns `H:K` for a compact invoice report panel
+- columns `H:K` for a compact invoice report panel with Cash In - NGRS,
+  QRISDUWIT disbursement-date subrows, Sellthru, and Accounting mini-tables
 
 Detail and unusual sheets replace existing rows for the same report date on
 rerun. Literal text cells are uppercased before writing; formulas and numeric

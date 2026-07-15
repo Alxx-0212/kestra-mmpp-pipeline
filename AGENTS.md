@@ -87,7 +87,7 @@ uploaded file
 -> prepare_summary_transactions -> summary_ready.parquet
 -> persist_transactions_to_db -> finpay_transactions
 -> summarize -> summary.parquet
--> upload_to_sheets
+-> upload_to_sheets (summary.parquet + qrisduwit.parquet)
 ```
 
 Important ordering:
@@ -275,31 +275,51 @@ Daily cash-flow sections are written in columns `A:F` in this order:
 2. `MANDIRI`
 3. `Cash`
 
-Invoice reports are written as one compact panel in columns `H:K`, starting
-three rows after the first `DETAIL` row:
+Invoice reports are written as one compact panel in columns `H:K`, starting on
+the same row as the first `DETAIL` row:
 
 - Column `H` repeats the invoice report date for filterability.
-- `CASH IN` is the first mini-table.
-- `ACCOUNTING` is the second mini-table below it.
+- `CASH IN - NGRS` is the first mini-table.
+- QRISDUWIT disbursement-date rows are a subpart inside
+  `CASH IN - NGRS`, not a separate mini-table.
+- `SELLTHRU` is below Cash In.
+- `ACCOUNTING` is the final mini-table.
 - Invoice header and data rows stay unmerged so date filtering still works.
 - Contiguous fully blank invoice-side `H:K` blocks are merged vertically and
   bordered as blank space.
 - The opening balance/saldo initialization row is not merged in the invoice
   area; invoice-side merges are limited to inserted daily date blocks.
 
-Cash In report rows:
+Cash In / Invoice NGRS report rows:
 
 - `NGRS`
 - `Recharge Fee`
 - `Pembelian Recharge Out Cluster`
 - `Expected Biaya Pembelian Recharge Out Cluster FEE`
-- `QRISDUWIT`
+- `QRISDUWIT` parent row when QRISDUWIT rows exist
+
+QRISDUWIT Cash In subrows:
+
+- One row per `DISBURSEMENT DATE`, sorted ascending.
+- The row label is `QRISDUWIT - <DISBURSEMENT DATE>`.
+- Column `J` uses the grouped source `KREDIT` amount as invoice debit from
+  the company perspective; column `K` is blank.
+- Missing/blank disbursement dates are grouped under
+  `QRISDUWIT - MISSING DISBURSEMENT DATE`.
+- The `QRISDUWIT` parent row uses the same fill, bold text, and centered
+  alignment as the `CASH IN - NGRS` header row.
 
 Additional rows currently live at the bottom of the `DETAIL` section:
 
 - `Jumlah Pembelian Recharge Out Cluster`
 - `Expected Biaya Pembelian Recharge Out Cluster FEE`
 - `Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER`
+
+Sellthru rows:
+
+- `ST`
+- `BIAYA FEE ST`
+- `BIAYA FEE BAR A. ST`
 
 Accounting rows:
 
@@ -309,9 +329,6 @@ Accounting rows:
 - `Recharge Out Cluster FEE`
 - `Reversal - Recharge Out Cluster`
 - `Reversal - Recharge Out Cluster FEE`
-- `ST`
-- `BIAYA FEE ST`
-- `BIAYA FEE BAR A. ST`
 
 `Jumlah Pembelian Recharge Out Cluster` and
 `Jumlah Reversal - PEMBELIAN RECHARGE OUT CLUSTER` are counts. The matching
@@ -348,11 +365,13 @@ Protection leaves only Mandiri input cells editable unless
 - Summary `DETAIL` rows use subtle alternating row backgrounds. On the first
   detail row, `A:B` uses the stronger section header fill while `C:F` keeps the
   light stripe.
-- Summary sheet keeps strong top borders for the full row at starts of
-  `DETAIL`, `MANDIRI`, and the invoice report columns.
+- Summary sheet keeps strong top borders at starts of `DETAIL` and `MANDIRI`.
+  The `DETAIL` start border is reapplied on both cash-flow columns `A:F` and
+  invoice columns `H:K` because later appends can otherwise weaken the invoice
+  report top edge.
 - Each summary append reapplies strong top borders for current and existing
-  daily `DETAIL` starts plus their invoice-side starts, because normal grid
-  borders on later appends can otherwise overwrite the first block's top border.
+  daily `DETAIL` starts, because normal grid borders on later appends can
+  otherwise overwrite the first block's top border.
 - `Cash` section start intentionally has no full-row strong top border.
 - `Total` and `SELISIH` strong top borders apply only to column `D`.
 - QRISDUWIT, Reversal, and Unusual sheets keep a strong top border on the first

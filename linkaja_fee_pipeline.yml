@@ -1,0 +1,131 @@
+id: linkaja_fee_pipeline_v1
+namespace: finance.linkaja
+
+inputs:
+  - id: source_file
+    type: FILE
+    displayName: "LinkAja CSV or XLSX file"
+    description: "Upload one LinkAja export for one cluster. Filename should be laporan-<cluster_id>-....csv|xlsx when possible."
+    required: true
+
+  - id: dry_run
+    type: BOOLEAN
+    displayName: "Dry run?"
+    description: "true → validate and summarize only. false → append/replace rows in Google Sheets."
+    defaults: false
+
+variables:
+  target_spreadsheet: "Salinan dari MONITORING FINPAY"
+  target_worksheet: "LinkAja"
+
+tasks:
+  - id: process_linkaja_fee_file
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: linkaja-fee-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT5M
+    inputFiles:
+      source_file: "{{ inputs.source_file }}"
+    outputFiles:
+      - linkaja_fees.json
+    env:
+      ORIGINAL_FILE_PATH: "{{ inputs.source_file }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+    script: |
+      import os
+      import sys
+      from kestra import Kestra
+
+      sys.path.insert(0, "/app")
+      from linkaja_pipeline import aggregate_linkaja_fee_file, write_linkaja_fee_json
+
+      original_file_path = os.environ.get("ORIGINAL_FILE_PATH", "source_file")
+
+      try:
+          summary = aggregate_linkaja_fee_file(
+              "source_file",
+              filename_hint=os.path.basename(original_file_path),
+          )
+      except Exception as exc:
+          print(f"❌ LinkAja fee processing failed: {exc}", file=sys.stderr)
+          sys.exit(1)
+
+      write_linkaja_fee_json(summary, "linkaja_fees.json")
+
+      print(f"📄 Source file : {summary.source_file}")
+      print(f"🗂  Cluster     : {summary.cluster_id}")
+      print(f"📅 Dates       : {', '.join(summary.report_dates)}")
+      print(f"📊 Output rows : {len(summary.rows)}")
+      if os.environ.get("DRY_RUN", "false").lower() == "true":
+          print("⚠️  DRY RUN — Google Sheets upload will be skipped.")
+      for row in summary.rows:
+          print(row)
+
+      Kestra.outputs({
+          "cluster_id": summary.cluster_id,
+          "source_file": summary.source_file,
+          "source_rows": summary.source_rows,
+          "report_dates": summary.report_dates,
+          "rows": len(summary.rows),
+      })
+
+  - id: upload_linkaja_fees_to_sheets
+    type: io.kestra.plugin.scripts.python.Script
+    runIf: "{{ inputs.dry_run == false }}"
+    containerImage: linkaja-fee-pipeline:3.11
+    pythonVersion: "3.11"
+    timeout: PT10M
+    retry:
+      type: exponential
+      interval: PT15S
+      maxInterval: PT60S
+      maxAttempts: 3
+    inputFiles:
+      linkaja_fees.json: "{{ outputs.process_linkaja_fee_file.outputFiles['linkaja_fees.json'] }}"
+    env:
+      TARGET_SPREADSHEET: "{{ vars.target_spreadsheet }}"
+      TARGET_WORKSHEET: "{{ vars.target_worksheet }}"
+      FINPAY_PROTECTION_EDITOR_EMAILS: "{{ secret('FINPAY_PROTECTION_EDITOR_EMAILS') }}"
+      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+    script: |
+      import os
+      import sys
+      import tempfile
+      from kestra import Kestra
+
+      sys.path.insert(0, "/app")
+      from linkaja_pipeline import (
+          load_linkaja_fee_json,
+          make_gspread_client,
+          process_linkaja_fee_sheet_upload,
+      )
+
+      service_account_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+      if not service_account_json or service_account_json.strip() == "{}":
+          print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
+          sys.exit(1)
+
+      service_account_path = None
+      try:
+          with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+              handle.write(service_account_json)
+              service_account_path = handle.name
+
+          payload = load_linkaja_fee_json("linkaja_fees.json")
+          client = make_gspread_client(service_account_path)
+          result = process_linkaja_fee_sheet_upload(
+              target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+              target_worksheet=os.environ["TARGET_WORKSHEET"],
+              rows=payload["rows"],
+              gspread_client=client,
+          )
+
+          print(
+              "✅ LinkAja fees uploaded to "
+              f"{os.environ['TARGET_SPREADSHEET']} / {os.environ['TARGET_WORKSHEET']}: "
+              f"{result}"
+          )
+          Kestra.outputs(result)
+      finally:
+          if service_account_path and os.path.exists(service_account_path):
+              os.unlink(service_account_path)

@@ -3,11 +3,17 @@ from unittest.mock import Mock, patch
 
 try:
     import pandas as pd
-    from finpay_pipeline import classification, detail_exports, unusual_sheets
+    from finpay_pipeline import (
+        classification,
+        detail_exports,
+        summary_sheets,
+        unusual_sheets,
+    )
 except ModuleNotFoundError as exc:
     pd = None
     classification = None
     detail_exports = None
+    summary_sheets = None
     unusual_sheets = None
     RUNTIME_IMPORT_ERROR = exc
 else:
@@ -138,6 +144,75 @@ class SharedSpreadsheetOpenContractTest(unittest.TestCase):
 
         self.assertTrue(result)
         opener.assert_called_once()
+
+
+@requires_runtime_dependencies
+class QrisduwitInvoiceRowsContractTest(unittest.TestCase):
+    def test_qrisduwit_invoice_rows_group_by_disbursement_date(self):
+        rows = summary_sheets._build_qrisduwit_invoice_rows(pd.DataFrame({
+            "Disbursement Date": ["05/06/2026", "04/06/2026", "04/06/2026"],
+            "Kredit": [200, 100, 50],
+        }))
+
+        self.assertEqual(rows, [
+            ("QRISDUWIT - 04/06/2026", 150, ""),
+            ("QRISDUWIT - 05/06/2026", 200, ""),
+        ])
+
+    def test_qrisduwit_invoice_rows_group_missing_disbursement_date(self):
+        rows = summary_sheets._build_qrisduwit_invoice_rows(pd.DataFrame({
+            "Disbursement Date": ["", None],
+            "Kredit": [100, 25],
+        }))
+
+        self.assertEqual(rows, [
+            ("QRISDUWIT - MISSING DISBURSEMENT DATE", 125, ""),
+        ])
+
+    def test_qrisduwit_invoice_rows_allow_missing_optional_dataframe(self):
+        self.assertEqual(summary_sheets._build_qrisduwit_invoice_rows(None), [])
+
+    def test_qrisduwit_invoice_rows_embed_under_cash_parent(self):
+        rows = summary_sheets._cash_invoice_rows_with_qrisduwit(
+            [("NGRS", "=D1", "")],
+            [("QRISDUWIT - 04/06/2026", 150, "")],
+        )
+
+        self.assertEqual(rows, [
+            ("NGRS", "=D1", ""),
+            ("QRISDUWIT", "", ""),
+            ("QRISDUWIT - 04/06/2026", 150, ""),
+        ])
+
+    def test_linkaja_fee_invoice_rows_use_static_cluster_columns(self):
+        rows = summary_sheets._build_linkaja_fee_invoice_rows("PKY", "01/07/2026")
+
+        self.assertEqual(rows[0][0], "LINKAJA EXPECTED RECHARGE OUT CLUSTER FEE")
+        self.assertEqual(rows[0][1], "")
+        self.assertIn("'LinkAja'!L:L", rows[0][2])
+        self.assertIn("'LinkAja'!K:K", rows[0][2])
+        self.assertIn('"01/07/2026"', rows[0][2])
+        self.assertEqual(rows[1][0], "LINKAJA DIGIPOS B2B TRANSFER IN CLUSTER FEE")
+        self.assertEqual(rows[1][1], "")
+        self.assertIn("'LinkAja'!M:M", rows[1][2])
+        self.assertIn("'LinkAja'!K:K", rows[1][2])
+
+    def test_linkaja_fee_invoice_rows_are_before_qrisduwit_rows(self):
+        cash_rows = [
+            ("NGRS", "=D1", ""),
+            *summary_sheets._build_linkaja_fee_invoice_rows("TDR", "01/07/2026"),
+        ]
+        rows = summary_sheets._cash_invoice_rows_with_qrisduwit(
+            cash_rows,
+            [("QRISDUWIT - 04/06/2026", 150, "")],
+        )
+
+        labels = [row[0] for row in rows]
+        self.assertEqual(labels[-2:], ["QRISDUWIT", "QRISDUWIT - 04/06/2026"])
+        self.assertLess(
+            labels.index("LINKAJA DIGIPOS B2B TRANSFER IN CLUSTER FEE"),
+            labels.index("QRISDUWIT"),
+        )
 
 
 if __name__ == "__main__":

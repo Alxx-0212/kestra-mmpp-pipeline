@@ -26,6 +26,19 @@ from .sheets_common import (
 )
 
 
+LINKAJA_FEE_SHEET_NAME = "LinkAja"
+LINKAJA_FEE_COLUMNS_BY_WORKSHEET = {
+    "MRT": ("A", "B", "C"),
+    "TDR": ("F", "G", "H"),
+    "PKY": ("K", "L", "M"),
+    "BGI": ("P", "Q", "R"),
+    "MRW": ("U", "V", "W"),
+    "TNT": ("Z", "AA", "AB"),
+}
+LINKAJA_EXPECTED_FEE_LABEL = "LINKAJA EXPECTED RECHARGE OUT CLUSTER FEE"
+LINKAJA_IN_CLUSTER_FEE_LABEL = "LINKAJA DIGIPOS B2B TRANSFER IN CLUSTER FEE"
+
+
 def setup_initial_headers_and_saldo(
     gspread_client,
     target_spreadsheet: str,
@@ -109,6 +122,116 @@ def setup_initial_headers_and_saldo(
         sh.batch_update({"requests": requests})
 
 
+def _build_qrisduwit_invoice_rows(
+    qrisduwit_df: pd.DataFrame | None,
+) -> list[tuple[str, int | float, str]]:
+    if qrisduwit_df is None or qrisduwit_df.empty:
+        return []
+    if "Kredit" not in qrisduwit_df.columns:
+        raise KeyError("Kredit column is required for QRISDUWIT invoice rows.")
+
+    if "Disbursement Date" in qrisduwit_df.columns:
+        disbursement_values = qrisduwit_df["Disbursement Date"]
+    else:
+        disbursement_values = pd.Series(
+            [""] * len(qrisduwit_df),
+            index=qrisduwit_df.index,
+        )
+
+    labels = []
+    label_sort_keys = {}
+    missing_label = "MISSING DISBURSEMENT DATE"
+    for value in disbursement_values:
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            label = missing_label
+            sort_key = (2, "")
+        else:
+            text = str(value).strip()
+            parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+            if not text or pd.isna(parsed):
+                label = missing_label if not text else text
+                sort_key = (2, label) if label == missing_label else (1, label)
+            else:
+                label = parsed.strftime("%d/%m/%Y")
+                sort_key = (0, parsed.date())
+        labels.append(label)
+        label_sort_keys.setdefault(label, sort_key)
+
+    amounts = pd.to_numeric(qrisduwit_df["Kredit"], errors="coerce").fillna(0)
+    grouped = amounts.groupby(pd.Series(labels, index=qrisduwit_df.index)).sum()
+    rows = []
+    for label in sorted(grouped.index, key=lambda item: label_sort_keys[item]):
+        amount = float(grouped[label])
+        amount_cell = int(amount) if amount.is_integer() else amount
+        rows.append((f"QRISDUWIT - {label}", amount_cell, ""))
+    return rows
+
+
+def _cash_invoice_rows_with_qrisduwit(
+    cash_report_rows: list[tuple],
+    qrisduwit_report_rows: list[tuple[str, int | float, str]],
+) -> list[tuple]:
+    rows = list(cash_report_rows)
+    if qrisduwit_report_rows:
+        rows.append(("QRISDUWIT", "", ""))
+        rows.extend(qrisduwit_report_rows)
+    return rows
+
+
+def _quoted_sheet_name(sheet_name: str) -> str:
+    return "'" + sheet_name.replace("'", "''") + "'"
+
+
+def _linkaja_fee_lookup_formula(
+    target_worksheet: str,
+    formatted_date: str,
+    fee_type: str,
+) -> str:
+    worksheet_key = target_worksheet.strip().upper()
+    if worksheet_key not in LINKAJA_FEE_COLUMNS_BY_WORKSHEET:
+        known = ", ".join(LINKAJA_FEE_COLUMNS_BY_WORKSHEET)
+        raise KeyError(
+            f"No static LinkAja fee columns configured for worksheet "
+            f"{target_worksheet!r}. Expected one of: {known}"
+        )
+
+    date_column, expected_fee_column, in_cluster_fee_column = (
+        LINKAJA_FEE_COLUMNS_BY_WORKSHEET[worksheet_key]
+    )
+    if fee_type == "expected":
+        value_column = expected_fee_column
+    elif fee_type == "in_cluster":
+        value_column = in_cluster_fee_column
+    else:
+        raise ValueError(f"Unknown LinkAja fee type: {fee_type!r}")
+
+    sheet_name = _quoted_sheet_name(LINKAJA_FEE_SHEET_NAME)
+    return (
+        f'=IFERROR(SUM(FILTER({sheet_name}!{value_column}:{value_column},'
+        f'({sheet_name}!{date_column}:{date_column}="{formatted_date}")+'
+        f'(IFERROR(TEXT({sheet_name}!{date_column}:{date_column},"dd/mm/yyyy"),"")="{formatted_date}")'
+        ")),0)"
+    )
+
+
+def _build_linkaja_fee_invoice_rows(
+    target_worksheet: str,
+    formatted_date: str,
+) -> list[tuple[str, str, str]]:
+    return [
+        (
+            LINKAJA_EXPECTED_FEE_LABEL,
+            "",
+            _linkaja_fee_lookup_formula(target_worksheet, formatted_date, "expected"),
+        ),
+        (
+            LINKAJA_IN_CLUSTER_FEE_LABEL,
+            "",
+            _linkaja_fee_lookup_formula(target_worksheet, formatted_date, "in_cluster"),
+        ),
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4b  append daily block
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,6 +241,7 @@ def append_daily_to_gsheet(
     target_spreadsheet: str,
     target_worksheet: str,
     summary_df: pd.DataFrame,
+    qrisduwit_df: pd.DataFrame | None = None,
 ) -> tuple[int | None, int | None]:
     """
     Returns (insert_row, block_end) on success.
@@ -141,6 +265,8 @@ def append_daily_to_gsheet(
     COL_DETAIL_ALT = {"red": 0.965, "green": 0.980, "blue": 0.992}
     COL_CASH_HEADER = {"red": 0.820, "green": 0.910, "blue": 0.800}
     COL_CASH_BODY = {"red": 0.925, "green": 0.973, "blue": 0.910}
+    COL_SELLTHRU_HEADER = {"red": 0.860, "green": 0.895, "blue": 1.000}
+    COL_SELLTHRU_BODY = {"red": 0.940, "green": 0.955, "blue": 1.000}
     COL_ACCOUNTING_HEADER = {"red": 0.980, "green": 0.900, "blue": 0.700}
     COL_ACCOUNTING_BODY = {"red": 1.000, "green": 0.965, "blue": 0.840}
     COL_TABLE_BORDER = {"red": 0.650, "green": 0.700, "blue": 0.750}
@@ -149,6 +275,7 @@ def append_daily_to_gsheet(
     COL_FOOTER_BODY = {"red": 0.900, "green": 0.940, "blue": 0.980}
     COL_INPUT = COL_STATUS
     COL_MUTED_TEXT = {"red": 0.420, "green": 0.420, "blue": 0.420}
+    INVOICE_DETAIL_START_OFFSET = 0
 
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
     ws = sh.worksheet(target_worksheet)
@@ -333,20 +460,6 @@ def append_daily_to_gsheet(
                 style="SOLID_MEDIUM",
                 color=COL_HEADER,
             ))
-
-            invoice_table_row = row + 3
-            if invoice_table_row <= max_row:
-                requests.extend(_horizontal_border_requests(
-                    ws,
-                    invoice_table_row,
-                    invoice_table_row,
-                    8,
-                    11,
-                    top=True,
-                    bottom=False,
-                    style="SOLID_MEDIUM",
-                    color=COL_HEADER,
-                ))
         return requests
 
     def _existing_mandiri_cells(values: list[list[str]]) -> list[tuple[int, int]]:
@@ -640,7 +753,23 @@ def append_daily_to_gsheet(
                 )
             ),
         ),
-        ("QRISDUWIT", *_split_net_formula(_detail_net_formula("QRISDUWIT"))),
+    ]
+    cash_report_rows.extend(
+        _build_linkaja_fee_invoice_rows(target_worksheet, formatted_date)
+    )
+    qrisduwit_report_rows = _build_qrisduwit_invoice_rows(qrisduwit_df)
+    cash_report_rows = _cash_invoice_rows_with_qrisduwit(
+        cash_report_rows,
+        qrisduwit_report_rows,
+    )
+
+    sellthru_report_rows = [
+        ("ST", *_split_net_formula(_detail_net_formula("SELLTHRU"))),
+        ("BIAYA FEE ST", *_split_net_formula(_detail_net_formula("SELLTHRUFEE"))),
+        (
+            "BIAYA FEE BAR A. ST",
+            *_split_net_formula(_detail_net_formula("SELLTHRUSALESFEE")),
+        ),
     ]
 
     accounting_report_rows = [
@@ -666,21 +795,38 @@ def append_daily_to_gsheet(
                 _detail_net_formula(REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY)
             ),
         ),
-        ("ST", *_split_net_formula(_detail_net_formula("SELLTHRU"))),
-        ("BIAYA FEE ST", *_split_net_formula(_detail_net_formula("SELLTHRUFEE"))),
-        (
-            "BIAYA FEE BAR A. ST",
-            *_split_net_formula(_detail_net_formula("SELLTHRUSALESFEE")),
-        ),
     ]
 
-    invoice_rows = [
-        [formatted_date, "CASH IN", "", ""],
-        *[[formatted_date, *row] for row in cash_report_rows],
-        ["", "", "", ""],
-        [formatted_date, "ACCOUNTING", "", ""],
-        *[[formatted_date, *row] for row in accounting_report_rows],
+    invoice_sections = [
+        {
+            "title": "CASH IN - NGRS",
+            "rows": cash_report_rows,
+            "header_color": COL_CASH_HEADER,
+            "body_color": COL_CASH_BODY,
+        },
     ]
+    invoice_sections.extend([
+        {
+            "title": "SELLTHRU",
+            "rows": sellthru_report_rows,
+            "header_color": COL_SELLTHRU_HEADER,
+            "body_color": COL_SELLTHRU_BODY,
+        },
+        {
+            "title": "ACCOUNTING",
+            "rows": accounting_report_rows,
+            "header_color": COL_ACCOUNTING_HEADER,
+            "body_color": COL_ACCOUNTING_BODY,
+        },
+    ])
+    invoice_rows = []
+    for section_index, section in enumerate(invoice_sections):
+        invoice_rows.append([formatted_date, section["title"], "", ""])
+        invoice_rows.extend(
+            [formatted_date, *row] for row in section["rows"]
+        )
+        if section_index < len(invoice_sections) - 1:
+            invoice_rows.append(["", "", "", ""])
 
     footer_start = r
     footer_formulas = [
@@ -823,7 +969,12 @@ def append_daily_to_gsheet(
     )
     reconciliation_end = r
     cash_flow_rows = rows_to_append
-    invoice_start = detail_start + 3
+    invoice_start = detail_start + INVOICE_DETAIL_START_OFFSET
+    qrisduwit_parent_invoice_row = None
+    if qrisduwit_report_rows:
+        qrisduwit_parent_invoice_row = (
+            invoice_start + 1 + cash_report_rows.index(("QRISDUWIT", "", ""))
+        )
     invoice_offset = invoice_start - insert_row
     block_row_count = max(len(cash_flow_rows), invoice_offset + len(invoice_rows))
     rows_to_append = []
@@ -841,11 +992,23 @@ def append_daily_to_gsheet(
         )
         rows_to_append.append([*left, "", *right])
     block_end = insert_row + len(rows_to_append) - 1
-    cash_invoice_header_row = invoice_start
-    cash_invoice_end = cash_invoice_header_row + len(cash_report_rows)
-    invoice_separator_row = cash_invoice_end + 1
-    accounting_invoice_header_row = cash_invoice_end + 2
-    invoice_end = accounting_invoice_header_row + len(accounting_report_rows)
+    invoice_table_ranges = []
+    invoice_separator_rows = []
+    row_cursor = invoice_start
+    for section_index, section in enumerate(invoice_sections):
+        header_row = row_cursor
+        end_row = header_row + len(section["rows"])
+        invoice_table_ranges.append({
+            "header_row": header_row,
+            "end_row": end_row,
+            "header_color": section["header_color"],
+            "body_color": section["body_color"],
+        })
+        row_cursor = end_row + 1
+        if section_index < len(invoice_sections) - 1:
+            invoice_separator_rows.append(row_cursor)
+            row_cursor += 1
+    invoice_end = row_cursor - 1
     blank_invoice_blocks = _blank_invoice_block_ranges(
         insert_row,
         rows_to_append,
@@ -856,6 +1019,17 @@ def append_daily_to_gsheet(
     blank_invoice_border_requests = _blank_invoice_block_border_requests(
         blank_invoice_blocks,
     )
+    invoice_header_unmerge_requests = []
+    invoice_table_border_requests = []
+    for table in invoice_table_ranges:
+        header_row = table["header_row"]
+        end_row = table["end_row"]
+        invoice_header_unmerge_requests.extend(
+            _unmerge_range_requests(header_row, header_row, 9, 11)
+        )
+        invoice_table_border_requests.extend(
+            _invoice_table_border_requests(header_row, end_row)
+        )
 
     required_rows = max(block_end, next_transfer_range_start)
     if replacement_start:
@@ -929,28 +1103,22 @@ def append_daily_to_gsheet(
     ws.format(f"D{selisih_row}", {"numberFormat": IDR})
     ws.format(f"E{selisih_row}", {"wrapStrategy": "WRAP"})
     if invoice_rows:
-        ws.format(_range(cash_invoice_header_row, cash_invoice_header_row, 8, 11), {
-            "backgroundColor": COL_CASH_HEADER,
-            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-            "horizontalAlignment": "CENTER",
-        })
-        ws.format(_range(cash_invoice_header_row + 1, cash_invoice_end, 8, 11), {
-            "backgroundColor": COL_CASH_BODY,
-        })
-        ws.format(_range(invoice_separator_row, invoice_separator_row, 8, 11), {
-            "backgroundColor": COL_WHITE,
-        })
-        ws.format(
-            _range(accounting_invoice_header_row, accounting_invoice_header_row, 8, 11),
-            {
-                "backgroundColor": COL_ACCOUNTING_HEADER,
+        for table in invoice_table_ranges:
+            header_row = table["header_row"]
+            end_row = table["end_row"]
+            ws.format(_range(header_row, header_row, 8, 11), {
+                "backgroundColor": table["header_color"],
                 "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
                 "horizontalAlignment": "CENTER",
-            },
-        )
-        ws.format(_range(accounting_invoice_header_row + 1, invoice_end, 8, 11), {
-            "backgroundColor": COL_ACCOUNTING_BODY,
-        })
+            })
+            if end_row > header_row:
+                ws.format(_range(header_row + 1, end_row, 8, 11), {
+                    "backgroundColor": table["body_color"],
+                })
+        for separator_row in invoice_separator_rows:
+            ws.format(_range(separator_row, separator_row, 8, 11), {
+                "backgroundColor": COL_WHITE,
+            })
         ws.format(f"I{invoice_start}:I{invoice_end}", {
             "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
             "horizontalAlignment": "LEFT",
@@ -963,8 +1131,22 @@ def append_daily_to_gsheet(
         ws.format(f"J{invoice_start}:K{invoice_end}", {
             "horizontalAlignment": "RIGHT",
         })
-        ws.format(f"I{cash_invoice_header_row}", {"horizontalAlignment": "CENTER"})
-        ws.format(f"I{accounting_invoice_header_row}", {"horizontalAlignment": "CENTER"})
+        for table in invoice_table_ranges:
+            ws.format(f"I{table['header_row']}", {"horizontalAlignment": "CENTER"})
+        if qrisduwit_parent_invoice_row:
+            ws.format(
+                _range(
+                    qrisduwit_parent_invoice_row,
+                    qrisduwit_parent_invoice_row,
+                    8,
+                    11,
+                ),
+                {
+                    "backgroundColor": COL_CASH_HEADER,
+                    "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+                    "horizontalAlignment": "CENTER",
+                },
+            )
     ws.format("A1:F1", {
         "backgroundColor": COL_HEADER,
         "horizontalAlignment": "CENTER",
@@ -1030,13 +1212,7 @@ def append_daily_to_gsheet(
                 "fields": "gridProperties.frozenRowCount",
             }
         },
-        *_unmerge_range_requests(cash_invoice_header_row, cash_invoice_header_row, 9, 11),
-        *_unmerge_range_requests(
-            accounting_invoice_header_row,
-            accounting_invoice_header_row,
-            9,
-            11,
-        ),
+        *invoice_header_unmerge_requests,
         *_unmerge_range_requests(2, 2, 8, 11),
         *blank_invoice_merge_requests,
         *_cell_grid_border_requests(1, 1, 1, 11),
@@ -1063,58 +1239,7 @@ def append_daily_to_gsheet(
                 color=COL_HEADER,
             )
         ],
-        *_horizontal_border_requests(
-            ws,
-            invoice_start,
-            invoice_start,
-            8,
-            11,
-            top=True,
-            bottom=False,
-            style="SOLID_MEDIUM",
-            color=COL_HEADER,
-        ),
-        *_horizontal_border_requests(
-            ws,
-            invoice_start,
-            invoice_start,
-            8,
-            11,
-            top=False,
-            bottom=True,
-            style="SOLID_MEDIUM",
-            color=COL_HEADER,
-        ),
-        *_horizontal_border_requests(
-            ws,
-            accounting_invoice_header_row,
-            accounting_invoice_header_row,
-            8,
-            11,
-            top=True,
-            bottom=False,
-            style="SOLID_MEDIUM",
-            color=COL_HEADER,
-        ),
-        *_horizontal_border_requests(
-            ws,
-            accounting_invoice_header_row,
-            accounting_invoice_header_row,
-            8,
-            11,
-            top=False,
-            bottom=True,
-            style="SOLID_MEDIUM",
-            color=COL_HEADER,
-        ),
-        *_invoice_table_border_requests(
-            invoice_start,
-            cash_invoice_end,
-        ),
-        *_invoice_table_border_requests(
-            accounting_invoice_header_row,
-            invoice_end,
-        ),
+        *invoice_table_border_requests,
         *_summary_block_top_border_requests(detail_start_rows, final_sheet_end),
         *_horizontal_border_requests(
             ws,
@@ -1182,6 +1307,7 @@ def process_daily_upload(
     starting_balance_date: str,
     default_starting_balance: int,
     gspread_client,
+    qrisduwit_df: pd.DataFrame | None = None,
 ) -> tuple[int | None, int | None]:
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
 
@@ -1198,5 +1324,9 @@ def process_daily_upload(
         )
 
     return append_daily_to_gsheet(
-        gspread_client, target_spreadsheet, target_worksheet, summary_df
+        gspread_client,
+        target_spreadsheet,
+        target_worksheet,
+        summary_df,
+        qrisduwit_df=qrisduwit_df,
     )
