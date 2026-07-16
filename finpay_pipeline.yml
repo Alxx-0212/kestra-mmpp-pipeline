@@ -59,32 +59,32 @@ tasks:
 
       CLUSTERS = {
           "421306": {
-              "target_spreadsheet":       "FINPAY REPORT",
+              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
               "target_worksheet":         "MRT",
               "default_starting_balance": 0,
           },
           "421307": {
-              "target_spreadsheet":       "FINPAY REPORT",
+              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
               "target_worksheet":         "TDR",
               "default_starting_balance": 0,
           },
           "411311": {
-              "target_spreadsheet":       "FINPAY REPORT",
+              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
               "target_worksheet":         "PKY",
               "default_starting_balance": 0,
           },
           "421315": {
-              "target_spreadsheet":       "FINPAY REPORT",
+              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
               "target_worksheet":         "BGI",
               "default_starting_balance": 0,
           },
           "421318": {
-              "target_spreadsheet":       "FINPAY REPORT",
+              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
               "target_worksheet":         "MRW",
               "default_starting_balance": 0,
           },
           "421320": {
-              "target_spreadsheet":       "FINPAY REPORT",
+              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
               "target_worksheet":         "TNT",
               "default_starting_balance": 0,
           },
@@ -1052,6 +1052,11 @@ tasks:
                       finally:
                           if sa_key_path and os.path.exists(sa_key_path):
                               os.unlink(sa_key_path)
+
+                  - id: pause_after_summary_sheet_write
+                    type: io.kestra.plugin.core.flow.Sleep
+                    runIf: "{{ inputs.dry_run == false }}"
+                    duration: PT10S
 
 errors:
   # ── TODO: replace with a real notification plugin once your channel is ready ──

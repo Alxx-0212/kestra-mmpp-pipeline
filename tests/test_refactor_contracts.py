@@ -122,6 +122,209 @@ class SharedSpreadsheetOpenContractTest(unittest.TestCase):
         self.assertTrue(result)
         opener.assert_called_once()
 
+    def test_daily_upload_initializes_linkaja_reference_sheet(self):
+        spreadsheet = Mock()
+        summary_worksheet = Mock()
+        summary_worksheet.acell.return_value.value = "REPORT DATE"
+        linkaja_worksheet = Mock()
+        linkaja_worksheet.id = 456
+        linkaja_worksheet.row_count = 1000
+        linkaja_worksheet.col_count = 29
+
+        def worksheet_by_title(title):
+            if title == "PKY":
+                return summary_worksheet
+            if title == "LinkAja":
+                raise summary_sheets.gspread.WorksheetNotFound()
+            raise AssertionError(title)
+
+        spreadsheet.worksheet.side_effect = worksheet_by_title
+        spreadsheet.add_worksheet.return_value = linkaja_worksheet
+
+        with patch(
+            "finpay_pipeline.summary_sheets.open_or_create_finpay_spreadsheet",
+            return_value=spreadsheet,
+        ), patch(
+            "finpay_pipeline.summary_sheets.append_daily_to_gsheet",
+            return_value=(3, 10),
+        ):
+            result = summary_sheets.process_daily_upload(
+                target_spreadsheet="FINPAY REPORT",
+                target_worksheet="PKY",
+                summary_df=pd.DataFrame(),
+                starting_balance_date="2026-06-30",
+                default_starting_balance=0,
+                gspread_client=Mock(),
+            )
+
+        self.assertEqual(result, (3, 10))
+        spreadsheet.add_worksheet.assert_called_once_with(
+            title="LinkAja",
+            rows=1000,
+            cols=29,
+        )
+        linkaja_worksheet.get.assert_not_called()
+        linkaja_worksheet.update.assert_not_called()
+        batch_requests = spreadsheet.batch_update.call_args.kwargs.get("requests")
+        if batch_requests is None:
+            batch_requests = spreadsheet.batch_update.call_args.args[0]["requests"]
+        update_cells = next(
+            request["updateCells"]
+            for request in batch_requests
+            if "updateCells" in request
+        )
+        row_values = update_cells["rows"]
+        self.assertEqual(
+            row_values[0]["values"][10]["userEnteredValue"]["stringValue"],
+            "PKY - 411311",
+        )
+        self.assertEqual(
+            row_values[1]["values"][10]["userEnteredValue"]["stringValue"],
+            "REPORT DATE",
+        )
+        self.assertEqual(
+            row_values[1]["values"][12]["userEnteredValue"]["stringValue"],
+            "DIGIPOS B2B TRANSFER IN CLUSTER FEE",
+        )
+        self.assertEqual(
+            sum(1 for request in batch_requests if "mergeCells" in request),
+            6,
+        )
+        self.assertEqual(
+            sum(1 for request in batch_requests if "updateBorders" in request),
+            6,
+        )
+        title_format = next(
+            request["repeatCell"]
+            for request in batch_requests
+            if (
+                "repeatCell" in request
+                and request["repeatCell"]["range"]["startRowIndex"] == 0
+                and request["repeatCell"]["range"]["startColumnIndex"] == 10
+            )
+        )
+        self.assertEqual(
+            title_format["cell"]["userEnteredFormat"]["horizontalAlignment"],
+            "CENTER",
+        )
+        self.assertEqual(
+            title_format["cell"]["userEnteredFormat"]["backgroundColor"],
+            summary_sheets.LINKAJA_REFERENCE_CLUSTER_PALETTES[2]["title"],
+        )
+
+    def test_daily_upload_repairs_existing_linkaja_header_format(self):
+        spreadsheet = Mock()
+        summary_worksheet = Mock()
+        summary_worksheet.acell.return_value.value = "REPORT DATE"
+        linkaja_worksheet = Mock()
+        linkaja_worksheet.id = 456
+        linkaja_worksheet.row_count = 1000
+        linkaja_worksheet.col_count = 29
+        linkaja_worksheet.get.return_value = [
+            *summary_sheets._linkaja_reference_header_values(),
+            ["" for _ in range(summary_sheets.LINKAJA_REFERENCE_COLUMN_COUNT)],
+        ]
+
+        def worksheet_by_title(title):
+            if title == "PKY":
+                return summary_worksheet
+            if title == "LinkAja":
+                return linkaja_worksheet
+            raise AssertionError(title)
+
+        spreadsheet.worksheet.side_effect = worksheet_by_title
+
+        with patch(
+            "finpay_pipeline.summary_sheets.open_or_create_finpay_spreadsheet",
+            return_value=spreadsheet,
+        ), patch(
+            "finpay_pipeline.summary_sheets.append_daily_to_gsheet",
+            return_value=(3, 10),
+        ):
+            result = summary_sheets.process_daily_upload(
+                target_spreadsheet="FINPAY REPORT",
+                target_worksheet="PKY",
+                summary_df=pd.DataFrame(),
+                starting_balance_date="2026-06-30",
+                default_starting_balance=0,
+                gspread_client=Mock(),
+            )
+
+        self.assertEqual(result, (3, 10))
+        spreadsheet.add_worksheet.assert_not_called()
+        linkaja_worksheet.update.assert_not_called()
+        linkaja_worksheet.get.assert_called_once_with(
+            "A1:AC3",
+            value_render_option="FORMATTED_VALUE",
+        )
+        batch_requests = spreadsheet.batch_update.call_args.args[0]["requests"]
+        self.assertFalse(
+            any("updateCells" in request for request in batch_requests)
+        )
+        self.assertEqual(
+            sum(1 for request in batch_requests if "unmergeCells" in request),
+            6,
+        )
+        self.assertEqual(
+            sum(1 for request in batch_requests if "mergeCells" in request),
+            6,
+        )
+        self.assertEqual(
+            sum(1 for request in batch_requests if "updateBorders" in request),
+            6,
+        )
+
+    def test_daily_upload_skips_linkaja_format_when_data_exists(self):
+        spreadsheet = Mock()
+        summary_worksheet = Mock()
+        summary_worksheet.acell.return_value.value = "REPORT DATE"
+        linkaja_worksheet = Mock()
+        linkaja_worksheet.id = 456
+        linkaja_worksheet.row_count = 1000
+        linkaja_worksheet.col_count = 29
+        linkaja_data_row = [
+            "01/07/2026",
+            "100",
+            "200",
+            "300",
+            "",
+            "01/07/2026",
+        ]
+        linkaja_worksheet.get.return_value = [
+            *summary_sheets._linkaja_reference_header_values(),
+            linkaja_data_row,
+        ]
+
+        def worksheet_by_title(title):
+            if title == "PKY":
+                return summary_worksheet
+            if title == "LinkAja":
+                return linkaja_worksheet
+            raise AssertionError(title)
+
+        spreadsheet.worksheet.side_effect = worksheet_by_title
+
+        with patch(
+            "finpay_pipeline.summary_sheets.open_or_create_finpay_spreadsheet",
+            return_value=spreadsheet,
+        ), patch(
+            "finpay_pipeline.summary_sheets.append_daily_to_gsheet",
+            return_value=(3, 10),
+        ):
+            result = summary_sheets.process_daily_upload(
+                target_spreadsheet="FINPAY REPORT",
+                target_worksheet="PKY",
+                summary_df=pd.DataFrame(),
+                starting_balance_date="2026-06-30",
+                default_starting_balance=0,
+                gspread_client=Mock(),
+            )
+
+        self.assertEqual(result, (3, 10))
+        spreadsheet.add_worksheet.assert_not_called()
+        spreadsheet.batch_update.assert_not_called()
+        linkaja_worksheet.update.assert_not_called()
+
     def test_detail_upload_uses_shared_spreadsheet_open(self):
         spreadsheet = Mock()
         worksheet = Mock()
@@ -145,9 +348,181 @@ class SharedSpreadsheetOpenContractTest(unittest.TestCase):
         self.assertTrue(result)
         opener.assert_called_once()
 
+    def test_summary_upload_batches_formatting_requests(self):
+        spreadsheet = Mock()
+        worksheet = Mock()
+        worksheet.id = 123
+        worksheet.row_count = 1000
+        worksheet.get_all_values.return_value = [
+            [
+                "REPORT DATE",
+                "SECTION",
+                "KETERANGAN",
+                "DEBET",
+                "KREDIT",
+                "SALDO",
+                "",
+                "REPORT DATE",
+                "INVOICE REPORT",
+                "DEBET",
+                "KREDIT",
+            ],
+            ["30/06/2026", "", "SALDO 30/06/2026", "", "", "0"],
+        ]
+        spreadsheet.worksheet.return_value = worksheet
+        spreadsheet.fetch_sheet_metadata.return_value = {
+            "sheets": [{
+                "properties": {"sheetId": worksheet.id},
+                "protectedRanges": [],
+            }]
+        }
+        summary_df = pd.DataFrame([{
+            "Transaction_Date": "2026-07-01",
+            "Transaction": "RECHARGE",
+            "Sum_of_Debet": 0,
+            "Sum_of_Kredit": 100,
+            "Transaction_Count": 1,
+        }])
+
+        with patch(
+            "finpay_pipeline.summary_sheets.open_or_create_finpay_spreadsheet",
+            return_value=spreadsheet,
+        ):
+            result = summary_sheets.append_daily_to_gsheet(
+                gspread_client=Mock(),
+                target_spreadsheet="FINPAY REPORT",
+                target_worksheet="PKY",
+                summary_df=summary_df,
+            )
+
+        self.assertEqual(result[0], 3)
+        worksheet.update.assert_called_once()
+        worksheet.format.assert_not_called()
+        spreadsheet.batch_update.assert_called_once()
+        batch_requests = spreadsheet.batch_update.call_args.args[0]["requests"]
+        self.assertTrue(any(
+            "updateCells" in request
+            and request["updateCells"]["range"]["startRowIndex"] == 0
+            and request["updateCells"]["range"]["endColumnIndex"] == 11
+            for request in batch_requests
+        ))
+        self.assertGreater(
+            sum(1 for request in batch_requests if "repeatCell" in request),
+            10,
+        )
+
+    def test_summary_rerun_batches_replacement_structure(self):
+        spreadsheet = Mock()
+        worksheet = Mock()
+        worksheet.id = 123
+        worksheet.row_count = 1000
+        worksheet.get_all_values.return_value = [
+            [
+                "REPORT DATE",
+                "SECTION",
+                "KETERANGAN",
+                "DEBET",
+                "KREDIT",
+                "SALDO",
+                "",
+                "REPORT DATE",
+                "INVOICE REPORT",
+                "DEBET",
+                "KREDIT",
+            ],
+            ["30/06/2026", "", "SALDO 30/06/2026", "", "", "0"],
+            ["01/07/2026", "DETAIL", "NGRS", "100", "", "100"],
+            ["01/07/2026", "Cash", "SELISIH", "", "", ""],
+        ]
+        spreadsheet.worksheet.return_value = worksheet
+        merged_invoice_range = {
+            "sheetId": worksheet.id,
+            "startRowIndex": 1,
+            "endRowIndex": 5,
+            "startColumnIndex": 7,
+            "endColumnIndex": 11,
+        }
+        spreadsheet.fetch_sheet_metadata.side_effect = [
+            {
+                "sheets": [{
+                    "properties": {"sheetId": worksheet.id},
+                    "merges": [merged_invoice_range],
+                }]
+            },
+            {
+                "sheets": [{
+                    "properties": {"sheetId": worksheet.id},
+                    "protectedRanges": [],
+                }]
+            },
+        ]
+        summary_df = pd.DataFrame([{
+            "Transaction_Date": "2026-07-01",
+            "Transaction": "RECHARGE",
+            "Sum_of_Debet": 0,
+            "Sum_of_Kredit": 100,
+            "Transaction_Count": 1,
+        }])
+
+        with patch(
+            "finpay_pipeline.summary_sheets.open_or_create_finpay_spreadsheet",
+            return_value=spreadsheet,
+        ):
+            result = summary_sheets.append_daily_to_gsheet(
+                gspread_client=Mock(),
+                target_spreadsheet="FINPAY REPORT",
+                target_worksheet="PKY",
+                summary_df=summary_df,
+            )
+
+        self.assertEqual(result[0], 3)
+        worksheet.get_all_values.assert_called_once()
+        worksheet.update.assert_called_once()
+        worksheet.format.assert_not_called()
+        self.assertEqual(spreadsheet.batch_update.call_count, 2)
+        structure_requests = spreadsheet.batch_update.call_args_list[0].args[0][
+            "requests"
+        ]
+        self.assertTrue(
+            any("unmergeCells" in request for request in structure_requests)
+        )
+        unmerge_request = next(
+            request["unmergeCells"]
+            for request in structure_requests
+            if "unmergeCells" in request
+        )
+        self.assertEqual(unmerge_request["range"], merged_invoice_range)
+        self.assertTrue(
+            any("deleteDimension" in request for request in structure_requests)
+        )
+        self.assertTrue(
+            any("insertDimension" in request for request in structure_requests)
+        )
+        final_requests = spreadsheet.batch_update.call_args_list[1].args[0][
+            "requests"
+        ]
+        self.assertGreater(
+            sum(1 for request in final_requests if "repeatCell" in request),
+            10,
+        )
+
 
 @requires_runtime_dependencies
 class QrisduwitInvoiceRowsContractTest(unittest.TestCase):
+    def test_linkaja_reference_headers_match_static_invoice_columns(self):
+        rows = summary_sheets._linkaja_reference_header_values()
+
+        self.assertEqual(rows[0][0], "MRT - 421306")
+        self.assertEqual(rows[1][0:4], [
+            "REPORT DATE",
+            "EXPECTED RECHARGE OUT CLUSTER FEE",
+            "DIGIPOS B2B TRANSFER IN CLUSTER FEE",
+            "TOTAL FEE",
+        ])
+        self.assertEqual(rows[0][10], "PKY - 411311")
+        self.assertEqual(rows[1][10:14], rows[1][0:4])
+        self.assertEqual(rows[0][25], "TNT - 421320")
+
     def test_qrisduwit_invoice_rows_group_by_disbursement_date(self):
         rows = summary_sheets._build_qrisduwit_invoice_rows(pd.DataFrame({
             "Disbursement Date": ["05/06/2026", "04/06/2026", "04/06/2026"],
@@ -191,11 +566,15 @@ class QrisduwitInvoiceRowsContractTest(unittest.TestCase):
         self.assertEqual(rows[0][1], "")
         self.assertIn("'LinkAja'!L:L", rows[0][2])
         self.assertIn("'LinkAja'!K:K", rows[0][2])
-        self.assertIn('"01/07/2026"', rows[0][2])
+        self.assertIn("SUMIF(", rows[0][2])
+        self.assertIn("DATE(2026,7,1)", rows[0][2])
+        self.assertNotIn("FILTER(", rows[0][2])
         self.assertEqual(rows[1][0], "LINKAJA DIGIPOS B2B TRANSFER IN CLUSTER FEE")
         self.assertEqual(rows[1][1], "")
         self.assertIn("'LinkAja'!M:M", rows[1][2])
         self.assertIn("'LinkAja'!K:K", rows[1][2])
+        self.assertIn("DATE(2026,7,1)", rows[1][2])
+        self.assertNotIn("TEXT(", rows[1][2])
 
     def test_linkaja_fee_invoice_rows_are_before_qrisduwit_rows(self):
         cash_rows = [
@@ -213,6 +592,14 @@ class QrisduwitInvoiceRowsContractTest(unittest.TestCase):
             labels.index("LINKAJA DIGIPOS B2B TRANSFER IN CLUSTER FEE"),
             labels.index("QRISDUWIT"),
         )
+
+    def test_mandiri_formula_uses_row_relative_indirect_ranges(self):
+        formula = summary_sheets._next_transfer_mandiri_formula()
+
+        self.assertIn('INDIRECT("E"&ROW()+2&":E")', formula)
+        self.assertIn('INDIRECT("F"&ROW()+2&":F")', formula)
+        self.assertIn('INDIRECT("D"&ROW()+2&":D")', formula)
+        self.assertNotRegex(formula, r"[A-Z]+\\d+:[A-Z]+")
 
 
 if __name__ == "__main__":

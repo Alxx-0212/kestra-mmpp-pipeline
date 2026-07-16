@@ -15,10 +15,10 @@ from .classification import (
 from .sheets_common import (
     _add_protected_range_request,
     _add_protected_sheet_request,
+    _contiguous_row_runs,
     _delete_all_protected_range_requests,
-    _delete_sheet_rows,
+    _grid_range,
     _horizontal_border_requests,
-    _insert_blank_sheet_rows,
     _mandiri_editor_emails,
     ensure_row_capacity,
     open_or_create_finpay_spreadsheet,
@@ -37,6 +37,364 @@ LINKAJA_FEE_COLUMNS_BY_WORKSHEET = {
 }
 LINKAJA_EXPECTED_FEE_LABEL = "LINKAJA EXPECTED RECHARGE OUT CLUSTER FEE"
 LINKAJA_IN_CLUSTER_FEE_LABEL = "LINKAJA DIGIPOS B2B TRANSFER IN CLUSTER FEE"
+LINKAJA_REFERENCE_CLUSTER_IDS = {
+    "MRT": "421306",
+    "TDR": "421307",
+    "PKY": "411311",
+    "BGI": "421315",
+    "MRW": "421318",
+    "TNT": "421320",
+}
+LINKAJA_REFERENCE_HEADERS = [
+    "REPORT DATE",
+    "EXPECTED RECHARGE OUT CLUSTER FEE",
+    "DIGIPOS B2B TRANSFER IN CLUSTER FEE",
+    "TOTAL FEE",
+]
+LINKAJA_REFERENCE_TABLE_WIDTH = len(LINKAJA_REFERENCE_HEADERS)
+LINKAJA_REFERENCE_BLOCK_WIDTH = LINKAJA_REFERENCE_TABLE_WIDTH + 1
+LINKAJA_REFERENCE_COLUMN_COUNT = (
+    len(LINKAJA_REFERENCE_CLUSTER_IDS) * LINKAJA_REFERENCE_BLOCK_WIDTH - 1
+)
+LINKAJA_REFERENCE_ROW_COUNT = 2
+LINKAJA_REFERENCE_WHITE_COLOR = {"red": 1, "green": 1, "blue": 1}
+LINKAJA_REFERENCE_BORDER_COLOR = {"red": 0.650, "green": 0.700, "blue": 0.750}
+LINKAJA_REFERENCE_CLUSTER_PALETTES = [
+    {
+        "title": {"red": 0.122, "green": 0.306, "blue": 0.471},
+        "header": {"red": 0.733, "green": 0.835, "blue": 0.922},
+        "body": {"red": 0.925, "green": 0.965, "blue": 0.988},
+    },
+    {
+        "title": {"red": 0.220, "green": 0.424, "blue": 0.204},
+        "header": {"red": 0.765, "green": 0.890, "blue": 0.741},
+        "body": {"red": 0.925, "green": 0.973, "blue": 0.910},
+    },
+    {
+        "title": {"red": 0.494, "green": 0.184, "blue": 0.556},
+        "header": {"red": 0.850, "green": 0.765, "blue": 0.890},
+        "body": {"red": 0.965, "green": 0.930, "blue": 0.990},
+    },
+    {
+        "title": {"red": 0.749, "green": 0.341, "blue": 0.000},
+        "header": {"red": 0.980, "green": 0.820, "blue": 0.604},
+        "body": {"red": 1.000, "green": 0.948, "blue": 0.882},
+    },
+    {
+        "title": {"red": 0.525, "green": 0.082, "blue": 0.082},
+        "header": {"red": 0.925, "green": 0.690, "blue": 0.690},
+        "body": {"red": 0.992, "green": 0.925, "blue": 0.925},
+    },
+    {
+        "title": {"red": 0.000, "green": 0.376, "blue": 0.455},
+        "header": {"red": 0.694, "green": 0.867, "blue": 0.902},
+        "body": {"red": 0.910, "green": 0.973, "blue": 0.984},
+    },
+]
+
+
+def _linkaja_reference_sheet_is_empty(values: list[list[str]]) -> bool:
+    return not any(
+        str(value).strip()
+        for row in values
+        for value in row
+    )
+
+
+def _linkaja_reference_header_values() -> list[list[str]]:
+    values = [
+        ["" for _ in range(LINKAJA_REFERENCE_COLUMN_COUNT)]
+        for _ in range(LINKAJA_REFERENCE_ROW_COUNT)
+    ]
+    for index, (worksheet_name, cluster_id) in enumerate(
+        LINKAJA_REFERENCE_CLUSTER_IDS.items()
+    ):
+        start_column = index * LINKAJA_REFERENCE_BLOCK_WIDTH
+        values[0][start_column] = f"{worksheet_name} - {cluster_id}"
+        for header_offset, header in enumerate(LINKAJA_REFERENCE_HEADERS):
+            values[1][start_column + header_offset] = header
+    return values
+
+
+def _linkaja_reference_headers_match(values: list[list[str]]) -> bool:
+    expected = uppercase_sheet_rows(_linkaja_reference_header_values())
+    for row_index, expected_row in enumerate(expected):
+        actual_row = values[row_index] if row_index < len(values) else []
+        for column_index, expected_value in enumerate(expected_row):
+            actual_value = (
+                actual_row[column_index]
+                if column_index < len(actual_row)
+                else ""
+            )
+            if (
+                str(actual_value).strip().upper()
+                != str(expected_value).strip().upper()
+            ):
+                return False
+    return True
+
+
+def _linkaja_reference_sheet_setup_requests(ws) -> list[dict]:
+    widths = {
+        0: 110,
+        1: 285,
+        2: 300,
+        3: 120,
+        4: 24,
+    }
+    requests = [{
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": ws.id,
+                "gridProperties": {
+                    "rowCount": max(int(getattr(ws, "row_count", 0) or 0), 1000),
+                    "columnCount": max(
+                        int(getattr(ws, "col_count", 0) or 0),
+                        LINKAJA_REFERENCE_COLUMN_COUNT,
+                    ),
+                    "frozenRowCount": LINKAJA_REFERENCE_ROW_COUNT,
+                },
+            },
+            "fields": "gridProperties(rowCount,columnCount,frozenRowCount)",
+        }
+    }]
+    for block_index in range(len(LINKAJA_REFERENCE_CLUSTER_IDS)):
+        block_start = block_index * LINKAJA_REFERENCE_BLOCK_WIDTH
+        for offset, width in widths.items():
+            column_index = block_start + offset
+            if column_index >= LINKAJA_REFERENCE_COLUMN_COUNT:
+                continue
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": column_index,
+                        "endIndex": column_index + 1,
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize",
+                }
+            })
+    return requests
+
+
+def _linkaja_reference_cluster_format_requests(
+    ws,
+    start_column_index: int,
+    palette: dict[str, dict[str, float]],
+) -> list[dict]:
+    end_column_index = start_column_index + LINKAJA_REFERENCE_TABLE_WIDTH
+    start_column = start_column_index + 1
+    end_column = end_column_index
+    body_end_row = max(LINKAJA_REFERENCE_ROW_COUNT, 3)
+
+    return [
+        {
+            "unmergeCells": {
+                "range": _grid_range(ws, 1, 1, start_column, end_column),
+            }
+        },
+        {
+            "mergeCells": {
+                "range": _grid_range(ws, 1, 1, start_column, end_column),
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(ws, 1, 1, start_column, end_column),
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": palette["title"],
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "textFormat": {
+                            "foregroundColor": LINKAJA_REFERENCE_WHITE_COLOR,
+                            "bold": True,
+                        },
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                    "verticalAlignment,textFormat)"
+                ),
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(ws, 2, 2, start_column, end_column),
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": palette["header"],
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "textFormat": {"bold": True},
+                        "wrapStrategy": "WRAP",
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                    "verticalAlignment,textFormat,wrapStrategy)"
+                ),
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(ws, 3, body_end_row, start_column, end_column),
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": palette["body"],
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                    "verticalAlignment)"
+                ),
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(
+                    ws,
+                    3,
+                    body_end_row,
+                    start_column + 1,
+                    end_column,
+                ),
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "NUMBER", "pattern": "#,##0"}
+                    }
+                },
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        },
+        {
+            "updateBorders": {
+                "range": _grid_range(
+                    ws,
+                    1,
+                    LINKAJA_REFERENCE_ROW_COUNT,
+                    start_column,
+                    end_column,
+                ),
+                "top": {
+                    "style": "SOLID_MEDIUM",
+                    "color": LINKAJA_REFERENCE_BORDER_COLOR,
+                },
+                "bottom": {
+                    "style": "SOLID_MEDIUM",
+                    "color": LINKAJA_REFERENCE_BORDER_COLOR,
+                },
+                "left": {
+                    "style": "SOLID_MEDIUM",
+                    "color": LINKAJA_REFERENCE_BORDER_COLOR,
+                },
+                "right": {
+                    "style": "SOLID_MEDIUM",
+                    "color": LINKAJA_REFERENCE_BORDER_COLOR,
+                },
+                "innerHorizontal": {
+                    "style": "SOLID",
+                    "color": LINKAJA_REFERENCE_BORDER_COLOR,
+                },
+                "innerVertical": {
+                    "style": "SOLID",
+                    "color": LINKAJA_REFERENCE_BORDER_COLOR,
+                },
+            }
+        },
+    ]
+
+
+def _linkaja_reference_sheet_format_requests(ws) -> list[dict]:
+    requests = []
+    for index in range(len(LINKAJA_REFERENCE_CLUSTER_IDS)):
+        start_column = index * LINKAJA_REFERENCE_BLOCK_WIDTH
+        palette = LINKAJA_REFERENCE_CLUSTER_PALETTES[
+            index % len(LINKAJA_REFERENCE_CLUSTER_PALETTES)
+        ]
+        requests.extend(
+            _linkaja_reference_cluster_format_requests(
+                ws,
+                start_column,
+                palette,
+            )
+        )
+    return requests
+
+
+def ensure_linkaja_fee_reference_sheet(gspread_client, spreadsheet) -> bool:
+    created = False
+    try:
+        worksheet = spreadsheet.worksheet(LINKAJA_FEE_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=LINKAJA_FEE_SHEET_NAME,
+            rows=1000,
+            cols=LINKAJA_REFERENCE_COLUMN_COUNT,
+        )
+        created = True
+
+    existing_values = (
+        []
+        if created
+        else worksheet.get("A1:AC3", value_render_option="FORMATTED_VALUE")
+    )
+    existing_header_values = existing_values[:LINKAJA_REFERENCE_ROW_COUNT]
+    if not _linkaja_reference_sheet_is_empty(existing_header_values):
+        existing_data_preview = existing_values[LINKAJA_REFERENCE_ROW_COUNT:]
+        if (
+            _linkaja_reference_headers_match(existing_header_values)
+            and _linkaja_reference_sheet_is_empty(existing_data_preview)
+        ):
+            spreadsheet.batch_update({
+                "requests": [
+                    *_linkaja_reference_sheet_setup_requests(worksheet),
+                    *_linkaja_reference_sheet_format_requests(worksheet),
+                ]
+            })
+        return False
+
+    header_rows = uppercase_sheet_rows(_linkaja_reference_header_values())
+    row_values = []
+    for row in header_rows:
+        row_values.append({
+            "values": [
+                {"userEnteredValue": {"stringValue": str(value)}}
+                if str(value) else {}
+                for value in row
+            ]
+        })
+
+    spreadsheet.batch_update({
+        "requests": [
+            *_linkaja_reference_sheet_setup_requests(worksheet),
+            {
+                "updateCells": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": LINKAJA_REFERENCE_ROW_COUNT,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": LINKAJA_REFERENCE_COLUMN_COUNT,
+                    },
+                    "rows": row_values,
+                    "fields": "userEnteredValue",
+                }
+            },
+            *_linkaja_reference_sheet_format_requests(worksheet),
+            _add_protected_sheet_request(
+                gspread_client,
+                worksheet,
+                "FinPay initialized LinkAja reference sheet",
+            ),
+        ]
+    })
+    return True
 
 
 def setup_initial_headers_and_saldo(
@@ -107,8 +465,6 @@ def setup_initial_headers_and_saldo(
          "", "", "", "", ""],
     ]), value_input_option="USER_ENTERED")
 
-    ws.format("A1:K1", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
-    ws.format("F2", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}})
     protection_request = _add_protected_sheet_request(
         gspread_client,
         ws,
@@ -116,6 +472,32 @@ def setup_initial_headers_and_saldo(
     )
     requests = [
         *_delete_all_protected_range_requests(sh, ws),
+        {
+            "repeatCell": {
+                "range": _grid_range(ws, 1, 1, 1, 11),
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"bold": True},
+                        "horizontalAlignment": "CENTER",
+                    }
+                },
+                "fields": "userEnteredFormat(textFormat,horizontalAlignment)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(ws, 2, 2, 6, 6),
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {
+                            "type": "NUMBER",
+                            "pattern": "#,##0;(#,##0);-",
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        },
         *([protection_request] if protection_request else []),
     ]
     if requests:
@@ -205,12 +587,17 @@ def _linkaja_fee_lookup_formula(
     else:
         raise ValueError(f"Unknown LinkAja fee type: {fee_type!r}")
 
+    report_date = datetime.strptime(formatted_date, "%d/%m/%Y")
+    date_criterion = (
+        f"DATE({report_date.year},{report_date.month},{report_date.day})"
+    )
     sheet_name = _quoted_sheet_name(LINKAJA_FEE_SHEET_NAME)
     return (
-        f'=IFERROR(SUM(FILTER({sheet_name}!{value_column}:{value_column},'
-        f'({sheet_name}!{date_column}:{date_column}="{formatted_date}")+'
-        f'(IFERROR(TEXT({sheet_name}!{date_column}:{date_column},"dd/mm/yyyy"),"")="{formatted_date}")'
-        ")),0)"
+        f"=IFERROR(SUMIF("
+        f"{sheet_name}!{date_column}:{date_column},"
+        f"{date_criterion},"
+        f"{sheet_name}!{value_column}:{value_column}"
+        "),0)"
     )
 
 
@@ -230,6 +617,27 @@ def _build_linkaja_fee_invoice_rows(
             _linkaja_fee_lookup_formula(target_worksheet, formatted_date, "in_cluster"),
         ),
     ]
+
+
+def _next_transfer_mandiri_formula() -> str:
+    next_debet = 'INDIRECT("D"&ROW()+2&":D")'
+    next_kredit = 'INDIRECT("E"&ROW()+2&":E")'
+    next_saldo = 'INDIRECT("F"&ROW()+2&":F")'
+    next_section = 'INDIRECT("B"&ROW()+2&":B")'
+    next_label = 'INDIRECT("C"&ROW()+2&":C")'
+    return (
+        f'=IFERROR(INDEX(FILTER({next_kredit},'
+        f'TRIM({next_label})="TRANSFER MASUK DARI FINPAY",'
+        f'{next_debet}<>"CASHOUT APOLLO",'
+        f'{next_kredit}<>""),1),'
+        f'IFERROR(INDEX(FILTER({next_saldo},'
+        f'TRIM({next_label})="TRANSFER MASUK DARI FINPAY",'
+        f'{next_debet}="CASHOUT APOLLO",'
+        f'{next_saldo}<>""),1),'
+        f'IFERROR(INDEX(FILTER({next_debet},'
+        f'TRIM({next_section})="TRANSFER MASUK DARI FINPAY",'
+        f'{next_debet}<>""),1),0)))'
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,6 +698,40 @@ def append_daily_to_gsheet(
             "endColumnIndex": ec,
         }
 
+    def _format_cell_request(
+        start_row: int,
+        end_row: int,
+        start_col: int,
+        end_col: int,
+        cell_format: dict,
+        fields: str,
+    ) -> dict | None:
+        if start_row > end_row or start_col > end_col:
+            return None
+        return {
+            "repeatCell": {
+                "range": _grid_range(start_row, end_row, start_col, end_col),
+                "cell": {"userEnteredFormat": cell_format},
+                "fields": fields,
+            }
+        }
+
+    def _header_value_request(headers: list[str]) -> dict:
+        return {
+            "updateCells": {
+                "range": _grid_range(1, 1, 1, len(headers)),
+                "rows": [{
+                    "values": [
+                        {"userEnteredValue": {"stringValue": str(value)}}
+                        if str(value)
+                        else {}
+                        for value in uppercase_sheet_rows([headers])[0]
+                    ]
+                }],
+                "fields": "userEnteredValue",
+            }
+        }
+
     def _invoice_table_border_requests(
         start_row: int,
         end_row: int,
@@ -333,6 +775,28 @@ def append_daily_to_gsheet(
             }
         }]
 
+    def _clear_cell_grid_border_requests(
+        start_row: int,
+        end_row: int,
+        start_col: int,
+        end_col: int,
+    ) -> list[dict]:
+        if start_row > end_row or start_col > end_col:
+            return []
+
+        border = {"style": "NONE"}
+        return [{
+            "updateBorders": {
+                "range": _grid_range(start_row, end_row, start_col, end_col),
+                "top": border,
+                "bottom": border,
+                "left": border,
+                "right": border,
+                "innerHorizontal": border,
+                "innerVertical": border,
+            }
+        }]
+
     def _merge_range_requests(
         start_row: int,
         end_row: int,
@@ -356,6 +820,89 @@ def append_daily_to_gsheet(
                 "range": _grid_range(start_row, end_row, start_col, end_col),
             }
         }]
+
+    def _delete_row_requests(row_numbers: list[int]) -> list[dict]:
+        requests = []
+        for start, end in reversed(_contiguous_row_runs(sorted(row_numbers))):
+            requests.append({
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": start - 1,
+                        "endIndex": end,
+                    }
+                }
+            })
+        return requests
+
+    def _insert_row_request(start_row: int, row_count: int) -> dict | None:
+        if row_count <= 0:
+            return None
+        return {
+            "insertDimension": {
+                "range": {
+                    "sheetId": ws.id,
+                    "dimension": "ROWS",
+                    "startIndex": start_row - 1,
+                    "endIndex": start_row - 1 + row_count,
+                },
+                "inheritFromBefore": start_row > 1,
+            }
+        }
+
+    def _ranges_intersect(
+        first_start: int,
+        first_end: int,
+        second_start: int,
+        second_end: int,
+    ) -> bool:
+        return first_start < second_end and first_end > second_start
+
+    def _merged_invoice_unmerge_requests(row_numbers: list[int]) -> list[dict]:
+        if not row_numbers:
+            return []
+
+        row_start_index = min(row_numbers) - 1
+        row_end_index = max(row_numbers)
+        invoice_start_index = 7
+        invoice_end_index = 11
+        metadata = sh.fetch_sheet_metadata({
+            "fields": "sheets(properties(sheetId),merges)",
+        })
+        requests = []
+        for sheet in metadata.get("sheets", []):
+            if sheet.get("properties", {}).get("sheetId") != ws.id:
+                continue
+            for merged_range in sheet.get("merges", []):
+                merge_start_row = merged_range.get("startRowIndex", 0)
+                merge_end_row = merged_range.get(
+                    "endRowIndex",
+                    merge_start_row + 1,
+                )
+                merge_start_col = merged_range.get("startColumnIndex", 0)
+                merge_end_col = merged_range.get(
+                    "endColumnIndex",
+                    merge_start_col + 1,
+                )
+                if not _ranges_intersect(
+                    merge_start_row,
+                    merge_end_row,
+                    row_start_index,
+                    row_end_index,
+                ):
+                    continue
+                if not _ranges_intersect(
+                    merge_start_col,
+                    merge_end_col,
+                    invoice_start_index,
+                    invoice_end_index,
+                ):
+                    continue
+                exact_range = dict(merged_range)
+                exact_range["sheetId"] = ws.id
+                requests.append({"unmergeCells": {"range": exact_range}})
+        return requests
 
     def _has_blank_invoice_cells(row: list) -> bool:
         return all(
@@ -556,22 +1103,16 @@ def append_daily_to_gsheet(
     )
     if replacement_rows:
         replacement_start = min(replacement_rows)
-        sh.batch_update({"requests": [{
-            "unmergeCells": {
-                "range": _grid_range(
-                    max(2, replacement_start - 1),
-                    max(replacement_rows),
-                    8,
-                    11,
-                )
-            }
-        }]})
-        _delete_sheet_rows(sh, ws, replacement_rows)
+        replacement_row_numbers = set(replacement_rows)
+        existing_values = [
+            row
+            for row_number, row in enumerate(existing_values, start=1)
+            if row_number not in replacement_row_numbers
+        ]
         print(
             f"↻ Replacing existing summary block for {formatted_date} "
             f"({len(replacement_rows)} rows)."
         )
-        existing_values = ws.get_all_values()
     else:
         replacement_start = None
 
@@ -598,7 +1139,6 @@ def append_daily_to_gsheet(
         "DEBET",
         "KREDIT",
     ]
-    ws.update("A1:K1", uppercase_sheet_rows([summary_headers]), value_input_option="USER_ENTERED")
 
     insert_row = replacement_start or len(existing_values) + 1
     r = insert_row
@@ -934,20 +1474,7 @@ def append_daily_to_gsheet(
     )
     r += 1
     mandiri_row = r
-    next_transfer_range_start = mandiri_row + 2
-    mandiri_formula = (
-        f'=IFERROR(INDEX(FILTER(E{next_transfer_range_start}:E,'
-        f'TRIM(C{next_transfer_range_start}:C)="TRANSFER MASUK DARI FINPAY",'
-        f'D{next_transfer_range_start}:D<>"CASHOUT APOLLO",'
-        f'E{next_transfer_range_start}:E<>""),1),'
-        f'IFERROR(INDEX(FILTER(F{next_transfer_range_start}:F,'
-        f'TRIM(C{next_transfer_range_start}:C)="TRANSFER MASUK DARI FINPAY",'
-        f'D{next_transfer_range_start}:D="CASHOUT APOLLO",'
-        f'F{next_transfer_range_start}:F<>""),1),'
-        f'IFERROR(INDEX(FILTER(D{next_transfer_range_start}:D,'
-        f'TRIM(B{next_transfer_range_start}:B)="TRANSFER MASUK DARI FINPAY",'
-        f'D{next_transfer_range_start}:D<>""),1),0)))'
-    )
+    mandiri_formula = _next_transfer_mandiri_formula()
     rows_to_append.append(
         _summary_row("Cash", "MANDIRI", mandiri_formula)
     )
@@ -1031,9 +1558,21 @@ def append_daily_to_gsheet(
             _invoice_table_border_requests(header_row, end_row)
         )
 
-    required_rows = max(block_end, next_transfer_range_start)
+    required_rows = max(block_end, mandiri_row + 2)
     if replacement_start:
-        _insert_blank_sheet_rows(sh, ws, replacement_start, len(rows_to_append))
+        structure_requests = []
+        structure_requests.extend(
+            _merged_invoice_unmerge_requests(replacement_rows)
+        )
+        structure_requests.extend(_delete_row_requests(replacement_rows))
+        insert_request = _insert_row_request(
+            replacement_start,
+            len(rows_to_append),
+        )
+        if insert_request:
+            structure_requests.append(insert_request)
+        if structure_requests:
+            sh.batch_update({"requests": structure_requests})
     else:
         ensure_row_capacity(sh, ws, required_rows, label="summary worksheet")
     ws.update(
@@ -1046,6 +1585,26 @@ def append_daily_to_gsheet(
     data_start = insert_row
     data_end = block_end
     IDR = {"type": "NUMBER", "pattern": "#,##0;(#,##0);-"}
+    format_requests = []
+
+    def _add_format_request(
+        start_row: int,
+        end_row: int,
+        start_col: int,
+        end_col: int,
+        cell_format: dict,
+        fields: str,
+    ) -> None:
+        request = _format_cell_request(
+            start_row,
+            end_row,
+            start_col,
+            end_col,
+            cell_format,
+            fields,
+        )
+        if request:
+            format_requests.append(request)
 
     def _format_report_section(
         start_row: int,
@@ -1053,30 +1612,87 @@ def append_daily_to_gsheet(
         first_row_color: dict,
         body_color: dict,
     ) -> None:
-        ws.format(_range(start_row, end_row), {"backgroundColor": body_color})
-        ws.format(f"D{start_row}:F{end_row}", {"numberFormat": IDR})
+        _add_format_request(
+            start_row,
+            end_row,
+            1,
+            6,
+            {"backgroundColor": body_color},
+            "userEnteredFormat.backgroundColor",
+        )
+        _add_format_request(
+            start_row,
+            end_row,
+            4,
+            6,
+            {"numberFormat": IDR},
+            "userEnteredFormat.numberFormat",
+        )
         if end_row > start_row:
-            ws.format(f"A{start_row + 1}:B{end_row}", {
-                "textFormat": {"foregroundColor": COL_MUTED_TEXT},
-            })
-        ws.format(f"A{start_row}:B{start_row}", {
-            "backgroundColor": first_row_color,
-            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-        })
+            _add_format_request(
+                start_row + 1,
+                end_row,
+                1,
+                2,
+                {"textFormat": {"foregroundColor": COL_MUTED_TEXT}},
+                "userEnteredFormat.textFormat.foregroundColor",
+            )
+        _add_format_request(
+            start_row,
+            start_row,
+            1,
+            2,
+            {
+                "backgroundColor": first_row_color,
+                "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+            },
+            "userEnteredFormat(backgroundColor,textFormat)",
+        )
 
     def _format_detail_stripes(start_row: int, end_row: int) -> None:
         for row_number in range(start_row, end_row + 1, 2):
             stripe_start_col = 3 if row_number == start_row else 1
-            ws.format(_range(row_number, row_number, stripe_start_col, 6), {
-                "backgroundColor": COL_DETAIL_ALT,
-            })
+            _add_format_request(
+                row_number,
+                row_number,
+                stripe_start_col,
+                6,
+                {"backgroundColor": COL_DETAIL_ALT},
+                "userEnteredFormat.backgroundColor",
+            )
 
-    ws.format(_range(data_start, data_end, 1, 11), {"backgroundColor": COL_WHITE})
-    ws.format(f"D{data_start}:F{data_end}", {"numberFormat": IDR})
-    ws.format(f"H{data_start}:H{data_end}", {
-        "numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"},
-    })
-    ws.format(f"J{data_start}:K{data_end}", {"numberFormat": IDR})
+    _add_format_request(
+        data_start,
+        data_end,
+        1,
+        11,
+        {"backgroundColor": COL_WHITE},
+        "userEnteredFormat.backgroundColor",
+    )
+    _add_format_request(
+        data_start,
+        data_end,
+        4,
+        6,
+        {"numberFormat": IDR},
+        "userEnteredFormat.numberFormat",
+    )
+    _add_format_request(
+        data_start,
+        data_end,
+        8,
+        8,
+        {"numberFormat": {"type": "DATE", "pattern": "dd/mm/yyyy"}},
+        "userEnteredFormat.numberFormat",
+    )
+    _add_format_request(
+        data_start,
+        data_end,
+        10,
+        11,
+        {"numberFormat": IDR},
+        "userEnteredFormat.numberFormat",
+    )
     _format_report_section(
         detail_start, detail_end, COL_FOOTER_HEADER, COL_WHITE
     )
@@ -1087,77 +1703,176 @@ def append_daily_to_gsheet(
     _format_report_section(
         running_total_row, selisih_row, COL_INPUT, COL_STATUS
     )
-    ws.format(f"D{running_total_row}:E{selisih_row}", {"numberFormat": IDR})
-    ws.format(_range(mandiri_row, mandiri_row), {
-        "backgroundColor": COL_INPUT,
-        "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-    })
-    ws.format(f"D{mandiri_row}", {
-        "backgroundColor": COL_INPUT,
-        "numberFormat": IDR,
-    })
-    ws.format(_range(selisih_row, selisih_row), {
-        "backgroundColor": COL_STATUS,
-        "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-    })
-    ws.format(f"D{selisih_row}", {"numberFormat": IDR})
-    ws.format(f"E{selisih_row}", {"wrapStrategy": "WRAP"})
+    _add_format_request(
+        running_total_row,
+        selisih_row,
+        4,
+        5,
+        {"numberFormat": IDR},
+        "userEnteredFormat.numberFormat",
+    )
+    _add_format_request(
+        mandiri_row,
+        mandiri_row,
+        1,
+        6,
+        {
+            "backgroundColor": COL_INPUT,
+            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+        },
+        "userEnteredFormat(backgroundColor,textFormat)",
+    )
+    _add_format_request(
+        mandiri_row,
+        mandiri_row,
+        4,
+        4,
+        {"backgroundColor": COL_INPUT, "numberFormat": IDR},
+        "userEnteredFormat(backgroundColor,numberFormat)",
+    )
+    _add_format_request(
+        selisih_row,
+        selisih_row,
+        1,
+        6,
+        {
+            "backgroundColor": COL_STATUS,
+            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+        },
+        "userEnteredFormat(backgroundColor,textFormat)",
+    )
+    _add_format_request(
+        selisih_row,
+        selisih_row,
+        4,
+        4,
+        {"numberFormat": IDR},
+        "userEnteredFormat.numberFormat",
+    )
+    _add_format_request(
+        selisih_row,
+        selisih_row,
+        5,
+        5,
+        {"wrapStrategy": "WRAP"},
+        "userEnteredFormat.wrapStrategy",
+    )
     if invoice_rows:
         for table in invoice_table_ranges:
             header_row = table["header_row"]
             end_row = table["end_row"]
-            ws.format(_range(header_row, header_row, 8, 11), {
-                "backgroundColor": table["header_color"],
-                "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-                "horizontalAlignment": "CENTER",
-            })
+            _add_format_request(
+                header_row,
+                header_row,
+                8,
+                11,
+                {
+                    "backgroundColor": table["header_color"],
+                    "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+                    "horizontalAlignment": "CENTER",
+                },
+                "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+            )
             if end_row > header_row:
-                ws.format(_range(header_row + 1, end_row, 8, 11), {
-                    "backgroundColor": table["body_color"],
-                })
-        for separator_row in invoice_separator_rows:
-            ws.format(_range(separator_row, separator_row, 8, 11), {
-                "backgroundColor": COL_WHITE,
-            })
-        ws.format(f"I{invoice_start}:I{invoice_end}", {
-            "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
-            "horizontalAlignment": "LEFT",
-            "wrapStrategy": "CLIP",
-        })
-        ws.format(f"H{invoice_start}:H{invoice_end}", {
-            "horizontalAlignment": "CENTER",
-            "wrapStrategy": "CLIP",
-        })
-        ws.format(f"J{invoice_start}:K{invoice_end}", {
-            "horizontalAlignment": "RIGHT",
-        })
-        for table in invoice_table_ranges:
-            ws.format(f"I{table['header_row']}", {"horizontalAlignment": "CENTER"})
-        if qrisduwit_parent_invoice_row:
-            ws.format(
-                _range(
-                    qrisduwit_parent_invoice_row,
-                    qrisduwit_parent_invoice_row,
+                _add_format_request(
+                    header_row + 1,
+                    end_row,
                     8,
                     11,
-                ),
+                    {"backgroundColor": table["body_color"]},
+                    "userEnteredFormat.backgroundColor",
+                )
+        for separator_row in invoice_separator_rows:
+            _add_format_request(
+                separator_row,
+                separator_row,
+                8,
+                11,
+                {"backgroundColor": COL_WHITE},
+                "userEnteredFormat.backgroundColor",
+            )
+        _add_format_request(
+            invoice_start,
+            invoice_end,
+            9,
+            9,
+            {
+                "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
+                "horizontalAlignment": "LEFT",
+                "wrapStrategy": "CLIP",
+            },
+            "userEnteredFormat(textFormat,horizontalAlignment,wrapStrategy)",
+        )
+        _add_format_request(
+            invoice_start,
+            invoice_end,
+            8,
+            8,
+            {"horizontalAlignment": "CENTER", "wrapStrategy": "CLIP"},
+            "userEnteredFormat(horizontalAlignment,wrapStrategy)",
+        )
+        _add_format_request(
+            invoice_start,
+            invoice_end,
+            10,
+            11,
+            {"horizontalAlignment": "RIGHT"},
+            "userEnteredFormat.horizontalAlignment",
+        )
+        for table in invoice_table_ranges:
+            _add_format_request(
+                table["header_row"],
+                table["header_row"],
+                9,
+                9,
+                {"horizontalAlignment": "CENTER"},
+                "userEnteredFormat.horizontalAlignment",
+            )
+        if qrisduwit_parent_invoice_row:
+            _add_format_request(
+                qrisduwit_parent_invoice_row,
+                qrisduwit_parent_invoice_row,
+                8,
+                11,
                 {
                     "backgroundColor": COL_CASH_HEADER,
                     "textFormat": {"bold": True, "foregroundColor": COL_HEADER},
                     "horizontalAlignment": "CENTER",
                 },
+                "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
             )
-    ws.format("A1:F1", {
-        "backgroundColor": COL_HEADER,
-        "horizontalAlignment": "CENTER",
-        "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
-    })
-    ws.format("G1", {"backgroundColor": COL_WHITE})
-    ws.format("H1:K1", {
-        "backgroundColor": COL_HEADER,
-        "horizontalAlignment": "CENTER",
-        "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
-    })
+    _add_format_request(
+        1,
+        1,
+        1,
+        6,
+        {
+            "backgroundColor": COL_HEADER,
+            "horizontalAlignment": "CENTER",
+            "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
+        },
+        "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)",
+    )
+    _add_format_request(
+        1,
+        1,
+        7,
+        7,
+        {"backgroundColor": COL_WHITE},
+        "userEnteredFormat.backgroundColor",
+    )
+    _add_format_request(
+        1,
+        1,
+        8,
+        11,
+        {
+            "backgroundColor": COL_HEADER,
+            "horizontalAlignment": "CENTER",
+            "textFormat": {"bold": True, "foregroundColor": COL_WHITE},
+        },
+        "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)",
+    )
     old_dashboard_range = {
         "sheetId": ws.id,
         "startRowIndex": 0,
@@ -1212,9 +1927,12 @@ def append_daily_to_gsheet(
                 "fields": "gridProperties.frozenRowCount",
             }
         },
+        _header_value_request(summary_headers),
         *invoice_header_unmerge_requests,
         *_unmerge_range_requests(2, 2, 8, 11),
         *blank_invoice_merge_requests,
+        *format_requests,
+        *_clear_cell_grid_border_requests(data_start, data_end, 1, 11),
         *_cell_grid_border_requests(1, 1, 1, 11),
         *_cell_grid_border_requests(2, 2, 1, 11),
         *_cell_grid_border_requests(data_start, data_end, 1, 11),
@@ -1322,6 +2040,8 @@ def process_daily_upload(
             starting_date_str=starting_balance_date,
             starting_balance=default_starting_balance,
         )
+
+    ensure_linkaja_fee_reference_sheet(gspread_client, sh)
 
     return append_daily_to_gsheet(
         gspread_client,
