@@ -474,6 +474,17 @@ def setup_initial_headers_and_saldo(
         *_delete_all_protected_range_requests(sh, ws),
         {
             "repeatCell": {
+                "range": _grid_range(ws, 1, 2, 1, 11),
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat.textFormat.bold",
+            }
+        },
+        {
+            "repeatCell": {
                 "range": _grid_range(ws, 1, 1, 1, 11),
                 "cell": {
                     "userEnteredFormat": {
@@ -682,6 +693,7 @@ def append_daily_to_gsheet(
     COL_FOOTER_HEADER = {"red": 0.800, "green": 0.880, "blue": 0.950}
     COL_FOOTER_BODY = {"red": 0.900, "green": 0.940, "blue": 0.980}
     COL_INPUT = COL_STATUS
+    COL_DEFAULT_TEXT = {"red": 0, "green": 0, "blue": 0}
     COL_MUTED_TEXT = {"red": 0.420, "green": 0.420, "blue": 0.420}
     INVOICE_DETAIL_START_OFFSET = 0
 
@@ -1012,18 +1024,14 @@ def append_daily_to_gsheet(
     def _existing_mandiri_cells(values: list[list[str]]) -> list[tuple[int, int]]:
         cells = []
         for idx, row in enumerate(values, start=1):
-            # New layout: KETERANGAN is column C and MANDIRI input is column D.
-            if len(row) > 2 and str(row[2]).strip().upper() == "MANDIRI":
-                if len(row) > 3 and str(row[3]).strip().upper() == "MANDIRI":
-                    # Previous 7-column layout kept TRANSACTION KEY in column D.
-                    cells.append((idx, 5))
-                else:
-                    cells.append((idx, 4))
-                continue
-
-            # Legacy layout: KETERANGAN was column B and MANDIRI input was column C.
-            if len(row) > 1 and str(row[1]).strip().upper() == "MANDIRI":
-                cells.append((idx, 3))
+            if (
+                len(row) > 2
+                and str(row[1]).strip().upper() == "CASH"
+                and str(row[2]).strip().upper() == "MANDIRI"
+            ):
+                # Current layout: KETERANGAN is column C and MANDIRI input is D.
+                # Do not expose column C from MANDIRI invoice/report rows.
+                cells.append((idx, 4))
         return cells
 
     def _matching_summary_date_block_rows(
@@ -1668,6 +1676,22 @@ def append_daily_to_gsheet(
         11,
         {"backgroundColor": COL_WHITE},
         "userEnteredFormat.backgroundColor",
+    )
+    _add_format_request(
+        data_start,
+        data_end,
+        1,
+        11,
+        {
+            "textFormat": {
+                "bold": True,
+                "foregroundColor": COL_DEFAULT_TEXT,
+            }
+        },
+        (
+            "userEnteredFormat.textFormat.bold,"
+            "userEnteredFormat.textFormat.foregroundColor"
+        ),
     )
     _add_format_request(
         data_start,

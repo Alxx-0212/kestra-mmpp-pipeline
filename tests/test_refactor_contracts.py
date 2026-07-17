@@ -410,6 +410,94 @@ class SharedSpreadsheetOpenContractTest(unittest.TestCase):
             sum(1 for request in batch_requests if "repeatCell" in request),
             10,
         )
+        self.assertTrue(any(
+            "repeatCell" in request
+            and request["repeatCell"]["range"]["startRowIndex"] == 2
+            and request["repeatCell"]["range"]["startColumnIndex"] == 0
+            and request["repeatCell"]["range"]["endColumnIndex"] == 11
+            and request["repeatCell"]["fields"]
+            == (
+                "userEnteredFormat.textFormat.bold,"
+                "userEnteredFormat.textFormat.foregroundColor"
+            )
+            and request["repeatCell"]["cell"]["userEnteredFormat"]
+            ["textFormat"]["bold"] is True
+            and request["repeatCell"]["cell"]["userEnteredFormat"]
+            ["textFormat"]["foregroundColor"] == {"red": 0, "green": 0, "blue": 0}
+            for request in batch_requests
+        ))
+
+    def test_summary_protection_only_unprotects_mandiri_d_cells(self):
+        spreadsheet = Mock()
+        worksheet = Mock()
+        worksheet.id = 123
+        worksheet.row_count = 1000
+        worksheet.get_all_values.return_value = [
+            [
+                "REPORT DATE",
+                "SECTION",
+                "KETERANGAN",
+                "DEBET",
+                "KREDIT",
+                "SALDO",
+                "",
+                "REPORT DATE",
+                "INVOICE REPORT",
+                "DEBET",
+                "KREDIT",
+            ],
+            ["30/06/2026", "", "SALDO 30/06/2026", "", "", "0"],
+            ["30/06/2026", "MANDIRI", "NGRS", "100", "", ""],
+            ["30/06/2026", "Cash", "MANDIRI", "100", "", ""],
+        ]
+        spreadsheet.worksheet.return_value = worksheet
+        spreadsheet.fetch_sheet_metadata.return_value = {
+            "sheets": [{
+                "properties": {"sheetId": worksheet.id},
+                "protectedRanges": [],
+            }]
+        }
+        summary_df = pd.DataFrame([{
+            "Transaction_Date": "2026-07-01",
+            "Transaction": "RECHARGE",
+            "Sum_of_Debet": 0,
+            "Sum_of_Kredit": 100,
+            "Transaction_Count": 1,
+        }])
+
+        with patch(
+            "finpay_pipeline.summary_sheets.open_or_create_finpay_spreadsheet",
+            return_value=spreadsheet,
+        ):
+            summary_sheets.append_daily_to_gsheet(
+                gspread_client=Mock(),
+                target_spreadsheet="FINPAY REPORT",
+                target_worksheet="PKY",
+                summary_df=summary_df,
+            )
+
+        batch_requests = spreadsheet.batch_update.call_args.args[0]["requests"]
+        protected_sheet = next(
+            request["addProtectedRange"]["protectedRange"]
+            for request in batch_requests
+            if (
+                "addProtectedRange" in request
+                and request["addProtectedRange"]["protectedRange"]["range"]
+                == {"sheetId": worksheet.id}
+            )
+        )
+        unprotected_ranges = protected_sheet["unprotectedRanges"]
+        self.assertTrue(unprotected_ranges)
+        self.assertTrue(all(
+            protected_range["startColumnIndex"] == 3
+            and protected_range["endColumnIndex"] == 4
+            for protected_range in unprotected_ranges
+        ))
+        self.assertFalse(any(
+            protected_range["startColumnIndex"] == 2
+            and protected_range["endColumnIndex"] == 3
+            for protected_range in unprotected_ranges
+        ))
 
     def test_summary_rerun_batches_replacement_structure(self):
         spreadsheet = Mock()
