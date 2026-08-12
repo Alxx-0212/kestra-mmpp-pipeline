@@ -34,6 +34,8 @@ preserve its chat and plan context. Use --linkaja-picker to select it from all
 local projects. --linkaja-fresh is an explicit opt-out. Managed Codex windows
 use inline terminal output, tmux mouse scrolling, and a 50,000-line history by
 default. Override the history size with CODEX_LANES_TMUX_HISTORY_LIMIT.
+
+Full reference: scripts/README.md
 EOF
 }
 

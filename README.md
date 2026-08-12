@@ -80,7 +80,9 @@ Domain-specific SQL no longer lives in a shared root directory:
 Use the checked-in launcher with one clean integration checkout and two sibling
 Git worktrees. Each Codex TUI receives a separate filesystem, branch, and tmux
 window, so FinPay and LinkAja changes cannot overwrite one another's working
-files. Root/shared files remain in the integration lane.
+files. Root/shared files remain in the integration lane. See the
+[complete command and environment reference](scripts/README.md) for every
+launcher argument, safety check, and internal function.
 
 The stable branch and worktree layout is:
 

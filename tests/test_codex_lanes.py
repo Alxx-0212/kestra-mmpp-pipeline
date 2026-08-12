@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPOSITORY_ROOT / "scripts" / "codex-lanes"
+LAUNCHER_DOCUMENTATION = REPOSITORY_ROOT / "scripts" / "README.md"
 PROJECT_CODEX = REPOSITORY_ROOT / ".codex"
 
 
@@ -50,6 +52,45 @@ class CodexProjectConfigurationTest(unittest.TestCase):
     def test_launcher_is_executable_and_has_valid_bash_syntax(self):
         self.assertTrue(LAUNCHER.stat().st_mode & stat.S_IXUSR)
         subprocess.run(["bash", "-n", str(LAUNCHER)], check=True)
+
+    def test_launcher_documentation_covers_the_public_interface(self):
+        documentation = LAUNCHER_DOCUMENTATION.read_text()
+        help_output = subprocess.run(
+            [str(LAUNCHER), "--help"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        for command in ("init", "start", "status", "check", "stop"):
+            self.assertIn(f"### `{command}`", documentation)
+            self.assertIn(f"scripts/codex-lanes {command}", help_output)
+        for option in (
+            "--linkaja-fork",
+            "--linkaja-picker",
+            "--linkaja-fresh",
+        ):
+            self.assertIn(option, documentation)
+            self.assertIn(option, help_output)
+        for variable in (
+            "CODEX_LANES_INTEGRATION_BRANCH",
+            "CODEX_LANES_FINPAY_BRANCH",
+            "CODEX_LANES_LINKAJA_BRANCH",
+            "CODEX_LANES_FINPAY_PATH",
+            "CODEX_LANES_LINKAJA_PATH",
+            "CODEX_LANES_TMUX_SESSION",
+            "CODEX_LANES_TMUX_HISTORY_LIMIT",
+            "CODEX_LANES_CODEX_BIN",
+        ):
+            self.assertIn(variable, documentation)
+        internal_functions = re.findall(
+            r"^([a-z_]+)\(\) \{",
+            LAUNCHER.read_text(),
+            flags=re.MULTILINE,
+        )
+        for function in internal_functions:
+            self.assertIn(f"`{function}`", documentation)
 
 
 @unittest.skipUnless(
