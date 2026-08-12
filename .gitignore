@@ -7,4 +7,11 @@ __pycache__/
 data/
 .idea/
 main.ipynb
-sql/
+docs/
+
+# Local dbt learning/runtime artifacts
+.venv-dbt/
+linkaja_fee_pipeline/dbt/profiles.yml
+linkaja_fee_pipeline/dbt/target/
+linkaja_fee_pipeline/dbt/logs/
+linkaja_fee_pipeline/dbt/dbt_packages/

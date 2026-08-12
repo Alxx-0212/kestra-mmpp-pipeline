@@ -102,7 +102,7 @@ services:
               path: /tmp/kestra-wd/tmp
             python:
               version: "3.11"
-          url: http://localhost:8080/
+          url: http://localhost:8081/
           
           plugins:
             configurations:
@@ -111,7 +111,7 @@ services:
                   volumeEnabled: true
                   networkMode: finpay-network
     ports:
-      - "8080:8080"
+      - "8081:8080"
     depends_on:
       postgres:
         condition: service_healthy

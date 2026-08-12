@@ -1,0 +1,18 @@
+# In-memory configuration for local, read-only flow validation with the pinned
+# Kestra CLI image. It is not a server or production configuration.
+datasources:
+  h2:
+    url: jdbc:h2:mem:kestra;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: kestra
+    password: ""
+    driver-class-name: org.h2.Driver
+
+kestra:
+  repository:
+    type: h2
+  queue:
+    type: h2
+  storage:
+    type: local
+    local:
+      base-path: /tmp/kestra-storage

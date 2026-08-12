@@ -1,0 +1,31 @@
+# Never send local secrets, source data, or repository metadata to Docker.
+.git
+.gitignore
+.env
+.env_encoded
+.env.*
+data/
+tmp/
+docs/
+main.ipynb
+
+# Local Python and tool state.
+**/__pycache__/
+**/*.py[cod]
+.venv/
+.venv-*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local dbt learning/runtime state.
+linkaja_fee_pipeline/dbt/profiles.yml
+linkaja_fee_pipeline/dbt/target/
+linkaja_fee_pipeline/dbt/logs/
+linkaja_fee_pipeline/dbt/dbt_packages/
+
+# Test and generated artifacts are not used by either runtime Dockerfile.
+tests/
+**/*.parquet
+**/*.xlsx
+**/*.xls
