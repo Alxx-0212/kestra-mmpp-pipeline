@@ -8,6 +8,7 @@ INTEGRATION_BRANCH=${CODEX_LANES_INTEGRATION_BRANCH:-integration/mmpp-next}
 FINPAY_BRANCH=${CODEX_LANES_FINPAY_BRANCH:-agent/finpay-next}
 LINKAJA_BRANCH=${CODEX_LANES_LINKAJA_BRANCH:-agent/linkaja-next}
 TMUX_SESSION=${CODEX_LANES_TMUX_SESSION:-mmpp-agents}
+TMUX_HISTORY_LIMIT=${CODEX_LANES_TMUX_HISTORY_LIMIT:-50000}
 CODEX_BIN=${CODEX_LANES_CODEX_BIN:-codex}
 
 usage() {
@@ -30,7 +31,9 @@ Commands:
 
 Use --linkaja-fork with the UUID from the existing LinkAja conversation to
 preserve its chat and plan context. Use --linkaja-picker to select it from all
-local projects. --linkaja-fresh is an explicit opt-out.
+local projects. --linkaja-fresh is an explicit opt-out. Managed Codex windows
+use inline terminal output, tmux mouse scrolling, and a 50,000-line history by
+default. Override the history size with CODEX_LANES_TMUX_HISTORY_LIMIT.
 EOF
 }
 
@@ -163,6 +166,8 @@ start_lanes() {
         [[ "$linkaja_session_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
             || die "invalid LinkAja session UUID: $linkaja_session_id"
     fi
+    [[ "$TMUX_HISTORY_LIMIT" =~ ^[1-9][0-9]*$ ]] \
+        || die "CODEX_LANES_TMUX_HISTORY_LIMIT must be a positive integer"
 
     acquire_lock
     require_integration_checkout
@@ -176,18 +181,19 @@ start_lanes() {
     tmux has-session -t "$TMUX_SESSION" 2>/dev/null && die "tmux session already exists: $TMUX_SESSION"
 
     local integrator_prompt finpay_prompt linkaja_prompt
-    local -a integrator_command finpay_command linkaja_command
+    local -a tui_options integrator_command finpay_command linkaja_command
     integrator_prompt=$(prompt_text "$root/.codex/prompts/integrator.md")
     finpay_prompt=$(prompt_text "$root/.codex/prompts/finpay.md")
     linkaja_prompt=$(prompt_text "$root/.codex/prompts/linkaja-relocation.md")
-    integrator_command=("$CODEX_BIN" --strict-config -C "$root" "$integrator_prompt")
-    finpay_command=("$CODEX_BIN" --strict-config -C "$FINPAY_PATH" "$finpay_prompt")
+    tui_options=(--no-alt-screen --strict-config)
+    integrator_command=("$CODEX_BIN" "${tui_options[@]}" -C "$root" "$integrator_prompt")
+    finpay_command=("$CODEX_BIN" "${tui_options[@]}" -C "$FINPAY_PATH" "$finpay_prompt")
     if [[ "$linkaja_mode" == fork ]]; then
-        linkaja_command=("$CODEX_BIN" fork --strict-config -C "$LINKAJA_PATH" "$linkaja_session_id" "$linkaja_prompt")
+        linkaja_command=("$CODEX_BIN" fork "${tui_options[@]}" -C "$LINKAJA_PATH" "$linkaja_session_id" "$linkaja_prompt")
     elif [[ "$linkaja_mode" == picker ]]; then
-        linkaja_command=("$CODEX_BIN" fork --all --strict-config -C "$LINKAJA_PATH")
+        linkaja_command=("$CODEX_BIN" fork --all "${tui_options[@]}" -C "$LINKAJA_PATH")
     else
-        linkaja_command=("$CODEX_BIN" --strict-config -C "$LINKAJA_PATH" "$linkaja_prompt")
+        linkaja_command=("$CODEX_BIN" "${tui_options[@]}" -C "$LINKAJA_PATH" "$linkaja_prompt")
     fi
 
     local session_created=false
@@ -197,14 +203,20 @@ start_lanes() {
         fi
     }
     trap cleanup_failed_start ERR INT TERM HUP
-    tmux new-session -d -s "$TMUX_SESSION" -n integrator -c "$root" "${integrator_command[@]}"
+    tmux new-session -d -s "$TMUX_SESSION" -n bootstrap -c "$root" "sleep 300"
     session_created=true
+    tmux set-option -t "$TMUX_SESSION" mouse on
+    tmux set-option -t "$TMUX_SESSION" history-limit "$TMUX_HISTORY_LIMIT"
+    tmux new-window -d -t "$TMUX_SESSION:" -n integrator -c "$root" "${integrator_command[@]}"
     tmux new-window -d -t "$TMUX_SESSION:" -n finpay -c "$FINPAY_PATH" "${finpay_command[@]}"
     tmux new-window -d -t "$TMUX_SESSION:" -n linkaja -c "$LINKAJA_PATH" "${linkaja_command[@]}"
+    tmux kill-window -t "$TMUX_SESSION:bootstrap"
+    tmux select-window -t "$TMUX_SESSION:integrator"
     trap - ERR INT TERM HUP
     flock -u 9
 
     printf 'Started tmux session %s. Attach with:\n  tmux attach -t %q\n' "$TMUX_SESSION" "$TMUX_SESSION"
+    printf 'Scrollback: Codex inline mode, tmux mouse on, history limit %s lines.\n' "$TMUX_HISTORY_LIMIT"
     if [[ "$linkaja_mode" == fork ]]; then
         printf 'LinkAja forked session: %s\n' "$linkaja_session_id"
     elif [[ "$linkaja_mode" == picker ]]; then

@@ -115,6 +115,16 @@ the conversation, send one message confirming that it should continue from
 `agent/linkaja-next`. Do not commit the session UUID. If prior context is not
 needed, opt out explicitly with `--linkaja-fresh`.
 
+The launcher runs every Codex TUI with `--no-alt-screen`, enables tmux mouse
+support, and gives each new pane 50,000 lines of history. After restarting the
+managed session, the mouse wheel scrolls tmux history instead of searching only
+the current Codex view. Keyboard navigation remains available: press `Ctrl-b [`
+to enter copy mode, use `PageUp`, `PageDown`, `Ctrl-u`, or `Ctrl-d`, and press
+`q` to exit. Set `CODEX_LANES_TMUX_HISTORY_LIMIT` to a positive integer before
+`start` if a different limit is needed. These settings apply only to the
+launcher-managed tmux session; they do not modify the user's global tmux
+configuration.
+
 Before handing a domain branch to the integrator, enforce its file boundary:
 
 ```bash

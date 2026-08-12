@@ -205,6 +205,10 @@ class CodexLaneLauncherTest(unittest.TestCase):
         launch_log = self.base / "codex-cwd.log"
         fake_codex.write_text(
             "#!/usr/bin/env bash\n"
+            "case \" $* \" in\n"
+            "  *\" --no-alt-screen \"*) ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n"
             f"printf '%s\\n' \"$PWD\" >>{launch_log}\n"
             "exec sleep 300\n"
         )
@@ -220,6 +224,7 @@ class CodexLaneLauncherTest(unittest.TestCase):
         )
         self.assertEqual(started.returncode, 0, started.stderr)
         self.assertIn("LinkAja forked session", started.stdout)
+        self.assertIn("history limit 50000 lines", started.stdout)
         windows = subprocess.run(
             [
                 "tmux",
@@ -237,6 +242,62 @@ class CodexLaneLauncherTest(unittest.TestCase):
             {line.split("|", 1)[0] for line in windows},
             {"integrator", "finpay", "linkaja"},
         )
+        self.assertEqual(
+            subprocess.run(
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    self.tmux_session,
+                    "#{window_name}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "integrator",
+        )
+        self.assertEqual(
+            subprocess.run(
+                ["tmux", "show-options", "-t", self.tmux_session, "-v", "mouse"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "on",
+        )
+        self.assertEqual(
+            subprocess.run(
+                [
+                    "tmux",
+                    "show-options",
+                    "-t",
+                    self.tmux_session,
+                    "-v",
+                    "history-limit",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "50000",
+        )
+        pane_history_limits = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-s",
+                "-t",
+                self.tmux_session,
+                "-F",
+                "#{history_limit}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertEqual(pane_history_limits, ["50000", "50000", "50000"])
         deadline = time.monotonic() + 2
         launched_directories = set()
         while time.monotonic() < deadline:
@@ -268,6 +329,17 @@ class CodexLaneLauncherTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--linkaja-picker", result.stderr)
+
+    def test_start_rejects_an_invalid_tmux_history_limit(self):
+        self.environment["CODEX_LANES_TMUX_HISTORY_LIMIT"] = "0"
+
+        result = self.run_launcher("start", "--linkaja-fresh", check=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "CODEX_LANES_TMUX_HISTORY_LIMIT must be a positive integer",
+            result.stderr,
+        )
 
 
 if __name__ == "__main__":
