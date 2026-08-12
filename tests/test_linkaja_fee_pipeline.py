@@ -8,18 +8,55 @@ from linkaja_fee_pipeline.processing import (
     CLUSTER_ID_HEADER,
     EXPECTED_FEE_HEADER,
     IN_CLUSTER_FEE_HEADER,
+    LINKAJA_SOURCE_COLUMNS,
+    RAW_NORMALIZED_COLUMNS,
     REPORT_DATE_HEADER,
     TOTAL_FEE_HEADER,
     aggregate_linkaja_fee_file,
+    normalize_linkaja_csv,
+)
+from linkaja_fee_pipeline.database import (
+    DETAIL_HEADERS,
+    DETAIL_REPORT_DATE_HEADER,
+    MEASURE_COMPANY_CREDIT_HEADER,
+    MEASURE_COMPANY_DEBIT_HEADER,
+    MEASURE_EXPECTED_FEE_HEADER,
+    MEASURE_IN_CLUSTER_FEE_HEADER,
+    MEASURE_REVERSAL_COUNT_HEADER,
+    MEASURE_REVERSAL_FEE_HEADER,
+    MEASURE_SCENARIO_HEADER,
+    MEASURE_SOURCE_FEE_HEADER,
+    MEASURE_SOURCE_FEE_MISSING_COUNT_HEADER,
+    MEASURE_UNRESOLVED_COUNT_HEADER,
 )
 from linkaja_fee_pipeline.sheets import matching_date_cluster_rows
 from linkaja_fee_pipeline.sheets import (
     CLUSTER_START_COLUMNS,
+    COMPLETE_IN_CLUSTER_REVERSAL_LABEL,
+    COMPLETE_REVERSAL_PREFIX,
+    CASH_SECTION_LABEL,
     DATA_START_ROW,
+    DETAIL_COLUMN_WIDTHS,
+    DETAIL_SECTION_LABEL,
     EXPECTED_FEE_COLUMN_WIDTH,
+    EXPECTED_FEE_LEDGER_LABEL,
     IN_CLUSTER_FEE_COLUMN_WIDTH,
+    IN_CLUSTER_FEE_LEDGER_LABEL,
     KNOWN_CLUSTER_ORDER,
+    LEGACY_DETAIL_HEADERS,
+    MANDIRI_SECTION_LABEL,
+    OUT_CLUSTER_SCENARIO,
+    POSTED_FEE_SCENARIO,
+    PREVIOUS_DETAIL_HEADERS,
+    PPOB_SCENARIO,
+    REVERSAL_COUNT_LEDGER_LABEL,
+    REVERSAL_FEE_LEDGER_LABEL,
+    SELISIH_LABEL,
     STATIC_SHEET_COL_COUNT,
+    TOTAL_EXPECTED_MANDIRI_LABEL,
+    UNRESOLVED_COUNT_LEDGER_LABEL,
+    UNRESOLVED_REVERSAL_LABEL,
+    WITHDRAWAL_SCENARIO,
     _add_protected_sheet_request,
     _build_static_header_values,
     _build_side_by_side_values,
@@ -27,9 +64,12 @@ from linkaja_fee_pipeline.sheets import (
     _cluster_id_from_title,
     _delete_all_protected_range_requests,
     _extract_cluster_tables,
+    _format_linkaja_detail_sheet,
+    _merge_detail_summary_values,
     _merge_replacement_rows,
     _protection_editor_emails,
     _write_cluster_data_blocks,
+    detail_worksheet_for_cluster,
     setup_linkaja_fee_headers,
 )
 
@@ -54,7 +94,7 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
         def get_all_values(self):
             return self.values
 
-        def update(self, range_name, values, value_input_option=None):
+        def update(self, values, range_name=None, value_input_option=None):
             self.updates.append((range_name, values, value_input_option))
 
     class FakeSpreadsheet:
@@ -66,6 +106,674 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
 
         def fetch_sheet_metadata(self, _params):
             return {"sheets": [{"properties": {"sheetId": 123}, "protectedRanges": []}]}
+
+    @staticmethod
+    def full_source_row(**overrides):
+        row = {column: "" for column in LINKAJA_SOURCE_COLUMNS}
+        row.update({
+            "No": "1",
+            "Top Organization": "123456-TEST COMPANY",
+            "Parent Organization": "123456-TEST COMPANY",
+            "Organization": "123456-TEST COMPANY",
+            "Transaction ID": "TX-1",
+            "Finalized Date": "01/07/2026",
+            "Finalized Time": "12:34:56",
+            "Initiate Date": "01/07/2026",
+            "Initiate Time": "12:30:00",
+            "Transaction Type": "Transfer",
+            "Transaction Scenario": "Organization Withdraw of Funds with Next Working Day Payment",
+            "Transaction Status": "Completed",
+            "Account": "123 - Organization MFS Purchase Account",
+            "Debit": "1000",
+            "Credit": "0",
+            "Balance": "50",
+        })
+        row.update(overrides)
+        return row
+
+    def test_normalizes_full_csv_for_database_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "laporan-123456-TEST-1.csv"
+            output = Path(temp_dir) / "normalized.csv"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=LINKAJA_SOURCE_COLUMNS)
+                writer.writeheader()
+                writer.writerows([
+                    self.full_source_row(),
+                    self.full_source_row(
+                        **{
+                            "No": "2",
+                            "Organization": "654321-AGENT",
+                            "Transaction ID": "TX-2",
+                            "Transaction Scenario": "Digipos B2B Transfer In Cluster",
+                            "Debit": "2000",
+                            "Fee": "20",
+                        }
+                    ),
+                ])
+
+            manifest = normalize_linkaja_csv(
+                source,
+                output,
+                filename_hint=source.name,
+                load_id="load-1",
+            )
+            with output.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(manifest.cluster_id, "123456")
+        self.assertEqual(manifest.source_rows, 2)
+        self.assertEqual(manifest.report_dates, ["2026-07-01"])
+        self.assertEqual(list(rows[0]), RAW_NORMALIZED_COLUMNS)
+        self.assertEqual(rows[0]["finalized_date"], "2026-07-01")
+        self.assertEqual(rows[0]["finalized_time"], "12:34:56")
+        self.assertEqual(rows[0]["debit"], "1000")
+        self.assertEqual(rows[0]["fee"], "")
+        self.assertEqual(rows[1]["fee"], "20")
+
+    def test_normalizer_rejects_non_csv_input(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source_file"
+            source.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unsupported LinkAja input"):
+                normalize_linkaja_csv(
+                    source,
+                    Path(temp_dir) / "normalized.csv",
+                    filename_hint="laporan-123456-TEST.xlsx",
+                    load_id="load-1",
+                )
+
+    def test_normalizer_requires_exact_source_header(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "laporan-123456-TEST.csv"
+            source.write_text("Finalized Date,Transaction ID\n01/07/2026,TX-1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid LinkAja CSV header"):
+                normalize_linkaja_csv(
+                    source,
+                    Path(temp_dir) / "normalized.csv",
+                    filename_hint=source.name,
+                    load_id="load-1",
+                )
+
+    def test_replaces_complete_detail_dates_and_preserves_other_dates(self):
+        existing = [
+            DETAIL_HEADERS,
+            ["01/07/2026", DETAIL_SECTION_LABEL, "OLD SCENARIO", "", "", 10],
+            [
+                "01/07/2026",
+                MANDIRI_SECTION_LABEL,
+                TOTAL_EXPECTED_MANDIRI_LABEL,
+                10,
+                "",
+                "",
+            ],
+            ["02/07/2026", DETAIL_SECTION_LABEL, "KEEP SCENARIO", "", "", 30],
+            [
+                "02/07/2026",
+                MANDIRI_SECTION_LABEL,
+                TOTAL_EXPECTED_MANDIRI_LABEL,
+                30,
+                "",
+                "",
+            ],
+        ]
+        new_rows = [{
+            DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+            MEASURE_SCENARIO_HEADER: WITHDRAWAL_SCENARIO,
+            MEASURE_COMPANY_DEBIT_HEADER: 1000,
+            MEASURE_COMPANY_CREDIT_HEADER: 0,
+            MEASURE_SOURCE_FEE_HEADER: 0,
+            MEASURE_EXPECTED_FEE_HEADER: 0,
+            MEASURE_REVERSAL_COUNT_HEADER: 0,
+            MEASURE_REVERSAL_FEE_HEADER: 0,
+        }]
+
+        values, replaced = _merge_detail_summary_values(
+            existing,
+            new_rows,
+            ["01/07/2026"],
+        )
+
+        self.assertEqual(replaced, 2)
+        self.assertEqual(values[0], DETAIL_HEADERS)
+        self.assertNotIn("OLD SCENARIO", [row[2] for row in values])
+        self.assertIn("KEEP SCENARIO", [row[2] for row in values])
+        withdrawal_row = next(row for row in values if row[2] == WITHDRAWAL_SCENARIO)
+        self.assertEqual(withdrawal_row[3:], [1000, "", ""])
+        self.assertEqual(len(withdrawal_row), 6)
+
+    def test_builds_fee_count_and_mandiri_rows_in_six_column_ledger(self):
+        new_rows = [
+            {
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: "Digipos B2B Transfer",
+                MEASURE_COMPANY_DEBIT_HEADER: 0,
+                MEASURE_COMPANY_CREDIT_HEADER: 1000,
+                MEASURE_SOURCE_FEE_HEADER: 0,
+                MEASURE_EXPECTED_FEE_HEADER: 200,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            },
+            {
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: "Digipos B2B Transfer In Cluster",
+                MEASURE_COMPANY_DEBIT_HEADER: 0,
+                MEASURE_COMPANY_CREDIT_HEADER: 500,
+                MEASURE_SOURCE_FEE_HEADER: 20,
+                MEASURE_IN_CLUSTER_FEE_HEADER: 20,
+                MEASURE_EXPECTED_FEE_HEADER: 0,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            },
+            {
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: PPOB_SCENARIO,
+                MEASURE_COMPANY_DEBIT_HEADER: 0,
+                MEASURE_COMPANY_CREDIT_HEADER: 0,
+                MEASURE_SOURCE_FEE_HEADER: 2400,
+                MEASURE_SOURCE_FEE_MISSING_COUNT_HEADER: 0,
+                MEASURE_EXPECTED_FEE_HEADER: 0,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            },
+            {
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: POSTED_FEE_SCENARIO,
+                MEASURE_COMPANY_DEBIT_HEADER: 0,
+                MEASURE_COMPANY_CREDIT_HEADER: 200,
+                MEASURE_SOURCE_FEE_HEADER: 0,
+                MEASURE_EXPECTED_FEE_HEADER: 0,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            },
+            {
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: "Buy Goods Reversal for General Merchant",
+                MEASURE_COMPANY_DEBIT_HEADER: 100,
+                MEASURE_COMPANY_CREDIT_HEADER: 0,
+                MEASURE_SOURCE_FEE_HEADER: 0,
+                MEASURE_EXPECTED_FEE_HEADER: 0,
+                MEASURE_REVERSAL_COUNT_HEADER: 2,
+                MEASURE_REVERSAL_FEE_HEADER: 40,
+            },
+            {
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: WITHDRAWAL_SCENARIO,
+                MEASURE_COMPANY_DEBIT_HEADER: 1200,
+                MEASURE_COMPANY_CREDIT_HEADER: 0,
+                MEASURE_SOURCE_FEE_HEADER: 0,
+                MEASURE_EXPECTED_FEE_HEADER: 0,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            },
+        ]
+
+        values, _replaced = _merge_detail_summary_values(
+            [],
+            new_rows,
+            ["01/07/2026"],
+        )
+
+        self.assertTrue(all(len(row) == 6 for row in values))
+        first_date_row = next(
+            row for row in values[1:] if row[0] == "01/07/2026"
+        )
+        self.assertEqual(
+            first_date_row[:3],
+            [
+                "01/07/2026",
+                DETAIL_SECTION_LABEL,
+                WITHDRAWAL_SCENARIO,
+            ],
+        )
+        self.assertEqual(first_date_row[3:], [1200, "", ""])
+        out_cluster_row = next(
+            row for row in values if row[2] == OUT_CLUSTER_SCENARIO
+        )
+        self.assertEqual(out_cluster_row[3:], [1000, 0, ""])
+        posted_fee_rows = [row for row in values if row[2] == POSTED_FEE_SCENARIO]
+        self.assertEqual(len(posted_fee_rows), 1)
+        self.assertEqual(posted_fee_rows[0][3:], [200, "", ""])
+        ppob_row = next(row for row in values if row[2] == PPOB_SCENARIO)
+        self.assertEqual(ppob_row[3:], [2400, "", ""])
+        expected_rows = [row for row in values if row[2] == EXPECTED_FEE_LEDGER_LABEL]
+        self.assertEqual(expected_rows[0][3:], ["", "", 200])
+        self.assertEqual(expected_rows[0][1], DETAIL_SECTION_LABEL)
+        self.assertFalse(any(
+            row[1] == MANDIRI_SECTION_LABEL
+            and row[2] in {
+                EXPECTED_FEE_LEDGER_LABEL,
+                POSTED_FEE_SCENARIO,
+                PPOB_SCENARIO,
+            }
+            for row in values
+        ))
+        in_cluster_fee_rows = [
+            row for row in values if row[2] == IN_CLUSTER_FEE_LEDGER_LABEL
+        ]
+        self.assertEqual(in_cluster_fee_rows[0][3:], ["", 20, ""])
+        reversal_count_row = next(
+            row for row in values
+            if row[2] == REVERSAL_COUNT_LEDGER_LABEL
+        )
+        self.assertEqual(reversal_count_row[5], 2)
+        reversal_fee_rows = [
+            row for row in values if row[2] == REVERSAL_FEE_LEDGER_LABEL
+        ]
+        self.assertEqual(reversal_fee_rows[0][3:], [40, "", ""])
+        self.assertEqual(
+            [row[2] for row in values].count(TOTAL_EXPECTED_MANDIRI_LABEL),
+            1,
+        )
+        mandiri_value_row = next(
+            row for row in values
+            if row[1] == CASH_SECTION_LABEL
+            and row[2] == MANDIRI_SECTION_LABEL
+        )
+        self.assertIn(WITHDRAWAL_SCENARIO.upper(), mandiri_value_row[3])
+        self.assertIn('INDIRECT("D"&ROW()+2&":D")', mandiri_value_row[3])
+        self.assertFalse(any(row[2] == "RUNNING TOTAL" for row in values))
+        selisih_row = next(row for row in values if row[2] == SELISIH_LABEL)
+        self.assertEqual(selisih_row[1], CASH_SECTION_LABEL)
+        total_row_number = values.index(next(
+            row for row in values if row[2] == TOTAL_EXPECTED_MANDIRI_LABEL
+        )) + 1
+        self.assertIn(f"-D{total_row_number}", selisih_row[3])
+        self.assertIn("PENDING WITHDRAWAL", selisih_row[5])
+
+    def test_inserts_blank_withdrawal_row_when_a_date_has_no_withdrawal(self):
+        values, _replaced = _merge_detail_summary_values(
+            [],
+            [{
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: OUT_CLUSTER_SCENARIO,
+                MEASURE_COMPANY_DEBIT_HEADER: 0,
+                MEASURE_COMPANY_CREDIT_HEADER: 1000,
+                MEASURE_SOURCE_FEE_HEADER: 0,
+                MEASURE_EXPECTED_FEE_HEADER: 200,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            }],
+            ["01/07/2026"],
+        )
+
+        first_date_row = next(
+            row for row in values[1:] if row[0] == "01/07/2026"
+        )
+        self.assertEqual(
+            first_date_row,
+            [
+                "01/07/2026",
+                DETAIL_SECTION_LABEL,
+                WITHDRAWAL_SCENARIO,
+                "",
+                "",
+                "",
+            ],
+        )
+
+    def test_unresolved_reversal_is_separate_and_overrides_payment_status(self):
+        values, _replaced = _merge_detail_summary_values(
+            [],
+            [
+                {
+                    DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                    MEASURE_SCENARIO_HEADER: UNRESOLVED_REVERSAL_LABEL,
+                    MEASURE_COMPANY_DEBIT_HEADER: 100,
+                    MEASURE_COMPANY_CREDIT_HEADER: 0,
+                    MEASURE_SOURCE_FEE_HEADER: 0,
+                    MEASURE_EXPECTED_FEE_HEADER: 0,
+                    MEASURE_REVERSAL_COUNT_HEADER: 0,
+                    MEASURE_REVERSAL_FEE_HEADER: 0,
+                    MEASURE_UNRESOLVED_COUNT_HEADER: 1,
+                }
+            ],
+            ["01/07/2026"],
+        )
+
+        reversal_row = next(
+            row for row in values
+            if row[1] == DETAIL_SECTION_LABEL
+            and row[2] == UNRESOLVED_REVERSAL_LABEL
+        )
+        self.assertEqual(reversal_row[3:], [0, 100, ""])
+        count_row = next(
+            row for row in values
+            if row[1] == DETAIL_SECTION_LABEL
+            and row[2] == UNRESOLVED_COUNT_LEDGER_LABEL
+        )
+        self.assertEqual(count_row[5], 1)
+        self.assertTrue(any(
+            row[1] == MANDIRI_SECTION_LABEL
+            and row[2] == UNRESOLVED_REVERSAL_LABEL
+            for row in values
+        ))
+        status_formula = next(
+            row[5] for row in values if row[2] == SELISIH_LABEL
+        )
+        self.assertIn("UNUSUAL - UNRESOLVED REVERSAL", status_formula)
+        self.assertNotIn("IF(=F", status_formula)
+
+    def test_complete_fee_reversal_is_detail_only(self):
+        complete_posted_fee_label = f"{COMPLETE_REVERSAL_PREFIX}{POSTED_FEE_SCENARIO}"
+        values, _replaced = _merge_detail_summary_values(
+            [],
+            [
+                {
+                    DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                    MEASURE_SCENARIO_HEADER: COMPLETE_IN_CLUSTER_REVERSAL_LABEL,
+                    MEASURE_COMPANY_DEBIT_HEADER: 1000,
+                    MEASURE_COMPANY_CREDIT_HEADER: 0,
+                    MEASURE_SOURCE_FEE_HEADER: 0,
+                    MEASURE_EXPECTED_FEE_HEADER: 0,
+                    MEASURE_REVERSAL_COUNT_HEADER: 1,
+                    MEASURE_REVERSAL_FEE_HEADER: 20,
+                },
+                {
+                    DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                    MEASURE_SCENARIO_HEADER: complete_posted_fee_label,
+                    MEASURE_COMPANY_DEBIT_HEADER: 200,
+                    MEASURE_COMPANY_CREDIT_HEADER: 0,
+                    MEASURE_SOURCE_FEE_HEADER: 0,
+                    MEASURE_EXPECTED_FEE_HEADER: 0,
+                    MEASURE_REVERSAL_COUNT_HEADER: 0,
+                    MEASURE_REVERSAL_FEE_HEADER: 0,
+                },
+            ],
+            ["01/07/2026"],
+        )
+
+        posted_fee_reversal = next(
+            row for row in values
+            if row[1] == DETAIL_SECTION_LABEL
+            and row[2] == complete_posted_fee_label
+        )
+        self.assertEqual(posted_fee_reversal[3:], [0, 200, ""])
+        self.assertTrue(any(
+            row[1] == MANDIRI_SECTION_LABEL
+            and row[2] == COMPLETE_IN_CLUSTER_REVERSAL_LABEL
+            for row in values
+        ))
+        self.assertFalse(any(
+            row[1] == MANDIRI_SECTION_LABEL
+            and row[2] == complete_posted_fee_label
+            for row in values
+        ))
+
+    def test_ppob_missing_fee_does_not_silently_become_zero(self):
+        values, _replaced = _merge_detail_summary_values(
+            [],
+            [{
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: PPOB_SCENARIO,
+                MEASURE_COMPANY_DEBIT_HEADER: 0,
+                MEASURE_COMPANY_CREDIT_HEADER: 0,
+                MEASURE_SOURCE_FEE_HEADER: 0,
+                MEASURE_SOURCE_FEE_MISSING_COUNT_HEADER: 1,
+                MEASURE_EXPECTED_FEE_HEADER: 0,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            }],
+            ["01/07/2026"],
+        )
+
+        ppob_row = next(row for row in values if row[2] == PPOB_SCENARIO)
+        self.assertEqual(ppob_row[3:], ["", "", ""])
+
+    def test_unknown_scenario_is_monitoring_only_in_other(self):
+        values, _replaced = _merge_detail_summary_values(
+            [],
+            [{
+                DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+                MEASURE_SCENARIO_HEADER: "Future Scenario",
+                MEASURE_COMPANY_DEBIT_HEADER: 10,
+                MEASURE_COMPANY_CREDIT_HEADER: 20,
+                MEASURE_SOURCE_FEE_HEADER: 0,
+                MEASURE_EXPECTED_FEE_HEADER: 0,
+                MEASURE_REVERSAL_COUNT_HEADER: 0,
+                MEASURE_REVERSAL_FEE_HEADER: 0,
+            }],
+            ["01/07/2026"],
+        )
+
+        future_row = next(row for row in values if row[2] == "Future Scenario")
+        self.assertEqual(future_row[3:], ["", "", 30])
+
+    def test_rerun_replaces_one_complete_ledger_block_without_duplicates(self):
+        first_measure = {
+            DETAIL_REPORT_DATE_HEADER: "01/07/2026",
+            MEASURE_SCENARIO_HEADER: "Digipos B2B Transfer",
+            MEASURE_COMPANY_DEBIT_HEADER: 0,
+            MEASURE_COMPANY_CREDIT_HEADER: 1000,
+            MEASURE_SOURCE_FEE_HEADER: 0,
+            MEASURE_EXPECTED_FEE_HEADER: 200,
+            MEASURE_REVERSAL_COUNT_HEADER: 0,
+            MEASURE_REVERSAL_FEE_HEADER: 0,
+        }
+        first_values, _replaced = _merge_detail_summary_values(
+            [],
+            [first_measure],
+            ["01/07/2026"],
+        )
+        replacement_measure = {
+            **first_measure,
+            MEASURE_COMPANY_CREDIT_HEADER: 1500,
+            MEASURE_EXPECTED_FEE_HEADER: 400,
+        }
+
+        replacement_values, replaced = _merge_detail_summary_values(
+            first_values,
+            [replacement_measure],
+            ["01/07/2026"],
+        )
+
+        self.assertEqual(replaced, len(first_values) - 1)
+        self.assertTrue(any(
+            row[1] == DETAIL_SECTION_LABEL
+            for row in replacement_values[1:]
+        ))
+        self.assertEqual(
+            [row[2] for row in replacement_values].count(
+                TOTAL_EXPECTED_MANDIRI_LABEL
+            ),
+            1,
+        )
+        detail_transfer = next(
+            row
+            for row in replacement_values
+            if row[2] == "Digipos B2B Transfer" and row[3] == 1500
+        )
+        self.assertEqual(detail_transfer[4:], [0, ""])
+
+    def test_migrates_previous_five_column_detail_layout(self):
+        previous = [
+            PREVIOUS_DETAIL_HEADERS,
+            ["01/07/2026", DETAIL_SECTION_LABEL, "", "", ""],
+            ["01/07/2026", "Digipos B2B Transfer", 1000, 0, ""],
+            ["01/07/2026", MANDIRI_SECTION_LABEL, "", "", ""],
+        ]
+
+        values, replaced = _merge_detail_summary_values(previous, [], [])
+
+        self.assertEqual(replaced, 0)
+        self.assertEqual(values[0], DETAIL_HEADERS)
+        transfer_row = next(
+            row for row in values if row[2] == "Digipos B2B Transfer"
+        )
+        self.assertEqual(
+            transfer_row,
+            [
+                "01/07/2026",
+                DETAIL_SECTION_LABEL,
+                "Digipos B2B Transfer",
+                1000,
+                0,
+                "",
+            ],
+        )
+
+    def test_clears_existing_other_for_recognized_detail_movement(self):
+        existing = [
+            DETAIL_HEADERS,
+            [
+                "01/07/2026",
+                DETAIL_SECTION_LABEL,
+                OUT_CLUSTER_SCENARIO,
+                1000,
+                0,
+                1000,
+            ],
+        ]
+
+        values, replaced = _merge_detail_summary_values(existing, [], [])
+
+        self.assertEqual(replaced, 0)
+        transfer_row = next(
+            row for row in values if row[2] == OUT_CLUSTER_SCENARIO
+        )
+        self.assertEqual(transfer_row[3:], [1000, 0, ""])
+
+    def test_migrates_expected_fee_to_other_only(self):
+        existing = [
+            DETAIL_HEADERS,
+            [
+                "01/07/2026",
+                DETAIL_SECTION_LABEL,
+                EXPECTED_FEE_LEDGER_LABEL,
+                "",
+                200,
+                200,
+            ],
+        ]
+
+        values, replaced = _merge_detail_summary_values(existing, [], [])
+
+        self.assertEqual(replaced, 0)
+        expected_row = next(
+            row for row in values if row[2] == EXPECTED_FEE_LEDGER_LABEL
+        )
+        self.assertEqual(expected_row[3:], ["", "", 200])
+
+    def test_migrates_legacy_nine_column_detail_layout(self):
+        legacy = [
+            LEGACY_DETAIL_HEADERS,
+            [
+                "01/07/2026",
+                "Digipos B2B Transfer",
+                1,
+                0,
+                1000,
+                0,
+                200,
+                0,
+                0,
+            ],
+        ]
+
+        values, replaced = _merge_detail_summary_values(legacy, [], [])
+
+        self.assertEqual(replaced, 0)
+        self.assertEqual(values[0], DETAIL_HEADERS)
+        transfer_row = next(
+            row for row in values if row[2] == "Digipos B2B Transfer"
+        )
+        self.assertEqual(transfer_row[3:], [1000, 0, ""])
+        self.assertTrue(any(
+            row[1] == MANDIRI_SECTION_LABEL
+            for row in values
+        ))
+
+    def test_detail_formatter_only_targets_the_six_used_columns(self):
+        worksheet = self.FakeWorksheet()
+        spreadsheet = self.FakeSpreadsheet()
+        values = [
+            DETAIL_HEADERS,
+            [
+                "01/07/2026",
+                DETAIL_SECTION_LABEL,
+                "Digipos B2B Transfer",
+                1000,
+                0,
+                "",
+            ],
+            [
+                "01/07/2026",
+                MANDIRI_SECTION_LABEL,
+                TOTAL_EXPECTED_MANDIRI_LABEL,
+                1000,
+                "",
+                "",
+            ],
+            [
+                "01/07/2026",
+                CASH_SECTION_LABEL,
+                MANDIRI_SECTION_LABEL,
+                1000,
+                "",
+                "",
+            ],
+            [
+                "01/07/2026",
+                CASH_SECTION_LABEL,
+                SELISIH_LABEL,
+                0,
+                "",
+                "SESUAI",
+            ],
+        ]
+
+        _format_linkaja_detail_sheet(
+            self.FakeClient(),
+            spreadsheet,
+            worksheet,
+            "421306",
+            values,
+        )
+
+        requests = spreadsheet.batch_updates[-1]["requests"]
+        cash_background_requests = [
+            request["repeatCell"]
+            for request in requests
+            if "repeatCell" in request
+            and request["repeatCell"].get("range", {}).get("startRowIndex") == 3
+            and request["repeatCell"].get("range", {}).get("endRowIndex") == 5
+            and request["repeatCell"].get("range", {}).get("startColumnIndex") == 0
+            and request["repeatCell"].get("range", {}).get("endColumnIndex")
+            == len(DETAIL_HEADERS)
+        ]
+        self.assertTrue(any(
+            request.get("cell", {})
+            .get("userEnteredFormat", {})
+            .get("backgroundColor")
+            == {"red": 0.965, "green": 0.930, "blue": 0.990}
+            for request in cash_background_requests
+        ))
+        column_widths = {
+            request["updateDimensionProperties"]["range"]["startIndex"]:
+            request["updateDimensionProperties"]["properties"]["pixelSize"]
+            for request in requests
+            if "updateDimensionProperties" in request
+        }
+        self.assertEqual(column_widths[2], DETAIL_COLUMN_WIDTHS[2])
+        self.assertEqual(column_widths[5], DETAIL_COLUMN_WIDTHS[5])
+        self.assertEqual(DETAIL_COLUMN_WIDTHS[2], 500)
+        self.assertEqual(DETAIL_COLUMN_WIDTHS[5], 280)
+        for request in requests:
+            operation = request.get("repeatCell") or request.get("updateBorders")
+            if operation and "range" in operation:
+                self.assertLessEqual(
+                    operation["range"].get("endColumnIndex", len(DETAIL_HEADERS)),
+                    len(DETAIL_HEADERS),
+                )
+            dimension = request.get("updateDimensionProperties", {}).get("range")
+            if dimension and dimension.get("dimension") == "COLUMNS":
+                self.assertLessEqual(
+                    dimension["endIndex"],
+                    len(DETAIL_HEADERS),
+                )
+
+    def test_uses_stable_cluster_detail_worksheet_names(self):
+        self.assertEqual(detail_worksheet_for_cluster("411311"), "PKY - LinkAja Detail")
 
     def test_aggregates_expected_and_in_cluster_fees_by_date(self):
         with tempfile.TemporaryDirectory() as temp_dir:

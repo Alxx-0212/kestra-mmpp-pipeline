@@ -1,0 +1,42 @@
+version: 2
+
+sources:
+  - name: linkaja
+    description: >-
+      Production-owned LinkAja PostgreSQL relations. dbt reads these relations
+      but does not own their migrations or ingestion.
+    schema: "{{ env_var('LINKAJA_SOURCE_SCHEMA', 'public') }}"
+    tables:
+      - name: raw_transactions
+        identifier: linkaja_raw_transactions
+        description: One row per normalized source ledger row.
+        columns:
+          - name: cluster_id
+            data_tests: [not_null]
+          - name: transaction_id
+            data_tests: [not_null]
+
+      - name: transaction_base
+        identifier: linkaja_transaction_base_v
+        description: One completed transaction fact before reversal enrichment.
+
+      - name: current_transactions
+        identifier: linkaja_transactions_current_v
+        description: Live transaction facts with current reversal enrichment.
+
+      - name: monthly_transactions
+        identifier: linkaja_transactions
+        description: Frozen transaction facts published for a cluster-month cutoff.
+        columns:
+          - name: cluster_id
+            data_tests: [not_null]
+          - name: transaction_id
+            data_tests: [not_null]
+          - name: report_month
+            data_tests: [not_null]
+          - name: calculation_cutoff
+            data_tests: [not_null]
+
+      - name: monthly_refreshes
+        identifier: linkaja_monthly_refreshes
+        description: Audit records for successful monthly publications.

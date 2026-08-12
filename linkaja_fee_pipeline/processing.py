@@ -1,4 +1,4 @@
-"""LinkAja fee extraction and aggregation."""
+"""LinkAja CSV normalization plus legacy fee aggregation helpers."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import csv
 import json
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -14,10 +14,69 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+LINKAJA_SOURCE_COLUMNS = [
+    "No",
+    "Top Organization",
+    "Parent Organization",
+    "Organization",
+    "Transaction ID",
+    "Original Transaction ID",
+    "Partner Reference Number",
+    "Invoice ID",
+    "Finalized Date",
+    "Finalized Time",
+    "Initiate Date",
+    "Initiate Time",
+    "Transaction Type",
+    "Transaction Scenario",
+    "Transaction Status",
+    "Transaction Statement",
+    "Account",
+    "Counter Party",
+    "Debit",
+    "Credit",
+    "Balance",
+    "Fee",
+]
+
 REQUIRED_COLUMNS = ("Finalized Date", "Transaction Scenario", "Debit", "Credit", "Fee")
 EXPECTED_SCENARIO = "Digipos B2B Transfer"
 IN_CLUSTER_SCENARIO = "Digipos B2B Transfer In Cluster"
 EXPECTED_FEE_PER_ROW = Decimal("200")
+PPOB_SCENARIO = "General to Purchase B2B Transfer Agent Telco"
+DIGIPOS_FEE_SCENARIO = "Digipos B2B Transfer Fee"
+DIGIPOS_FEE_PER_TRANSACTION = Decimal("200")
+IN_CLUSTER_FEE_PER_TRANSACTION = Decimal("20")
+REVERSAL_IN_CLUSTER_FEE_PER_TRANSACTION = Decimal("20")
+
+RAW_NORMALIZED_COLUMNS = [
+    "cluster_id",
+    "source_file",
+    "source_row_number",
+    "load_id",
+    "source_no",
+    "top_organization",
+    "parent_organization",
+    "organization",
+    "transaction_id",
+    "original_transaction_id",
+    "partner_reference_number",
+    "invoice_id",
+    "finalized_date",
+    "finalized_time",
+    "initiate_date",
+    "initiate_time",
+    "transaction_type",
+    "transaction_scenario",
+    "transaction_status",
+    "transaction_statement",
+    "account",
+    "counter_party",
+    "debit",
+    "credit",
+    "balance",
+    "fee",
+]
 
 REPORT_DATE_HEADER = "REPORT DATE"
 CLUSTER_ID_HEADER = "CLUSTER ID"
@@ -53,6 +112,26 @@ class LinkAjaFeeSummary:
             "source_rows": self.source_rows,
             "report_dates": self.report_dates,
             "rows": self.rows,
+        }
+
+
+@dataclass(frozen=True)
+class LinkAjaLoadManifest:
+    cluster_id: str
+    source_file: str
+    source_rows: int
+    report_dates: list[str]
+    scenario_counts: dict[str, int]
+    load_id: str
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "cluster_id": self.cluster_id,
+            "source_file": self.source_file,
+            "source_rows": self.source_rows,
+            "report_dates": self.report_dates,
+            "scenario_counts": self.scenario_counts,
+            "load_id": self.load_id,
         }
 
 
@@ -152,8 +231,6 @@ def load_linkaja_rows(
 
     if suffix == ".csv" or suffix == "":
         return _load_csv_rows(path)
-    if suffix in {".xlsx", ".xlsm"}:
-        return _load_xlsx_rows(path)
 
     raise ValueError(f"Unsupported LinkAja input file extension: {suffix or '<none>'}")
 
@@ -165,46 +242,226 @@ def _load_csv_rows(path: Path) -> list[dict[str, Any]]:
         return [dict(row) for row in reader]
 
 
-def _load_xlsx_rows(path: Path) -> list[dict[str, Any]]:
-    try:
-        from openpyxl import load_workbook
-    except ImportError as exc:
-        raise RuntimeError("openpyxl is required to read LinkAja .xlsx files") from exc
-
-    workbook = load_workbook(path, read_only=True, data_only=True)
-    all_rows: list[dict[str, Any]] = []
-
-    for worksheet in workbook.worksheets:
-        row_values = worksheet.iter_rows(values_only=True)
-        headers = None
-        for raw_header in row_values:
-            if raw_header and any(cell is not None and str(cell).strip() for cell in raw_header):
-                headers = [str(cell).strip() if cell is not None else "" for cell in raw_header]
-                break
-
-        if not headers:
-            continue
-
-        _validate_columns(headers, f"{display_name(path)}:{worksheet.title}")
-        for raw_row in row_values:
-            if not raw_row or not any(cell is not None and str(cell).strip() for cell in raw_row):
-                continue
-            all_rows.append({
-                header: raw_row[index] if index < len(raw_row) else ""
-                for index, header in enumerate(headers)
-            })
-
-    if not all_rows:
-        raise ValueError(f"{display_name(path)}: no data rows found")
-
-    return all_rows
-
-
 def _validate_columns(fieldnames: list[str], source_name: str) -> None:
     missing = [column for column in REQUIRED_COLUMNS if column not in fieldnames]
     if missing:
         missing_text = ", ".join(missing)
         raise ValueError(f"{source_name}: missing required column(s): {missing_text}")
+
+
+def _validate_exact_source_columns(fieldnames: list[str], source_name: str) -> None:
+    normalized = [str(column).strip() for column in fieldnames]
+    if normalized == LINKAJA_SOURCE_COLUMNS:
+        return
+
+    missing = [column for column in LINKAJA_SOURCE_COLUMNS if column not in normalized]
+    unexpected = [column for column in normalized if column not in LINKAJA_SOURCE_COLUMNS]
+    details = []
+    if missing:
+        details.append(f"missing: {', '.join(missing)}")
+    if unexpected:
+        details.append(f"unexpected: {', '.join(unexpected)}")
+    if not missing and not unexpected:
+        details.append("columns are not in the expected order")
+    raise ValueError(f"{source_name}: invalid LinkAja CSV header ({'; '.join(details)})")
+
+
+def _strict_source_date(value: Any, source_name: str, row_number: int, column: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{source_name}:{row_number}: {column} is blank")
+    try:
+        return datetime.strptime(text, "%d/%m/%Y").date().isoformat()
+    except ValueError as exc:
+        raise ValueError(
+            f"{source_name}:{row_number}: invalid {column} {value!r}; expected DD/MM/YYYY"
+        ) from exc
+
+
+def _optional_source_date(value: Any, source_name: str, row_number: int, column: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return _strict_source_date(text, source_name, row_number, column)
+
+
+def _strict_source_time(value: Any, source_name: str, row_number: int, column: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{source_name}:{row_number}: {column} is blank")
+    try:
+        return datetime.strptime(text, "%H:%M:%S").time().isoformat()
+    except ValueError as exc:
+        raise ValueError(
+            f"{source_name}:{row_number}: invalid {column} {value!r}; expected HH:MM:SS"
+        ) from exc
+
+
+def _optional_source_time(value: Any, source_name: str, row_number: int, column: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return _strict_source_time(text, source_name, row_number, column)
+
+
+def _decimal_text(
+    value: Any,
+    source_name: str,
+    row_number: int,
+    column: str,
+    *,
+    blank_is_null: bool = False,
+) -> str:
+    if blank_is_null and not str(value or "").strip():
+        return ""
+    return format(parse_amount(value, source_name, row_number, column), "f")
+
+
+def _source_cluster_id(value: Any) -> str | None:
+    match = re.match(r"\s*(\d+)-", str(value or ""))
+    return match.group(1) if match else None
+
+
+def normalize_linkaja_csv(
+    source_path: str | Path,
+    output_path: str | Path,
+    *,
+    filename_hint: str | None = None,
+    load_id: str,
+) -> LinkAjaLoadManifest:
+    """Validate one LinkAja CSV and write a typed, DB-ready CSV artifact."""
+    path = Path(source_path)
+    source_name = display_name(filename_hint or source_path)
+    suffix = Path(filename_hint or source_path).suffix.lower()
+    if suffix not in {"", ".csv"}:
+        raise ValueError(f"Unsupported LinkAja input file extension: {suffix}")
+    if not str(load_id).strip():
+        raise ValueError("LinkAja load_id must not be blank")
+
+    cluster_from_filename = cluster_id_from_filename(filename_hint or source_path)
+    cluster_id = cluster_from_filename
+    source_rows = 0
+    report_dates: set[str] = set()
+    scenario_counts: Counter[str] = Counter()
+
+    with path.open(newline="", encoding="utf-8-sig") as source_handle, Path(output_path).open(
+        "w", newline="", encoding="utf-8"
+    ) as output_handle:
+        reader = csv.DictReader(source_handle)
+        _validate_exact_source_columns(reader.fieldnames or [], source_name)
+        writer = csv.DictWriter(output_handle, fieldnames=RAW_NORMALIZED_COLUMNS)
+        writer.writeheader()
+
+        for row_number, row in enumerate(reader, start=2):
+            source_rows += 1
+            top_cluster_id = _source_cluster_id(row.get("Top Organization"))
+            if cluster_id is None:
+                cluster_id = top_cluster_id
+            if not cluster_id:
+                raise ValueError(
+                    f"{source_name}:{row_number}: cannot determine cluster ID from filename "
+                    "or Top Organization"
+                )
+            if top_cluster_id and top_cluster_id != cluster_id:
+                raise ValueError(
+                    f"{source_name}:{row_number}: Top Organization cluster {top_cluster_id} "
+                    f"does not match expected cluster {cluster_id}"
+                )
+
+            transaction_id = str(row.get("Transaction ID") or "").strip()
+            if not transaction_id:
+                raise ValueError(f"{source_name}:{row_number}: Transaction ID is blank")
+            transaction_scenario = str(row.get("Transaction Scenario") or "").strip()
+            if not transaction_scenario:
+                raise ValueError(f"{source_name}:{row_number}: Transaction Scenario is blank")
+
+            finalized_date = _strict_source_date(
+                row.get("Finalized Date"), source_name, row_number, "Finalized Date"
+            )
+            finalized_time = _strict_source_time(
+                row.get("Finalized Time"), source_name, row_number, "Finalized Time"
+            )
+            report_dates.add(finalized_date)
+            scenario_counts[transaction_scenario] += 1
+
+            writer.writerow({
+                "cluster_id": cluster_id,
+                "source_file": source_name,
+                "source_row_number": row_number,
+                "load_id": str(load_id).strip(),
+                "source_no": str(row.get("No") or "").strip(),
+                "top_organization": str(row.get("Top Organization") or "").strip(),
+                "parent_organization": str(row.get("Parent Organization") or "").strip(),
+                "organization": str(row.get("Organization") or "").strip(),
+                "transaction_id": transaction_id,
+                "original_transaction_id": str(
+                    row.get("Original Transaction ID") or ""
+                ).strip(),
+                "partner_reference_number": str(
+                    row.get("Partner Reference Number") or ""
+                ).strip(),
+                "invoice_id": str(row.get("Invoice ID") or "").strip(),
+                "finalized_date": finalized_date,
+                "finalized_time": finalized_time,
+                "initiate_date": _optional_source_date(
+                    row.get("Initiate Date"), source_name, row_number, "Initiate Date"
+                ),
+                "initiate_time": _optional_source_time(
+                    row.get("Initiate Time"), source_name, row_number, "Initiate Time"
+                ),
+                "transaction_type": str(row.get("Transaction Type") or "").strip(),
+                "transaction_scenario": transaction_scenario,
+                "transaction_status": str(row.get("Transaction Status") or "").strip(),
+                "transaction_statement": str(
+                    row.get("Transaction Statement") or ""
+                ).strip(),
+                "account": str(row.get("Account") or "").strip(),
+                "counter_party": str(row.get("Counter Party") or "").strip(),
+                "debit": _decimal_text(
+                    row.get("Debit"), source_name, row_number, "Debit"
+                ),
+                "credit": _decimal_text(
+                    row.get("Credit"), source_name, row_number, "Credit"
+                ),
+                "balance": _decimal_text(
+                    row.get("Balance"), source_name, row_number, "Balance"
+                ),
+                "fee": _decimal_text(
+                    row.get("Fee"),
+                    source_name,
+                    row_number,
+                    "Fee",
+                    blank_is_null=True,
+                ),
+            })
+
+    if source_rows == 0:
+        raise ValueError(f"{source_name}: no data rows found")
+    if not cluster_id:
+        raise ValueError(f"{source_name}: cannot determine cluster ID")
+
+    return LinkAjaLoadManifest(
+        cluster_id=cluster_id,
+        source_file=source_name,
+        source_rows=source_rows,
+        report_dates=sorted(report_dates),
+        scenario_counts=dict(sorted(scenario_counts.items())),
+        load_id=str(load_id).strip(),
+    )
+
+
+def write_linkaja_manifest(
+    manifest: LinkAjaLoadManifest,
+    output_path: str | Path,
+) -> None:
+    Path(output_path).write_text(
+        json.dumps(manifest.to_json_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_linkaja_manifest(input_path: str | Path) -> dict[str, Any]:
+    return json.loads(Path(input_path).read_text(encoding="utf-8"))
 
 
 def aggregate_linkaja_fee_file(

@@ -1,0 +1,14 @@
+linkaja_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('FINPAY_DB_HOST') }}"
+      port: "{{ env_var('FINPAY_DB_PORT') | int }}"
+      user: "{{ env_var('FINPAY_DB_USER') }}"
+      password: "{{ env_var('FINPAY_DB_PASSWORD') }}"
+      dbname: "{{ env_var('FINPAY_DB_NAME') }}"
+      schema: "{{ env_var('LINKAJA_DBT_SCHEMA', 'linkaja_dbt') }}"
+      threads: 4
+      connect_timeout: 10
+      retries: 1

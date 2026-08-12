@@ -1,131 +1,142 @@
-id: linkaja_fee_pipeline_v1
-namespace: finance.linkaja
+  id: linkaja_fee_pipeline_v1
+  namespace: finance.linkaja
 
-inputs:
-  - id: source_file
-    type: FILE
-    displayName: "LinkAja CSV or XLSX file"
-    description: "Upload one LinkAja export for one cluster. Filename should be laporan-<cluster_id>-....csv|xlsx when possible."
-    required: true
+  inputs:
+    - id: source_file
+      type: FILE
+      displayName: "LinkAja CSV file"
+      description: "Upload one LinkAja CSV export for one cluster. Filename should be laporan-<cluster_id>-....csv."
+      required: true
 
-  - id: dry_run
-    type: BOOLEAN
-    displayName: "Dry run?"
-    description: "true → validate and summarize only. false → append/replace rows in Google Sheets."
-    defaults: false
+    - id: dry_run
+      type: BOOLEAN
+      displayName: "Dry run?"
+      description: "true → validate only. false → apply pending LinkAja schema migrations, replace affected raw transaction IDs, and calculate database-backed daily results."
+      defaults: false
 
-variables:
-  target_spreadsheet: "Salinan dari MONITORING FINPAY"
-  target_worksheet: "LinkAja"
+  tasks:
+    - id: validate_and_normalize_linkaja_csv
+      type: io.kestra.plugin.scripts.python.Script
+      containerImage: linkaja-fee-pipeline:3.11
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: finpay-network
+      pythonVersion: "3.11"
+      timeout: PT10M
+      inputFiles:
+        source_file: "{{ inputs.source_file }}"
+      outputFiles:
+        - normalized_linkaja.csv
+        - linkaja_manifest.json
+      env:
+        ORIGINAL_FILE_PATH: "{{ inputs.source_file }}"
+        LOAD_ID: "{{ execution.id }}"
+        DRY_RUN: "{{ inputs.dry_run }}"
+      script: |
+        import os
+        import sys
+        from kestra import Kestra
 
-tasks:
-  - id: process_linkaja_fee_file
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: linkaja-fee-pipeline:3.11
-    pythonVersion: "3.11"
-    timeout: PT5M
-    inputFiles:
-      source_file: "{{ inputs.source_file }}"
-    outputFiles:
-      - linkaja_fees.json
-    env:
-      ORIGINAL_FILE_PATH: "{{ inputs.source_file }}"
-      DRY_RUN: "{{ inputs.dry_run }}"
-    script: |
-      import os
-      import sys
-      from kestra import Kestra
+        sys.path.insert(0, "/app")
+        from linkaja_pipeline import normalize_linkaja_csv, write_linkaja_manifest
 
-      sys.path.insert(0, "/app")
-      from linkaja_pipeline import aggregate_linkaja_fee_file, write_linkaja_fee_json
+        original_file_path = os.environ.get("ORIGINAL_FILE_PATH", "source_file")
+        try:
+            manifest = normalize_linkaja_csv(
+                "source_file",
+                "normalized_linkaja.csv",
+                filename_hint=os.path.basename(original_file_path),
+                load_id=os.environ["LOAD_ID"],
+            )
+        except Exception as exc:
+            print(f"❌ LinkAja CSV validation failed: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-      original_file_path = os.environ.get("ORIGINAL_FILE_PATH", "source_file")
+        write_linkaja_manifest(manifest, "linkaja_manifest.json")
+        print(f"📄 Source file : {manifest.source_file}")
+        print(f"🗂  Cluster     : {manifest.cluster_id}")
+        print(f"📅 Dates       : {', '.join(manifest.report_dates)}")
+        print(f"📊 Raw rows    : {manifest.source_rows}")
+        for scenario, count in manifest.scenario_counts.items():
+            print(f"  {scenario}: {count}")
+        if os.environ.get("DRY_RUN", "false").lower() == "true":
+            print("⚠️  DRY RUN — PostgreSQL writes will be skipped.")
 
-      try:
-          summary = aggregate_linkaja_fee_file(
-              "source_file",
-              filename_hint=os.path.basename(original_file_path),
-          )
-      except Exception as exc:
-          print(f"❌ LinkAja fee processing failed: {exc}", file=sys.stderr)
-          sys.exit(1)
+        Kestra.outputs({
+            "cluster_id": manifest.cluster_id,
+            "source_file": manifest.source_file,
+            "source_rows": manifest.source_rows,
+            "report_dates": manifest.report_dates,
+            "scenario_counts": manifest.scenario_counts,
+        })
 
-      write_linkaja_fee_json(summary, "linkaja_fees.json")
+    - id: persist_and_summarize_linkaja
+      type: io.kestra.plugin.scripts.python.Script
+      runIf: "{{ inputs.dry_run == false }}"
+      containerImage: linkaja-fee-pipeline:3.11
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: finpay-network
+      pythonVersion: "3.11"
+      timeout: PT15M
+      retry:
+        type: exponential
+        interval: PT10S
+        maxInterval: PT60S
+        maxAttempts: 3
+      inputFiles:
+        normalized_linkaja.csv: "{{ outputs.validate_and_normalize_linkaja_csv.outputFiles['normalized_linkaja.csv'] }}"
+        linkaja_manifest.json: "{{ outputs.validate_and_normalize_linkaja_csv.outputFiles['linkaja_manifest.json'] }}"
+      outputFiles:
+        - linkaja_database_result.json
+      env:
+        FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+        FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+        FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+        FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+        FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      script: |
+        import sys
+        from kestra import Kestra
 
-      print(f"📄 Source file : {summary.source_file}")
-      print(f"🗂  Cluster     : {summary.cluster_id}")
-      print(f"📅 Dates       : {', '.join(summary.report_dates)}")
-      print(f"📊 Output rows : {len(summary.rows)}")
-      if os.environ.get("DRY_RUN", "false").lower() == "true":
-          print("⚠️  DRY RUN — Google Sheets upload will be skipped.")
-      for row in summary.rows:
-          print(row)
+        sys.path.insert(0, "/app")
+        from linkaja_pipeline import (
+            linkaja_postgres_dsn_from_env,
+            load_linkaja_manifest,
+            migrate_linkaja_database,
+            persist_linkaja_normalized_csv,
+            write_linkaja_database_result,
+        )
 
-      Kestra.outputs({
-          "cluster_id": summary.cluster_id,
-          "source_file": summary.source_file,
-          "source_rows": summary.source_rows,
-          "report_dates": summary.report_dates,
-          "rows": len(summary.rows),
-      })
+        try:
+            dsn = linkaja_postgres_dsn_from_env()
+            migration = migrate_linkaja_database(dsn)
+            manifest = load_linkaja_manifest("linkaja_manifest.json")
+            result = persist_linkaja_normalized_csv(
+                "normalized_linkaja.csv",
+                manifest,
+                dsn,
+            )
+        except Exception as exc:
+            print(f"❌ LinkAja PostgreSQL processing failed: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-  - id: upload_linkaja_fees_to_sheets
-    type: io.kestra.plugin.scripts.python.Script
-    runIf: "{{ inputs.dry_run == false }}"
-    containerImage: linkaja-fee-pipeline:3.11
-    pythonVersion: "3.11"
-    timeout: PT10M
-    retry:
-      type: exponential
-      interval: PT15S
-      maxInterval: PT60S
-      maxAttempts: 3
-    inputFiles:
-      linkaja_fees.json: "{{ outputs.process_linkaja_fee_file.outputFiles['linkaja_fees.json'] }}"
-    env:
-      TARGET_SPREADSHEET: "{{ vars.target_spreadsheet }}"
-      TARGET_WORKSHEET: "{{ vars.target_worksheet }}"
-      FINPAY_PROTECTION_EDITOR_EMAILS: "{{ secret('FINPAY_PROTECTION_EDITOR_EMAILS') }}"
-      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
-    script: |
-      import os
-      import sys
-      import tempfile
-      from kestra import Kestra
-
-      sys.path.insert(0, "/app")
-      from linkaja_pipeline import (
-          load_linkaja_fee_json,
-          make_gspread_client,
-          process_linkaja_fee_sheet_upload,
-      )
-
-      service_account_json = os.environ.get("SECRET_GCP_SA_KEY", "")
-      if not service_account_json or service_account_json.strip() == "{}":
-          print("❌ GCP_SA_KEY secret is empty or not set.", file=sys.stderr)
-          sys.exit(1)
-
-      service_account_path = None
-      try:
-          with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
-              handle.write(service_account_json)
-              service_account_path = handle.name
-
-          payload = load_linkaja_fee_json("linkaja_fees.json")
-          client = make_gspread_client(service_account_path)
-          result = process_linkaja_fee_sheet_upload(
-              target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
-              target_worksheet=os.environ["TARGET_WORKSHEET"],
-              rows=payload["rows"],
-              gspread_client=client,
-          )
-
-          print(
-              "✅ LinkAja fees uploaded to "
-              f"{os.environ['TARGET_SPREADSHEET']} / {os.environ['TARGET_WORKSHEET']}: "
-              f"{result}"
-          )
-          Kestra.outputs(result)
-      finally:
-          if service_account_path and os.path.exists(service_account_path):
-              os.unlink(service_account_path)
+        write_linkaja_database_result(result, "linkaja_database_result.json")
+        print(f"✅ Current schema version   : {migration['current_version']}")
+        print(f"⬆️  Applied schema versions : {migration['applied_versions']}")
+        print(f"✅ Raw rows replaced       : {result['raw_rows']}")
+        print(f"✅ Impacted transaction IDs: {result['impacted_transaction_ids']}")
+        print(f"✅ Current transaction rows: {result['transaction_rows']}")
+        print(f"📅 Summary dates          : {', '.join(result['report_dates'])}")
+        print(f"📒 Ledger measure rows    : {len(result['detail_rows'])}")
+        Kestra.outputs({
+            "cluster_id": result["cluster_id"],
+            "schema_version": migration["current_version"],
+            "applied_schema_versions": migration["applied_versions"],
+            "raw_rows": result["raw_rows"],
+            "impacted_transaction_ids": result["impacted_transaction_ids"],
+            "transaction_rows": result["transaction_rows"],
+            "report_dates": result["report_dates"],
+            "detail_rows": len(result["detail_rows"]),
+            "ledger_measure_rows": len(result["detail_rows"]),
+        })

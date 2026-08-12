@@ -1,0 +1,307 @@
+Project linkaja_fee_pipeline {
+  database_type: 'PostgreSQL'
+
+  Note: '''
+    # LinkAja pipeline database
+
+    The business tables and views are managed by immutable SQL files in
+    `linkaja_fee_pipeline/migrations/`.
+
+    * `linkaja_raw_transactions` keeps one row per source ledger row.
+    * `linkaja_transaction_base_v` and `linkaja_transactions_current_v` are
+      regular calculation views used by daily database/dashboard reporting.
+    * `linkaja_transactions` keeps explicitly published month-scoped facts.
+    * `linkaja_monthly_fee_summary_v` calculates the release summary from the
+      published facts without using company DEBIT or KREDIT.
+    * `linkaja_monthly_refreshes` audits successful snapshot publications.
+    * `linkaja_schema_migrations` is operational metadata, not a business table.
+    * Reversal relationships are logical and intentionally have no foreign keys
+      because the original can be absent until a later file is loaded.
+    * Local business timestamps use Asia/Makassar and are stored without a time
+      zone in columns ending in `_local`.
+
+    Do not export this DBML as a migration. DBML cannot preserve the predicates
+    on partial PostgreSQL indexes or the exact generated-column definitions.
+  '''
+}
+
+Table linkaja_raw_transactions {
+  cluster_id text [not null]
+  source_file text [not null]
+  source_row_number integer [not null]
+  load_id text [not null]
+  ingested_at timestamptz [not null, default: `CURRENT_TIMESTAMP`]
+  source_no bigint
+  top_organization text
+  parent_organization text
+  organization text
+  transaction_id text [not null]
+  original_transaction_id text
+  partner_reference_number text
+  invoice_id text
+  finalized_date date [not null]
+  finalized_time time [not null]
+  initiate_date date
+  initiate_time time
+  transaction_type text
+  transaction_scenario text [not null]
+  transaction_status text
+  transaction_statement text
+  account text
+  counter_party text
+  debit numeric(20,2) [not null, default: 0]
+  credit numeric(20,2) [not null, default: 0]
+  balance numeric(20,2)
+  fee numeric(20,2) [note: 'Nullable source fact; blank and zero remain distinct.']
+
+  indexes {
+    (load_id, source_row_number) [pk, name: 'linkaja_raw_transactions_pkey']
+    (cluster_id, finalized_date, transaction_id) [name: 'linkaja_raw_cluster_date_transaction_idx']
+    (cluster_id, transaction_id) [name: 'linkaja_raw_cluster_transaction_idx', note: 'Application replacement key; all ledger rows for the ID are replaced together.']
+    (cluster_id, original_transaction_id) [name: 'linkaja_raw_cluster_original_transaction_idx', note: 'Partial in PostgreSQL: original_transaction_id IS NOT NULL.']
+  }
+
+  Note: '''
+    Grain: one normalized source ledger row. Both sides of internal transfers
+    remain present. A corrected posting date replaces the former raw group
+    because transaction identity is `(cluster_id, transaction_id)`.
+  '''
+}
+
+Table linkaja_transaction_base_v {
+  cluster_id text [not null]
+  transaction_id text [not null]
+  report_date date [not null]
+  finalized_at_local timestamp [not null]
+  original_transaction_id text
+  partner_reference_number text
+  invoice_id text
+  transaction_type text
+  transaction_scenario text [not null]
+  transaction_status text [not null]
+  counter_party text
+  source_ledger_row_count integer [not null]
+  ledger_debit_total numeric(20,2) [not null]
+  ledger_credit_total numeric(20,2) [not null]
+  source_fee numeric(20,2)
+  source_fee_value_count integer [not null]
+  company_organization text
+  company_account text
+  company_debit numeric(20,2) [not null]
+  company_credit numeric(20,2) [not null]
+  company_balance numeric(20,2)
+  source_files text
+  updated_load_id text [not null]
+  updated_at timestamptz [not null]
+
+  Note: '''
+    PostgreSQL regular view. Grain: one completed transaction on one posting
+    date. Grouping includes report_date so daily date predicates can be pushed
+    into the raw-table aggregation.
+  '''
+}
+
+Table linkaja_transactions_current_v {
+  cluster_id text [not null]
+  transaction_id text [not null]
+  report_date date [not null]
+  finalized_at_local timestamp [not null]
+  original_transaction_id text
+  partner_reference_number text
+  invoice_id text
+  transaction_type text
+  transaction_scenario text [not null]
+  transaction_status text [not null]
+  counter_party text
+  source_ledger_row_count integer [not null]
+  ledger_debit_total numeric(20,2) [not null]
+  ledger_credit_total numeric(20,2) [not null]
+  signed_amount numeric(20,2) [not null, note: 'ledger_debit_total - ledger_credit_total']
+  source_fee numeric(20,2)
+  source_fee_value_count integer [not null]
+  company_organization text
+  company_account text
+  has_company_purchase_account boolean [not null]
+  company_debit numeric(20,2) [not null]
+  company_credit numeric(20,2) [not null]
+  company_balance numeric(20,2)
+  balance_before numeric(20,2)
+  transfer_scope text [not null]
+  is_reversal boolean [not null]
+  original_transaction_scenario text
+  original_is_resolved boolean [not null]
+  reversal_category text
+  reversal_count integer [not null]
+  is_reversed boolean [not null]
+  reversal_transaction_ids text[] [not null]
+  first_reversal_at_local timestamp
+  latest_reversal_at_local timestamp
+  source_files text
+  updated_load_id text [not null]
+  updated_at timestamptz [not null]
+  reversal_resolution_status text [not null]
+  is_unusual boolean [not null]
+  unusual_reason_codes text[] [not null]
+
+  Note: '''
+    PostgreSQL regular view used by daily fee and ledger summaries. It resolves
+    originals and completed reversals from all raw data currently available.
+  '''
+}
+
+Table linkaja_transactions {
+  cluster_id text [not null]
+  transaction_id text [not null]
+  report_date date [not null]
+  finalized_at_local timestamp [not null]
+  original_transaction_id text
+  partner_reference_number text
+  invoice_id text
+  transaction_type text
+  transaction_scenario text [not null]
+  transaction_status text [not null]
+  counter_party text
+
+  source_ledger_row_count integer [not null]
+  ledger_debit_total numeric(20,2) [not null, default: 0, note: 'All completed source rows; not company cash flow.']
+  ledger_credit_total numeric(20,2) [not null, default: 0, note: 'All completed source rows; not company cash flow.']
+  signed_amount numeric(20,2) [not null, note: 'Generated as ledger_debit_total - ledger_credit_total.']
+  source_fee numeric(20,2) [note: 'Single distinct source fee value; NULL means absent.']
+  source_fee_value_count integer [not null, default: 0]
+
+  company_organization text
+  company_account text
+  has_company_purchase_account boolean [not null, note: 'Generated from company_account IS NOT NULL.']
+  company_debit numeric(20,2) [not null, default: 0]
+  company_credit numeric(20,2) [not null, default: 0]
+  company_balance numeric(20,2)
+  balance_before numeric(20,2) [note: 'Generated from the post-entry company balance and movement.']
+
+  transfer_scope text [not null, default: 'NOT_APPLICABLE']
+  is_reversal boolean [not null, note: 'Generated from original_transaction_id.']
+  original_transaction_scenario text
+  original_is_resolved boolean [not null, default: false]
+  reversal_category text [note: 'Generated as resolved scenario or UNRESOLVED REVERSAL.']
+  reversal_resolution_status text [note: 'Generated as NOT_REVERSAL, COMPLETE, or UNRESOLVED.']
+  is_unusual boolean [note: 'Generated true for an unresolved reversal.']
+  unusual_reason_codes text[] [note: 'Generated as UNRESOLVED_REVERSAL or an empty array.']
+  reversal_count integer [not null, default: 0]
+  is_reversed boolean [not null, note: 'Generated from reversal_count > 0.']
+  reversal_transaction_ids text[] [not null, default: `ARRAY[]::TEXT[]`]
+  first_reversal_at_local timestamp
+  latest_reversal_at_local timestamp
+
+  source_files text
+  updated_load_id text [not null]
+  updated_at timestamptz [not null, default: `CURRENT_TIMESTAMP`]
+  report_month date [not null]
+  calculation_cutoff timestamp [not null, note: 'Exclusive local Asia/Makassar cutoff used for this snapshot.']
+  materialization_id text [not null]
+  materialized_at timestamptz [not null, default: `CURRENT_TIMESTAMP`]
+
+  indexes {
+    (cluster_id, transaction_id) [pk, name: 'linkaja_transactions_pkey']
+    (cluster_id, report_date) [name: 'linkaja_transactions_cluster_report_date_idx']
+    (cluster_id, transaction_scenario, report_date) [name: 'linkaja_transactions_cluster_scenario_report_date_idx']
+    (cluster_id, original_transaction_id) [name: 'linkaja_transactions_cluster_original_idx', note: 'Partial in PostgreSQL: original_transaction_id IS NOT NULL.']
+    (cluster_id, report_date) [name: 'linkaja_transactions_unusual_cluster_date_idx', note: 'Partial in PostgreSQL: is_unusual.']
+    (cluster_id, report_month) [name: 'linkaja_transactions_cluster_report_month_idx']
+    (materialization_id) [name: 'linkaja_transactions_materialization_idx']
+  }
+
+  checks {
+    `LOWER(BTRIM(transaction_status)) = 'completed'` [name: 'linkaja_transactions_completed_status_check']
+    `source_ledger_row_count > 0` [name: 'linkaja_transactions_source_row_count_check']
+    `source_fee_value_count IN (0, 1)` [name: 'linkaja_transactions_source_fee_check']
+    `transfer_scope IN ('IN_CLUSTER', 'OUT_CLUSTER', 'NOT_APPLICABLE')` [name: 'linkaja_transactions_transfer_scope_check']
+    `reversal_count = CARDINALITY(reversal_transaction_ids)` [name: 'linkaja_transactions_reversal_count_check']
+    `reversal_resolution_status IN ('NOT_REVERSAL', 'COMPLETE', 'UNRESOLVED')` [name: 'linkaja_transactions_reversal_resolution_status_check']
+    `is_unusual = (CARDINALITY(unusual_reason_codes) > 0)` [name: 'linkaja_transactions_unusual_consistency_check']
+    `report_month = DATE_TRUNC('month', report_date)::DATE` [name: 'linkaja_transactions_report_month_check']
+    `finalized_at_local < calculation_cutoff` [name: 'linkaja_transactions_calculation_cutoff_check']
+  }
+
+  Note: '''
+    Grain: one completed transaction on its actual posting date inside a
+    published cluster-month snapshot. PPOB and non-company-account scenarios
+    remain available. Reversal state is frozen at calculation_cutoff; later
+    daily uploads do not mutate this table.
+  '''
+}
+
+Table linkaja_monthly_refreshes {
+  materialization_id text [pk]
+  cluster_id text [not null]
+  report_month date [not null]
+  calculation_cutoff timestamp [not null]
+  transaction_rows integer [not null]
+  unresolved_reversal_count integer [not null]
+  refreshed_at timestamptz [not null, default: `CURRENT_TIMESTAMP`]
+
+  indexes {
+    (cluster_id, report_month, refreshed_at) [name: 'linkaja_monthly_refreshes_cluster_month_idx']
+  }
+
+  Note: '''
+    Audit history for published month replacements. Preview executions do not
+    create rows here.
+  '''
+}
+
+Table linkaja_monthly_fee_summary_v {
+  report_month date [not null]
+  calculation_cutoff timestamp [not null]
+  materialization_id text [not null]
+  cluster_id text [not null]
+  fee_category text [not null]
+  gross_transaction_count bigint [not null]
+  reversed_transaction_count bigint [not null]
+  active_transaction_count bigint [not null]
+  gross_fee numeric
+  reversed_fee numeric
+  net_fee numeric
+  monthly_payable_fee numeric
+  gross_missing_fee_count bigint [not null]
+  reversed_missing_fee_count bigint [not null]
+  active_missing_fee_count bigint [not null]
+  calculation_status text [not null]
+
+  Note: '''
+    PostgreSQL regular view over the frozen monthly snapshot. Digipos includes
+    only source_fee = 200 originals; PPOB missing Fee values remain NULL and
+    are exposed through counts and calculation_status.
+  '''
+}
+
+Table linkaja_schema_migrations {
+  version integer [pk]
+  name text [not null]
+  checksum text [not null]
+  applied_at timestamptz [not null, default: `CURRENT_TIMESTAMP`]
+
+  Note: 'Operational migration history. It is not pipeline business data.'
+}
+
+Ref raw_rows_to_transaction {
+  linkaja_raw_transactions.(cluster_id, transaction_id) > linkaja_transactions.(cluster_id, transaction_id) [inactive]
+}
+
+Ref raw_rows_to_base_view {
+  linkaja_raw_transactions.(cluster_id, transaction_id) > linkaja_transaction_base_v.(cluster_id, transaction_id) [inactive]
+}
+
+Ref base_to_current_view {
+  linkaja_transaction_base_v.(cluster_id, transaction_id) - linkaja_transactions_current_v.(cluster_id, transaction_id) [inactive]
+}
+
+Ref raw_reversal_to_original {
+  linkaja_raw_transactions.(cluster_id, original_transaction_id) > linkaja_raw_transactions.(cluster_id, transaction_id) [inactive]
+}
+
+Ref transaction_reversal_to_original {
+  linkaja_transactions.(cluster_id, original_transaction_id) > linkaja_transactions.(cluster_id, transaction_id) [inactive]
+}
+
+Ref monthly_snapshot_to_fee_summary {
+  linkaja_transactions.(cluster_id, report_month) > linkaja_monthly_fee_summary_v.(cluster_id, report_month) [inactive]
+}

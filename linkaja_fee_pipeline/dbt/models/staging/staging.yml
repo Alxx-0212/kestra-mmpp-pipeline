@@ -1,0 +1,32 @@
+version: 2
+
+models:
+  - name: stg_linkaja_monthly_transactions
+    description: >-
+      Learning-stage projection of the production monthly snapshot. It does not
+      replace the current Python materialization or operational SQL report.
+    columns:
+      - name: report_month
+        description: First day of the frozen reporting month.
+        data_tests: [not_null]
+      - name: calculation_cutoff
+        description: Exclusive WITA cutoff used when the snapshot was published.
+        data_tests: [not_null]
+      - name: cluster_id
+        description: LinkAja cluster identifier.
+        data_tests: [not_null]
+      - name: transaction_id
+        description: Transaction identity within a cluster.
+        data_tests: [not_null]
+      - name: source_fee
+        description: Transaction-grain source Fee retained for audit and fee eligibility.
+      - name: is_reversed
+        description: True when a completed linked reversal exists before the cutoff.
+        data_tests: [not_null]
+      - name: reversal_resolution_status
+        description: NOT_REVERSAL, COMPLETE, or UNRESOLVED.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ["NOT_REVERSAL", "COMPLETE", "UNRESOLVED"]
