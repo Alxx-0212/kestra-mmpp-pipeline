@@ -1,7 +1,8 @@
 # Repository Agent Guide
 
-This repository is a monorepo with two independently deployable financial
-pipeline domains.
+This repository is a monorepo with two separately packaged financial pipeline
+domains. The local/on-premises stack may share infrastructure, so shared
+runtime changes still require integration review.
 
 | Domain | Runtime guide | Agent rules |
 |---|---|---|
@@ -15,7 +16,7 @@ domain lane are integrator-owned by default:
 |---|---|
 | FinPay agent | `finpay_pipeline/**`, `finpay_pipeline.yml`, `pipeline.py`, `pipeline_refactored.py`, `Dockerfile`, `requirements.txt`, `tests/test_refactor_contracts.py`, `tests/test_finpay_workflow_contracts.py` |
 | LinkAja agent | `linkaja_fee_pipeline/**`, `linkaja_fee_pipeline.yml`, `linkaja_monthly_materialization.yml`, `linkaja_pipeline.py`, `Dockerfile.linkaja`, `requirements-linkaja.txt`, `tests/test_linkaja_*.py` |
-| Integrating agent only | `AGENTS.md`, `README.md`, `.gitignore`, `.dockerignore`, `docker-compose.yml`, `.env*.example`, `config/**`, `tests/test_repository_setup_contracts.py` |
+| Integrating agent only | `AGENTS.md`, `README.md`, `.gitignore`, `.dockerignore`, `.codex/**`, `scripts/**`, `docker-compose.yml`, `.env*.example`, `config/**`, `tests/test_repository_setup_contracts.py`, `tests/test_codex_lanes.py` |
 
 `finpay_pipeline/summary_sheets.py` stays in the FinPay lane even though it
 creates the `LinkAja` worksheet and writes formulas that reference it. A LinkAja
@@ -48,6 +49,14 @@ owner implements and validates the FinPay-side adapter.
 
 ## Multi-agent workflow
 
+- Use `scripts/codex-lanes` from the clean `integration/mmpp-next` checkout to
+  create and inspect the isolated FinPay and LinkAja worktrees. The launcher
+  must never delete worktrees, merge or cherry-pick branches, deploy workflows,
+  or run database migrations.
+- Preserve an existing domain conversation by forking its Codex session UUID
+  into the corresponding worktree. Do not resume one session concurrently in
+  two checkouts. Session UUIDs are local operator state and must not be
+  committed.
 - Start with `git status --short` and read-only discovery. In the first progress
   update, declare one lane and the exact file allowlist before editing.
 - Give each file to one editing agent at a time. Do not concurrently edit the
@@ -92,7 +101,8 @@ provisioned Python 3.11 environment:
 ```bash
 python3 -m unittest -v \
   tests.test_repository_setup_contracts \
-  tests.test_finpay_workflow_contracts
+  tests.test_finpay_workflow_contracts \
+  tests.test_codex_lanes
 python3 -m unittest discover -s tests
 git diff --check
 git diff --cached --check

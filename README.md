@@ -14,7 +14,7 @@ otherwise.
 | FinPay | `finpay_pipeline.yml` | — | [`finpay_pipeline/README.md`](finpay_pipeline/README.md) |
 | LinkAja | `linkaja_fee_pipeline.yml` | `linkaja_monthly_materialization.yml` | [`linkaja_fee_pipeline/README.md`](linkaja_fee_pipeline/README.md) |
 
-The domains are independently deployable:
+The domains use separate runtime images and workflows:
 
 - FinPay uses `finpay-pipeline:3.11` and imports through `pipeline.py`.
 - LinkAja uses `linkaja-fee-pipeline:3.11` and imports through
@@ -23,6 +23,10 @@ The domains are independently deployable:
   [`linkaja_fee_pipeline/dbt/`](linkaja_fee_pipeline/dbt/README.md). It is not
   part of the production Kestra path yet.
 
+The current local/on-premises layout still shares the Compose network,
+PostgreSQL service, and some `FINPAY_DB_*` secret names. Treat changes to that
+shared runtime as integrator-owned even when only one domain consumes them.
+
 ## Repository structure
 
 ```text
@@ -30,6 +34,12 @@ kestra-mmpp-pipeline/
 ├── AGENTS.md
 ├── README.md
 ├── .dockerignore
+├── .codex/
+│   ├── config.toml
+│   ├── agents/
+│   └── prompts/
+├── scripts/
+│   └── codex-lanes
 ├── config/
 │   └── kestra-validation.yml
 ├── finpay_pipeline.yml
@@ -64,6 +74,66 @@ Domain-specific SQL no longer lives in a shared root directory:
 
 - FinPay operational checks: `finpay_pipeline/queries/`
 - LinkAja operational reports: `linkaja_fee_pipeline/queries/`
+
+## Parallel Codex development
+
+Use the checked-in launcher with one clean integration checkout and two sibling
+Git worktrees. Each Codex TUI receives a separate filesystem, branch, and tmux
+window, so FinPay and LinkAja changes cannot overwrite one another's working
+files. Root/shared files remain in the integration lane.
+
+The stable branch and worktree layout is:
+
+| Lane | Branch | Default checkout |
+|---|---|---|
+| Integrator | `integration/mmpp-next` | this repository directory |
+| FinPay | `agent/finpay-next` | sibling `kestra-mmpp-pipeline-finpay` |
+| LinkAja | `agent/linkaja-next` | sibling `kestra-mmpp-pipeline-linkaja` |
+
+Create the domain worktrees only from a clean integration checkout:
+
+```bash
+scripts/codex-lanes init
+scripts/codex-lanes status
+```
+
+To preserve the plan and chat context from an existing LinkAja Codex session,
+either open the all-project picker or supply its session UUID directly:
+
+```bash
+scripts/codex-lanes start --linkaja-picker
+# or:
+scripts/codex-lanes start --linkaja-fork <SESSION_ID>
+tmux attach -t mmpp-agents
+```
+
+Forking leaves the original conversation intact and creates a continuation in
+the isolated checkout. The picker deliberately includes sessions from other
+working directories so it can find the former LinkAja checkout. After choosing
+the conversation, send one message confirming that it should continue from
+`linkaja_fee_pipeline/LINKAJA_REVERSAL_IMPLEMENTATION_PLAN.md` on
+`agent/linkaja-next`. Do not commit the session UUID. If prior context is not
+needed, opt out explicitly with `--linkaja-fresh`.
+
+Before handing a domain branch to the integrator, enforce its file boundary:
+
+```bash
+scripts/codex-lanes check finpay
+scripts/codex-lanes check linkaja
+```
+
+The launcher never merges, cherry-picks, deploys, runs migrations, or deletes
+worktrees. `stop` only terminates its tmux session:
+
+```bash
+scripts/codex-lanes stop
+```
+
+The project-scoped `.codex/agents/` roles are available to a parent Codex
+session for bounded subagent review. They do not replace the worktree boundary;
+the three tmux windows are independent top-level Codex sessions. Compose,
+Docker, live Kestra, database, Sheets, and Telegram operations belong to the
+integrator lane.
 
 ## Local setup
 
@@ -203,7 +273,8 @@ FinPay tests do not count as a passing result:
 ```bash
 python3 -m unittest -v \
   tests.test_repository_setup_contracts \
-  tests.test_finpay_workflow_contracts
+  tests.test_finpay_workflow_contracts \
+  tests.test_codex_lanes
 docker run --rm \
   -e PYTHONPYCACHEPREFIX=/tmp/finpay-pycache \
   -v "$PWD:/workspace:ro" -w /workspace \

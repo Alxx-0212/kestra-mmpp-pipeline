@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+
+PROGRAM_NAME=${0##*/}
+INTEGRATION_BRANCH=${CODEX_LANES_INTEGRATION_BRANCH:-integration/mmpp-next}
+FINPAY_BRANCH=${CODEX_LANES_FINPAY_BRANCH:-agent/finpay-next}
+LINKAJA_BRANCH=${CODEX_LANES_LINKAJA_BRANCH:-agent/linkaja-next}
+TMUX_SESSION=${CODEX_LANES_TMUX_SESSION:-mmpp-agents}
+CODEX_BIN=${CODEX_LANES_CODEX_BIN:-codex}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scripts/codex-lanes init
+  scripts/codex-lanes start --linkaja-fork SESSION_ID
+  scripts/codex-lanes start --linkaja-picker
+  scripts/codex-lanes start --linkaja-fresh
+  scripts/codex-lanes status
+  scripts/codex-lanes check finpay|linkaja
+  scripts/codex-lanes stop
+
+Commands:
+  init    Create isolated FinPay and LinkAja sibling worktrees.
+  start   Start integrator, FinPay, and LinkAja Codex TUIs in tmux.
+  status  Show each lane's path, branch, HEAD, and working-tree state.
+  check   Fail when a domain branch contains files outside its lane.
+  stop    Stop only the managed tmux session; keep branches and worktrees.
+
+Use --linkaja-fork with the UUID from the existing LinkAja conversation to
+preserve its chat and plan context. Use --linkaja-picker to select it from all
+local projects. --linkaja-fresh is an explicit opt-out.
+EOF
+}
+
+die() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || die "run this command inside the integration repository"
+}
+
+canonical_dir() {
+    (cd "$1" 2>/dev/null && pwd -P)
+}
+
+root=$(repo_root)
+root=$(canonical_dir "$root")
+repo_parent=${root%/*}
+repo_name=${root##*/}
+FINPAY_PATH=${CODEX_LANES_FINPAY_PATH:-"$repo_parent/${repo_name}-finpay"}
+LINKAJA_PATH=${CODEX_LANES_LINKAJA_PATH:-"$repo_parent/${repo_name}-linkaja"}
+
+current_branch() {
+    git -C "$1" branch --show-current
+}
+
+require_integration_checkout() {
+    local branch
+    branch=$(current_branch "$root")
+    [[ -n "$branch" ]] || die "the integration checkout is detached"
+    [[ "$branch" == "$INTEGRATION_BRANCH" ]] || die "expected branch $INTEGRATION_BRANCH, found $branch"
+}
+
+require_clean_worktree() {
+    local path=$1
+    local label=$2
+    local state
+    state=$(git -C "$path" status --porcelain=v1 --untracked-files=all)
+    if [[ -n "$state" ]]; then
+        printf '%s\n' "$state" >&2
+        die "$label worktree must be clean"
+    fi
+}
+
+acquire_lock() {
+    require_command flock
+    local common_dir
+    common_dir=$(git -C "$root" rev-parse --git-common-dir)
+    if [[ "$common_dir" != /* ]]; then
+        common_dir="$root/$common_dir"
+    fi
+    exec 9>"$common_dir/codex-lanes.lock"
+    flock -n 9 || die "another codex-lanes command is already running"
+}
+
+branch_exists() {
+    git -C "$root" show-ref --verify --quiet "refs/heads/$1"
+}
+
+assert_path_absent() {
+    local path=$1
+    [[ ! -e "$path" && ! -L "$path" ]] || die "target path already exists: $path"
+}
+
+assert_lane_worktree() {
+    local path=$1
+    local expected_branch=$2
+    local actual_root actual_branch
+    [[ -d "$path" ]] || die "missing worktree: $path; run '$PROGRAM_NAME init' first"
+    actual_root=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null) || die "not a Git worktree: $path"
+    actual_root=$(canonical_dir "$actual_root")
+    [[ "$actual_root" == "$(canonical_dir "$path")" ]] || die "unexpected worktree root for $path"
+    actual_branch=$(current_branch "$path")
+    [[ "$actual_branch" == "$expected_branch" ]] || die "expected $expected_branch in $path, found ${actual_branch:-detached}"
+}
+
+init_lanes() {
+    acquire_lock
+    require_integration_checkout
+    require_clean_worktree "$root" "integration"
+    branch_exists "$FINPAY_BRANCH" && die "branch already exists: $FINPAY_BRANCH"
+    branch_exists "$LINKAJA_BRANCH" && die "branch already exists: $LINKAJA_BRANCH"
+    assert_path_absent "$FINPAY_PATH"
+    assert_path_absent "$LINKAJA_PATH"
+
+    git -C "$root" worktree add -b "$FINPAY_BRANCH" "$FINPAY_PATH" "$INTEGRATION_BRANCH"
+    git -C "$root" worktree add -b "$LINKAJA_BRANCH" "$LINKAJA_PATH" "$INTEGRATION_BRANCH"
+
+    printf 'Created FinPay lane:  %s (%s)\n' "$FINPAY_PATH" "$FINPAY_BRANCH"
+    printf 'Created LinkAja lane: %s (%s)\n' "$LINKAJA_PATH" "$LINKAJA_BRANCH"
+    printf 'Ignored local files such as .env and data/ were not copied.\n'
+}
+
+prompt_text() {
+    local path=$1
+    [[ -f "$path" ]] || die "missing launcher prompt: $path"
+    cat -- "$path"
+}
+
+start_lanes() {
+    local linkaja_mode= linkaja_session_id=
+    while (($#)); do
+        case "$1" in
+            --linkaja-fork)
+                (($# >= 2)) || die "--linkaja-fork requires a session UUID"
+                linkaja_mode=fork
+                linkaja_session_id=$2
+                shift 2
+                ;;
+            --linkaja-fresh)
+                linkaja_mode=fresh
+                shift
+                ;;
+            --linkaja-picker)
+                linkaja_mode=picker
+                shift
+                ;;
+            *)
+                die "unknown start option: $1"
+                ;;
+        esac
+    done
+    [[ -n "$linkaja_mode" ]] || die "choose --linkaja-fork SESSION_ID or --linkaja-picker to preserve context, or explicitly choose --linkaja-fresh"
+    if [[ "$linkaja_mode" == fork ]]; then
+        [[ "$linkaja_session_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+            || die "invalid LinkAja session UUID: $linkaja_session_id"
+    fi
+
+    acquire_lock
+    require_integration_checkout
+    assert_lane_worktree "$FINPAY_PATH" "$FINPAY_BRANCH"
+    assert_lane_worktree "$LINKAJA_PATH" "$LINKAJA_BRANCH"
+    require_clean_worktree "$root" "integration"
+    require_clean_worktree "$FINPAY_PATH" "FinPay"
+    require_clean_worktree "$LINKAJA_PATH" "LinkAja"
+    require_command tmux
+    require_command "$CODEX_BIN"
+    tmux has-session -t "$TMUX_SESSION" 2>/dev/null && die "tmux session already exists: $TMUX_SESSION"
+
+    local integrator_prompt finpay_prompt linkaja_prompt
+    local -a integrator_command finpay_command linkaja_command
+    integrator_prompt=$(prompt_text "$root/.codex/prompts/integrator.md")
+    finpay_prompt=$(prompt_text "$root/.codex/prompts/finpay.md")
+    linkaja_prompt=$(prompt_text "$root/.codex/prompts/linkaja-relocation.md")
+    integrator_command=("$CODEX_BIN" --strict-config -C "$root" "$integrator_prompt")
+    finpay_command=("$CODEX_BIN" --strict-config -C "$FINPAY_PATH" "$finpay_prompt")
+    if [[ "$linkaja_mode" == fork ]]; then
+        linkaja_command=("$CODEX_BIN" fork --strict-config -C "$LINKAJA_PATH" "$linkaja_session_id" "$linkaja_prompt")
+    elif [[ "$linkaja_mode" == picker ]]; then
+        linkaja_command=("$CODEX_BIN" fork --all --strict-config -C "$LINKAJA_PATH")
+    else
+        linkaja_command=("$CODEX_BIN" --strict-config -C "$LINKAJA_PATH" "$linkaja_prompt")
+    fi
+
+    local session_created=false
+    cleanup_failed_start() {
+        if [[ "$session_created" == true ]]; then
+            tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_failed_start ERR INT TERM HUP
+    tmux new-session -d -s "$TMUX_SESSION" -n integrator -c "$root" "${integrator_command[@]}"
+    session_created=true
+    tmux new-window -d -t "$TMUX_SESSION:" -n finpay -c "$FINPAY_PATH" "${finpay_command[@]}"
+    tmux new-window -d -t "$TMUX_SESSION:" -n linkaja -c "$LINKAJA_PATH" "${linkaja_command[@]}"
+    trap - ERR INT TERM HUP
+    flock -u 9
+
+    printf 'Started tmux session %s. Attach with:\n  tmux attach -t %q\n' "$TMUX_SESSION" "$TMUX_SESSION"
+    if [[ "$linkaja_mode" == fork ]]; then
+        printf 'LinkAja forked session: %s\n' "$linkaja_session_id"
+    elif [[ "$linkaja_mode" == picker ]]; then
+        printf 'Choose the previous LinkAja conversation in the linkaja window; the picker includes sessions from all working directories.\n'
+    else
+        printf 'LinkAja started fresh by explicit request.\n'
+    fi
+}
+
+lane_status() {
+    local lane=$1
+    local path=$2
+    if [[ ! -d "$path" ]]; then
+        printf '%-11s | %-45s | %s\n' "$lane" "$path" "missing"
+        return
+    fi
+    local branch head state
+    branch=$(current_branch "$path" 2>/dev/null || printf 'not-git')
+    head=$(git -C "$path" rev-parse --short HEAD 2>/dev/null || printf '-')
+    state=$(git -C "$path" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)
+    if [[ -z "$state" ]]; then
+        state=clean
+    else
+        state=dirty
+    fi
+    printf '%-11s | %-45s | %-24s | %-8s | %s\n' "$lane" "$path" "$branch" "$head" "$state"
+    if [[ "$state" == dirty ]]; then
+        git -C "$path" status --short
+    fi
+}
+
+show_status() {
+    printf '%-11s | %-45s | %-24s | %-8s | %s\n' lane path branch HEAD state
+    lane_status integrator "$root"
+    lane_status finpay "$FINPAY_PATH"
+    lane_status linkaja "$LINKAJA_PATH"
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        printf 'tmux: running (%s)\n' "$TMUX_SESSION"
+    else
+        printf 'tmux: stopped (%s)\n' "$TMUX_SESSION"
+    fi
+}
+
+allowed_path() {
+    local lane=$1
+    local path=$2
+    case "$lane:$path" in
+        finpay:finpay_pipeline/*|finpay:finpay_pipeline.yml|finpay:pipeline.py|finpay:pipeline_refactored.py|finpay:Dockerfile|finpay:requirements.txt|finpay:tests/test_refactor_contracts.py|finpay:tests/test_finpay_workflow_contracts.py)
+            return 0
+            ;;
+        linkaja:linkaja_fee_pipeline/*|linkaja:linkaja_fee_pipeline.yml|linkaja:linkaja_monthly_materialization.yml|linkaja:linkaja_pipeline.py|linkaja:Dockerfile.linkaja|linkaja:requirements-linkaja.txt|linkaja:tests/test_linkaja_*.py)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+check_lane() {
+    (($# == 1)) || die "check requires exactly one lane: finpay or linkaja"
+    local lane=$1
+    local path branch
+    case "$lane" in
+        finpay)
+            path=$FINPAY_PATH
+            branch=$FINPAY_BRANCH
+            ;;
+        linkaja)
+            path=$LINKAJA_PATH
+            branch=$LINKAJA_BRANCH
+            ;;
+        *)
+            die "unknown lane: $lane"
+            ;;
+    esac
+    assert_lane_worktree "$path" "$branch"
+    branch_exists "$INTEGRATION_BRANCH" || die "missing integration branch: $INTEGRATION_BRANCH"
+
+    local changed_file out_of_lane=false
+    local changes
+    changes=$(mktemp "${TMPDIR:-/tmp}/codex-lanes.XXXXXX")
+    trap 'rm -f "$changes"' EXIT
+    {
+        git -C "$path" diff --name-only --diff-filter=ACMRDTUXB "$INTEGRATION_BRANCH...HEAD"
+        git -C "$path" diff --cached --name-only --diff-filter=ACMRDTUXB
+        git -C "$path" diff --name-only --diff-filter=ACMRDTUXB
+        git -C "$path" ls-files --others --exclude-standard
+    } | LC_ALL=C sort -u >"$changes"
+
+    while IFS= read -r changed_file; do
+        [[ -n "$changed_file" ]] || continue
+        if ! allowed_path "$lane" "$changed_file"; then
+            printf 'out-of-lane: %s\n' "$changed_file" >&2
+            out_of_lane=true
+        fi
+    done <"$changes"
+
+    if [[ "$out_of_lane" == true ]]; then
+        die "$lane lane check failed"
+    fi
+    printf '%s lane check passed (%s changed files).\n' "$lane" "$(wc -l <"$changes" | tr -d ' ')"
+    rm -f "$changes"
+    trap - EXIT
+}
+
+stop_lanes() {
+    acquire_lock
+    require_command tmux
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        tmux kill-session -t "$TMUX_SESSION"
+        printf 'Stopped tmux session %s. Worktrees and branches were kept.\n' "$TMUX_SESSION"
+    else
+        printf 'tmux session %s is already stopped. Worktrees and branches were kept.\n' "$TMUX_SESSION"
+    fi
+}
+
+command=${1:-}
+case "$command" in
+    init)
+        (($# == 1)) || die "init takes no arguments"
+        init_lanes
+        ;;
+    start)
+        shift
+        start_lanes "$@"
+        ;;
+    status)
+        (($# == 1)) || die "status takes no arguments"
+        show_status
+        ;;
+    check)
+        shift
+        check_lane "$@"
+        ;;
+    stop)
+        (($# == 1)) || die "stop takes no arguments"
+        stop_lanes
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    '')
+        usage >&2
+        exit 2
+        ;;
+    *)
+        die "unknown command: $command"
+        ;;
+esac
