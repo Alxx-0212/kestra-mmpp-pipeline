@@ -37,6 +37,7 @@ LINKAJA_FEE_COLUMNS_BY_WORKSHEET = {
 }
 LINKAJA_EXPECTED_FEE_LABEL = "LINKAJA EXPECTED RECHARGE OUT CLUSTER FEE"
 LINKAJA_IN_CLUSTER_FEE_LABEL = "LINKAJA DIGIPOS B2B TRANSFER IN CLUSTER FEE"
+SELLTHRU_SALES_FEE_INVOICE_LABEL = "BIAYA FEE BAR A ST (HOLD)"
 LINKAJA_REFERENCE_CLUSTER_IDS = {
     "MRT": "421306",
     "TDR": "421307",
@@ -1190,7 +1191,7 @@ def append_daily_to_gsheet(
         },
         {"label": "ST",                         "key": "SELLTHRU"},
         {"label": "BIAYA FEE ST",               "key": "SELLTHRUFEE"},
-        {"label": "BIAYA FEE BAR A. ST",        "key": "SELLTHRUSALESFEE"},
+        {"label": SELLTHRU_SALES_FEE_INVOICE_LABEL, "key": "SELLTHRUSALESFEE"},
         {
             "label": "Jumlah Pembelian Recharge Out Cluster",
             "debet": pembelian_count,
@@ -1315,7 +1316,7 @@ def append_daily_to_gsheet(
         ("ST", *_split_net_formula(_detail_net_formula("SELLTHRU"))),
         ("BIAYA FEE ST", *_split_net_formula(_detail_net_formula("SELLTHRUFEE"))),
         (
-            "BIAYA FEE BAR A. ST",
+            SELLTHRU_SALES_FEE_INVOICE_LABEL,
             *_split_net_formula(_detail_net_formula("SELLTHRUSALESFEE")),
         ),
     ]

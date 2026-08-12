@@ -1,4 +1,4 @@
-"""Load FinPay CSV/XLS/XLSX files and validate the input schema."""
+"""Load FinPay CSV/XLSX files and validate the input schema."""
 import os
 
 import pandas as pd
@@ -23,17 +23,30 @@ FINPAY_SCHEMA = pa.DataFrameSchema(
     ordered=False,     # don't require columns to be in this exact order
 )
 
+SUPPORTED_FILE_EXTENSIONS = (".csv", ".xlsx")
+LEGACY_XLS_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _unsupported_xls_error() -> ValueError:
+    return ValueError(
+        "Unsupported file format: .xls. Convert the file to .xlsx or .csv."
+    )
+
+
 def _detect_file_type(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
-    if ext in (".csv", ".xlsx", ".xls"):
+    if ext == ".xls":
+        raise _unsupported_xls_error()
+    if ext in SUPPORTED_FILE_EXTENSIONS:
         return ext
     with open(path, "rb") as f:
         header = f.read(8)
     if header[:4] == b"PK\x03\x04":
         return ".xlsx"
-    if header[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-        return ".xls"
+    if header[:8] == LEGACY_XLS_MAGIC:
+        raise _unsupported_xls_error()
     return ".csv"
+
 
 def _find_header_row(df_raw: pd.DataFrame) -> int:
     """
@@ -117,7 +130,7 @@ def load_file(path: str) -> pd.DataFrame:
     """
     ext = _detect_file_type(path)
 
-    if ext in (".xlsx", ".xls"):
+    if ext == ".xlsx":
         return _read_with_header_detect(pd.read_excel, path)
 
     if ext == ".csv":
@@ -133,7 +146,7 @@ def load_file(path: str) -> pd.DataFrame:
                 continue
         raise ValueError(f"Could not parse CSV with any known separator: {path}")
 
-    raise ValueError(f"Unsupported file format: {ext}. Expected .csv, .xlsx, or .xls")
+    raise ValueError(f"Unsupported file format: {ext}. Expected .csv or .xlsx")
 
 
 def _transform_to_schema(df: pd.DataFrame) -> pd.DataFrame:

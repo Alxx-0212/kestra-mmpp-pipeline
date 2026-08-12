@@ -165,6 +165,26 @@ REVERSAL_MAIN_MISSING_REASONS = {
     ),
     REVERSAL_ST_CATEGORY: f'missing reversal remark: {REVERSAL_ST_MAIN_REMARK}',
 }
+KNOWN_SUMMARY_TRANSACTION_LABELS = {
+    'CASHOUT APOLLO',
+    'QRISDUWIT',
+    'DISBURSEMENT',
+    'FeeTransaksi',
+    'RECHARGE',
+    'RECHARGEFEE',
+    PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+    'RECHARGE OUT CLUSTER',
+    'RECHARGE OUT CLUSTER FEE',
+    REVERSAL_NGRS_CATEGORY,
+    REVERSAL_NGRS_FEE_CATEGORY,
+    REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+    REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
+    REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY,
+    'SELLTHRU',
+    'SELLTHRUFEE',
+    'SELLTHRUSALESFEE',
+}
+UNKNOWN_TRANSACTION_UNUSUAL_REASON_PREFIX = 'unknown transaction label'
 
 
 def _remarks_contain(remarks: pd.Series, phrase: str) -> pd.Series:
@@ -390,6 +410,50 @@ def _fee_only_group_implied_mains(transactions: pd.Series) -> list[str]:
 def _fee_only_group_excluded_from_summary(transactions: pd.Series) -> bool:
     implied_mains = _fee_only_group_implied_mains(transactions)
     return 'SELLTHRU' in implied_mains or len(implied_mains) != 1
+
+
+def _unknown_transaction_reason(value: object) -> str:
+    transaction = str(value).strip()
+    if not transaction:
+        transaction = '<blank>'
+    return (
+        f'{UNKNOWN_TRANSACTION_UNUSUAL_REASON_PREFIX}: {transaction}; '
+        'excluded from summary'
+    )
+
+
+def _collect_unknown_transaction_unusual_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[int]]:
+    """
+    Return non-reversal rows whose Transaction label is not reportable.
+
+    The summary sheet writes a fixed set of transaction labels. Unknown labels
+    are therefore flagged and excluded instead of silently disappearing from the
+    user-facing report.
+    """
+    source = df.copy()
+    if 'base_id' not in source.columns:
+        source['base_id'] = _base_id_from_transaction_id(source['Transaction ID'])
+
+    transactions = source['Transaction'].fillna('').astype(str).str.strip()
+    reversal_mask = transactions.apply(_is_reversal_transaction_label)
+    known_mask = transactions.isin(KNOWN_SUMMARY_TRANSACTION_LABELS)
+    unknown_mask = ~reversal_mask & ~known_mask
+
+    unusual_df = source.loc[unknown_mask].copy()
+    excluded_indices = set(unusual_df.index)
+    if unusual_df.empty:
+        unusual_df['base_id'] = pd.Series(dtype='object')
+        unusual_df['unusual_reason'] = pd.Series(dtype='object')
+        return unusual_df, excluded_indices
+
+    unusual_df['unusual_reason'] = [
+        _unknown_transaction_reason(value)
+        for value in unusual_df['Transaction']
+    ]
+    unusual_df = unusual_df.sort_values(['base_id', 'No']).reset_index(drop=True)
+    return unusual_df, excluded_indices
 
 
 def _collect_fee_only_unusual_transactions(
@@ -688,6 +752,9 @@ def prepare_reversal_summary_transactions(
         if fee_cap_excluded_indices
         else result
     )
+    unknown_unusual_df, unknown_excluded_indices = (
+        _collect_unknown_transaction_unusual_transactions(validation_result)
+    )
     unusual_df, excluded_indices, categorized_counts = (
         _collect_reversal_unusual_transactions(validation_result)
     )
@@ -696,6 +763,7 @@ def prepare_reversal_summary_transactions(
     )
     all_excluded_indices = (
         set(fee_cap_excluded_indices)
+        | set(unknown_excluded_indices)
         | set(excluded_indices)
         | set(fee_only_excluded_indices)
     )
@@ -706,7 +774,12 @@ def prepare_reversal_summary_transactions(
         summary_ready = result.reset_index(drop=True)
 
     unusual_parts = [
-        part for part in (fee_cap_unusual_df, unusual_df, fee_only_unusual_df)
+        part for part in (
+            fee_cap_unusual_df,
+            unknown_unusual_df,
+            unusual_df,
+            fee_only_unusual_df,
+        )
         if not part.empty
     ]
     if unusual_parts:
@@ -723,6 +796,7 @@ def prepare_reversal_summary_transactions(
     print(f'Reversal rows categorized for summary: {categorized_counts}')
     print(f'Summary unusual rows flagged: {len(unusual_df)}')
     print(f'Fee cap rows excluded from summary: {len(fee_cap_excluded_indices)}')
+    print(f'Unknown rows excluded from summary: {len(unknown_excluded_indices)}')
     print(f'Reversal rows excluded from summary: {len(excluded_indices)}')
     print(f'Fee-only rows excluded from summary: {len(fee_only_excluded_indices)}')
     return summary_ready, unusual_df
@@ -794,6 +868,9 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
         if fee_cap_excluded_indices
         else deduplicated_df
     )
+    unknown_unusual_df, _ = _collect_unknown_transaction_unusual_transactions(
+        validation_df
+    )
     fee_unusual_df = _flag_fee_rule_unusual_transactions(validation_df)
     reversal_unusual_df, _, _ = _collect_reversal_unusual_transactions(validation_df)
 
@@ -801,6 +878,7 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
         part
         for part in (
             fee_cap_unusual_df,
+            unknown_unusual_df,
             fee_unusual_df,
             duplicate_unusual_df,
             reversal_unusual_df,
@@ -822,6 +900,7 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
 
     print(f'Combined unusual rows      : {len(result)}')
     print(f'Fee cap unusual rows       : {len(fee_cap_unusual_df)}')
+    print(f'Unknown unusual rows       : {len(unknown_unusual_df)}')
     print(f'Duplicate unusual rows     : {len(duplicate_unusual_df)}')
     print(f'Fee-rule unusual rows      : {len(fee_unusual_df)}')
     print(f'Reversal unusual rows      : {len(reversal_unusual_df)}')

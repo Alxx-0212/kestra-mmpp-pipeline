@@ -40,14 +40,14 @@ tasks:
       file_path = os.environ["CSV_PATH"]
 
       PATTERN = re.compile(
-          r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx|xls)$"
+          r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx)$"
       )
 
       filename = os.path.basename(file_path)
       m = PATTERN.match(filename)
       if not m:
           print(f"ERROR: Filename doesn't match expected pattern: {filename}", file=sys.stderr)
-          print("Expected: finpay-<cluster_id>(<DD-MM-YYYY>to<DD-MM-YYYY>).<csv|xlsx|xls>", file=sys.stderr)
+          print("Expected: finpay-<cluster_id>(<DD-MM-YYYY>to<DD-MM-YYYY>).<csv|xlsx>", file=sys.stderr)
           sys.exit(1)
 
       cluster_id = m.group(1)

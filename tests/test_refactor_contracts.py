@@ -1,29 +1,40 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
-try:
-    import pandas as pd
-    from finpay_pipeline import (
-        classification,
-        detail_exports,
-        summary_sheets,
-        unusual_sheets,
-    )
-except ModuleNotFoundError as exc:
-    pd = None
-    classification = None
-    detail_exports = None
-    summary_sheets = None
-    unusual_sheets = None
-    RUNTIME_IMPORT_ERROR = exc
-else:
-    RUNTIME_IMPORT_ERROR = None
-
-
-requires_runtime_dependencies = unittest.skipIf(
-    RUNTIME_IMPORT_ERROR is not None,
-    f"project runtime dependencies are not installed: {RUNTIME_IMPORT_ERROR}",
+import pandas as pd
+from finpay_pipeline import (
+    classification,
+    detail_exports,
+    loading,
+    summary_sheets,
+    unusual_sheets,
 )
+
+
+class FinPayInputFormatContractTest(unittest.TestCase):
+    def test_current_csv_and_xlsx_extensions_are_accepted(self):
+        self.assertEqual(loading._detect_file_type("finpay-export.csv"), ".csv")
+        self.assertEqual(loading._detect_file_type("finpay-export.xlsx"), ".xlsx")
+
+    def test_legacy_xls_extension_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Convert the file to \.xlsx or \.csv",
+        ):
+            loading._detect_file_type("finpay-411311(01-01-2026to01-01-2026).xls")
+
+    def test_legacy_xls_magic_is_rejected_without_xls_extension(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "finpay-export.bin"
+            path.write_bytes(loading.LEGACY_XLS_MAGIC + b"legacy workbook")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"Convert the file to \.xlsx or \.csv",
+            ):
+                loading._detect_file_type(str(path))
 
 
 def _base_rows(transactions):
@@ -51,7 +62,27 @@ def _base_rows(transactions):
     return pd.DataFrame(rows)
 
 
-@requires_runtime_dependencies
+def _non_reversal_rows(transactions):
+    rows = []
+    for idx, transaction in enumerate(transactions, start=1):
+        rows.append({
+            "No": idx,
+            "Transaction Date": pd.Timestamp("2026-06-04 10:00:00"),
+            "Transaction ID": f"TXN{idx}",
+            "Saldo Awal": 1000,
+            "Kredit": 100,
+            "Debet": 0,
+            "Saldo Akhir": 1100,
+            "Transaction Type": "CREDIT",
+            "Transaction": transaction,
+            "raw_transaction_label": transaction,
+            "processed_transaction_label": transaction,
+            "Nomor RS": "",
+            "Remarks": "",
+        })
+    return pd.DataFrame(rows)
+
+
 class PreprocessedReversalContractTest(unittest.TestCase):
     def test_reversal_summary_trusts_preprocessed_labels(self):
         df = _base_rows([
@@ -97,7 +128,57 @@ class PreprocessedReversalContractTest(unittest.TestCase):
         )
 
 
-@requires_runtime_dependencies
+class UnknownTransactionContractTest(unittest.TestCase):
+    def test_known_summary_transaction_allowlist_is_explicit(self):
+        self.assertEqual(
+            classification.KNOWN_SUMMARY_TRANSACTION_LABELS,
+            {
+                "CASHOUT APOLLO",
+                "QRISDUWIT",
+                "DISBURSEMENT",
+                "FeeTransaksi",
+                "RECHARGE",
+                "RECHARGEFEE",
+                classification.PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+                "RECHARGE OUT CLUSTER",
+                "RECHARGE OUT CLUSTER FEE",
+                classification.REVERSAL_NGRS_CATEGORY,
+                classification.REVERSAL_NGRS_FEE_CATEGORY,
+                classification.REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
+                classification.REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
+                classification.REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY,
+                "SELLTHRU",
+                "SELLTHRUFEE",
+                "SELLTHRUSALESFEE",
+            },
+        )
+
+    def test_unknown_transaction_is_reported_as_unusual(self):
+        df = _non_reversal_rows(["QRISDUWIT", "NEWPAY"])
+
+        unusual = classification.flag_unusual_transactions(df)
+
+        self.assertEqual(len(unusual), 1)
+        self.assertEqual(unusual.iloc[0]["Transaction"], "NEWPAY")
+        self.assertEqual(
+            unusual.iloc[0]["unusual_reason"],
+            "unknown transaction label: NEWPAY; excluded from summary",
+        )
+
+    def test_unknown_transaction_is_excluded_from_summary_ready_rows(self):
+        df = _non_reversal_rows(["QRISDUWIT", "NEWPAY"])
+
+        summary_ready, unusual = classification.prepare_reversal_summary_transactions(df)
+
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["QRISDUWIT"])
+        self.assertEqual(len(unusual), 1)
+        self.assertEqual(unusual.iloc[0]["Transaction"], "NEWPAY")
+        self.assertEqual(
+            unusual.iloc[0]["unusual_reason"],
+            "unknown transaction label: NEWPAY; excluded from summary",
+        )
+
+
 class SharedSpreadsheetOpenContractTest(unittest.TestCase):
     def test_unusual_upload_uses_shared_spreadsheet_open(self):
         spreadsheet = Mock()
@@ -141,12 +222,20 @@ class SharedSpreadsheetOpenContractTest(unittest.TestCase):
         spreadsheet.worksheet.side_effect = worksheet_by_title
         spreadsheet.add_worksheet.return_value = linkaja_worksheet
 
+        def append_after_linkaja_reference_sheet(*args, **kwargs):
+            spreadsheet.add_worksheet.assert_called_once_with(
+                title="LinkAja",
+                rows=1000,
+                cols=29,
+            )
+            return 3, 10
+
         with patch(
             "finpay_pipeline.summary_sheets.open_or_create_finpay_spreadsheet",
             return_value=spreadsheet,
         ), patch(
             "finpay_pipeline.summary_sheets.append_daily_to_gsheet",
-            return_value=(3, 10),
+            side_effect=append_after_linkaja_reference_sheet,
         ):
             result = summary_sheets.process_daily_upload(
                 target_spreadsheet="FINPAY REPORT",
@@ -595,8 +684,13 @@ class SharedSpreadsheetOpenContractTest(unittest.TestCase):
         )
 
 
-@requires_runtime_dependencies
 class QrisduwitInvoiceRowsContractTest(unittest.TestCase):
+    def test_sellthru_sales_fee_invoice_label_is_stable(self):
+        self.assertEqual(
+            summary_sheets.SELLTHRU_SALES_FEE_INVOICE_LABEL,
+            "BIAYA FEE BAR A ST (HOLD)",
+        )
+
     def test_linkaja_reference_headers_match_static_invoice_columns(self):
         rows = summary_sheets._linkaja_reference_header_values()
 
