@@ -93,7 +93,7 @@ execution date.
 |---|---|
 | `finpay_pipeline.loading` | Load CSV/XLSX, detect the true header row, coerce data types, validate `FINPAY_SCHEMA`. |
 | `finpay_pipeline.integrity` | Enforce debit/credit integrity after schema validation. |
-| `finpay_pipeline.classification` | Preprocess transaction labels, relabel out-cluster and reversal rows, validate fee groups, build unusual rows, decide summary exclusion. |
+| `finpay_pipeline.classification` | Preprocess transaction labels, relabel out-cluster, standalone ST, and reversal rows, validate known remark structures and fee groups, build unusual rows, decide summary exclusion. |
 | `finpay_pipeline.dedup` | Drop duplicate calculation rows and create duplicate-row reports. |
 | `finpay_pipeline.summary` | Aggregate summary-ready rows by processed transaction label. |
 | `finpay_pipeline.database` | Define/reconcile Postgres schemas, serialize rows, and replace table batches by `cluster_id + report_date`. |
@@ -142,8 +142,9 @@ Important ordering:
 - Dedup happens before detail exports and summary preparation.
 - `finpay_transactions` is written from `summary_ready.parquet`, so it only
   contains rows included in summary calculation.
-- Summary preparation re-evaluates fee-cap, unknown-label, reversal, and
-  fee-only exclusion conditions against the explicitly deduplicated dataframe.
+- Summary preparation re-evaluates fee-cap, unknown-label, unknown-remark,
+  reversal, and fee-only exclusion conditions against the explicitly
+  deduplicated dataframe.
   The returned summary-unusual dataframe is used for task counts only; the
   workflow does not persist it or append it to `unusual.parquet` or the unusual
   sheet.
@@ -234,6 +235,16 @@ Out-cluster relabeling:
   `biaya pembelian recharge out cluster` becomes
   `PEMBELIAN RECHARGE OUT CLUSTER`.
 
+Standalone Sellthru relabeling:
+
+- A source `RECHARGE` row whose complete normalized remark is
+  `transaksi sellthru` becomes `SELLTHRU` and is included in the ST summary.
+- This is a characterized standalone main-row case, so it does not require
+  `SELLTHRUFEE` or `SELLTHRUSALESFEE` companions.
+- `raw_transaction_label` remains `RECHARGE`; only `Transaction` and
+  `processed_transaction_label` become `SELLTHRU`. Source `Remarks` remains
+  unchanged.
+
 Reversal relabeling:
 
 - `biaya pembelian recharge` -> `Reversal - NGRS`
@@ -268,10 +279,40 @@ Fee-only behavior:
 - `SELLTHRUFEE` / `SELLTHRUSALESFEE` without `SELLTHRU` is flagged unusual and
   excluded from summary.
 
-Any non-reversal transaction label outside the known FinPay summary categories
-is flagged with an `unknown transaction label` reason and excluded from
-`summary_ready.parquet`. Do not silently map new source labels into an existing
-category; add a characterized rule and tests first.
+Unknown transaction and remark behavior:
+
+- Any non-reversal transaction label outside the known FinPay summary
+  categories is flagged with an `unknown transaction label` reason.
+- Every known processed transaction label must also match one characterized
+  remark structure. A mismatch is flagged with an
+  `unknown remarks pattern for transaction` reason.
+- Both cases are excluded from `summary_ready.parquet`; they cannot affect the
+  persisted calculation rows or summary sheet.
+- Remark matching is case-insensitive and replaces changing numeric values and
+  `DD-MM-YYYY` dates with placeholders. Static words, punctuation, and order
+  must still match. This permits different amounts, phone/cluster numbers, and
+  dates without weakening the transaction-to-remark contract.
+
+The current normalized remark vocabulary was characterized from all 60 local
+cluster `411311` exports (74,532 rows):
+
+| Processed transaction | Accepted normalized remark structure |
+|---|---|
+| `CASHOUT APOLLO` | `apollo mrc<value> <date>` |
+| `QRISDUWIT` | `disburse qris duwit atas transaksi pembayaran qris pada tanggal <date> sejumlah rp <value>` |
+| `DISBURSEMENT` | `sales fee payment` for voucher and/or perdana counts, followed by `sejumlah <value> rupiah` |
+| `FeeTransaksi` | `fee digipos rp.<value> \| fee sbp rp.<value> \| dari nomor :<value>` |
+| `RECHARGE` / `Reversal - NGRS` | `biaya pembelian recharge sejumlah <value> rupiah, dari <value> ke <value>` |
+| `RECHARGEFEE` / `Reversal - NGRS FEE` | `platform fee recharge rp. <value>,-` |
+| `PEMBELIAN RECHARGE OUT CLUSTER` / its reversal | `biaya pembelian recharge out cluster sejumlah <value> rupiah, dari <value> ke <value>` |
+| `RECHARGE OUT CLUSTER` / its reversal | `fee pembelian recharge out cluster sejumlah <value> rupiah, dari <value> ke <value>` |
+| `RECHARGE OUT CLUSTER FEE` / its reversal | `platform fee recharge rp. <value>,-` |
+| `SELLTHRU` | `sellthru sales fee` or the standalone `transaksi sellthru` case |
+| `SELLTHRUFEE` | `platform fee sellthru rp. <value>,-` or the observed `fee transaksi sellthru ... fee tsel ... fee finnet ...` structure |
+| `SELLTHRUSALESFEE` | `sales hold transaksi sellthru sejumlah <value> rupiah, dari <value>` |
+
+Do not silently map another new label or remark structure into an existing
+category; characterize it from source data and add tests first.
 
 Unusual rows must keep transaction `Remarks` unchanged. Extra explanation
 belongs in `unusual_reason`.

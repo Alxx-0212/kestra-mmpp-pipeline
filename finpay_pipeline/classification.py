@@ -1,4 +1,6 @@
 """Transaction relabeling, fee validation, and unusual-row classification."""
+import re
+
 import pandas as pd
 
 from .dedup import deduplicate_rows_by_minute_with_report
@@ -27,6 +29,7 @@ REVERSAL_ST_TRANSACTION_FEE_REMARK = 'fee transaksi sellthru sejumlah 100 rupiah
 REVERSAL_ST_SALES_HOLD_REMARK = 'sales hold transaksi sellthru'
 REVERSAL_ST_UNSUPPORTED_REASON = 'unsupported reversal ST category'
 PROCESSED_TRANSACTION_LABEL_COLUMN = 'processed_transaction_label'
+STANDALONE_SELLTHRU_REMARK = 'transaksi sellthru'
 
 # Transaction group validation rules. A group is keyed by Transaction ID with
 # fee suffixes removed, then the main transaction determines the required rows.
@@ -50,6 +53,7 @@ TRANSACTION_GROUP_RULES = {
                 'presence_only': True,
             },
         },
+        'exempt_remark': STANDALONE_SELLTHRU_REMARK,
     },
     REVERSAL_NGRS_CATEGORY: {
         'required': {
@@ -185,6 +189,86 @@ KNOWN_SUMMARY_TRANSACTION_LABELS = {
     'SELLTHRUSALESFEE',
 }
 UNKNOWN_TRANSACTION_UNUSUAL_REASON_PREFIX = 'unknown transaction label'
+UNKNOWN_REMARK_UNUSUAL_REASON_PREFIX = 'unknown remarks pattern for transaction'
+
+RECHARGE_REMARK_PATTERNS = frozenset({
+    'biaya pembelian recharge sejumlah <value> rupiah, dari <value> ke <value>',
+})
+RECHARGE_OUT_CLUSTER_REMARK_PATTERNS = frozenset({
+    'fee pembelian recharge out cluster sejumlah <value> rupiah, '
+    'dari <value> ke <value>',
+})
+PEMBELIAN_RECHARGE_OUT_CLUSTER_REMARK_PATTERNS = frozenset({
+    'biaya pembelian recharge out cluster sejumlah <value> rupiah, '
+    'dari <value> ke <value>',
+})
+RECHARGE_FEE_REMARK_PATTERNS = frozenset({
+    'platform fee recharge rp. <value>,-',
+})
+SELLTHRU_MAIN_REMARK_PATTERNS = frozenset({
+    'sellthru sales fee',
+    STANDALONE_SELLTHRU_REMARK,
+})
+SELLTHRU_FEE_REMARK_PATTERNS = frozenset({
+    'platform fee sellthru rp. <value>,-',
+    'fee transaksi sellthru sejumlah <value> rupiah, dari <value> ke <value>, '
+    'fee tsel rp.<value> | fee finnet rp.<value>',
+})
+SELLTHRU_SALES_FEE_REMARK_PATTERNS = frozenset({
+    'sales hold transaksi sellthru sejumlah <value> rupiah, dari <value>',
+})
+
+# This allowlist was characterized from all FinPay exports currently available
+# under data/411311. Numeric values and DD-MM-YYYY dates are normalized before
+# comparison, while the source Remarks value remains unchanged in every output.
+KNOWN_TRANSACTION_REMARK_PATTERNS = {
+    'CASHOUT APOLLO': frozenset({'apollo mrc<value> <date>'}),
+    'QRISDUWIT': frozenset({
+        'disburse qris duwit atas transaksi pembayaran qris pada tanggal '
+        '<date> sejumlah rp <value>',
+    }),
+    'DISBURSEMENT': frozenset({
+        'sales fee payment untuk perdana sebanyak <value> sejumlah <value> rupiah',
+        'sales fee payment untuk voucher sebanyak <value> sejumlah <value> rupiah',
+        'sales fee payment untuk voucher sebanyak <value> dan perdana sebanyak '
+        '<value> sejumlah <value> rupiah',
+        'sales fee payment untuk perdana sebanyak <value> dan voucher sebanyak '
+        '<value> sejumlah <value> rupiah',
+    }),
+    'FeeTransaksi': frozenset({
+        'fee digipos rp.<value> | fee sbp rp.<value> | dari nomor :<value>',
+    }),
+    'RECHARGE': RECHARGE_REMARK_PATTERNS,
+    'RECHARGEFEE': RECHARGE_FEE_REMARK_PATTERNS,
+    PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY: (
+        PEMBELIAN_RECHARGE_OUT_CLUSTER_REMARK_PATTERNS
+    ),
+    'RECHARGE OUT CLUSTER': RECHARGE_OUT_CLUSTER_REMARK_PATTERNS,
+    'RECHARGE OUT CLUSTER FEE': RECHARGE_FEE_REMARK_PATTERNS,
+    REVERSAL_NGRS_CATEGORY: RECHARGE_REMARK_PATTERNS,
+    REVERSAL_NGRS_FEE_CATEGORY: RECHARGE_FEE_REMARK_PATTERNS,
+    REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY: (
+        PEMBELIAN_RECHARGE_OUT_CLUSTER_REMARK_PATTERNS
+    ),
+    REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY: RECHARGE_OUT_CLUSTER_REMARK_PATTERNS,
+    REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY: RECHARGE_FEE_REMARK_PATTERNS,
+    'SELLTHRU': SELLTHRU_MAIN_REMARK_PATTERNS,
+    'SELLTHRUFEE': SELLTHRU_FEE_REMARK_PATTERNS,
+    'SELLTHRUSALESFEE': SELLTHRU_SALES_FEE_REMARK_PATTERNS,
+    REVERSAL_ST_CATEGORY: frozenset({'sellthru sales fee'}),
+    REVERSAL_ST_SELLTHRU_FEE_CATEGORY: SELLTHRU_FEE_REMARK_PATTERNS,
+    REVERSAL_ST_SELLTHRU_SALES_FEE_CATEGORY: SELLTHRU_SALES_FEE_REMARK_PATTERNS,
+}
+
+
+def _normalize_remark_pattern(value: object) -> str:
+    """Remove changing date/number values while preserving remark structure."""
+    if pd.isna(value):
+        return ''
+    normalized = str(value).strip().casefold()
+    normalized = re.sub(r'\b\d{1,2}-\d{1,2}-\d{4}\b', '<date>', normalized)
+    normalized = re.sub(r'\d+(?:[.,]\d+)*', '<value>', normalized)
+    return ' '.join(normalized.split())
 
 
 def _remarks_contain(remarks: pd.Series, phrase: str) -> pd.Series:
@@ -237,6 +321,23 @@ def relabel_pembelian_recharge_out_cluster_transactions(
         PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY
     )
     print(f'Pembelian recharge out-cluster rows relabeled: {int(pembelian_mask.sum())}')
+    return result
+
+
+def relabel_standalone_sellthru_transactions(df: pd.DataFrame) -> pd.DataFrame:
+    """Relabel the FinPay standalone ST case currently emitted as RECHARGE."""
+    result = df.copy()
+    transaction = result['Transaction'].fillna('').astype(str).str.strip().str.upper()
+    normalized_remarks = result['Remarks'].map(_normalize_remark_pattern)
+    standalone_sellthru_mask = (
+        transaction.eq('RECHARGE')
+        & normalized_remarks.eq(STANDALONE_SELLTHRU_REMARK)
+    )
+    result.loc[standalone_sellthru_mask, 'Transaction'] = 'SELLTHRU'
+    print(
+        'Standalone Sellthru rows relabeled: '
+        f'{int(standalone_sellthru_mask.sum())}'
+    )
     return result
 
 
@@ -422,15 +523,25 @@ def _unknown_transaction_reason(value: object) -> str:
     )
 
 
-def _collect_unknown_transaction_unusual_transactions(
+def _unknown_remark_reason(transaction_value: object) -> str:
+    transaction = str(transaction_value).strip()
+    if not transaction:
+        transaction = '<blank>'
+    return (
+        f'{UNKNOWN_REMARK_UNUSUAL_REASON_PREFIX}: {transaction}; '
+        'excluded from summary'
+    )
+
+
+def _collect_unknown_transaction_or_remark_unusual_transactions(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, set[int]]:
     """
-    Return non-reversal rows whose Transaction label is not reportable.
+    Return rows whose Transaction label or normalized Remarks are not known.
 
     The summary sheet writes a fixed set of transaction labels. Unknown labels
-    are therefore flagged and excluded instead of silently disappearing from the
-    user-facing report.
+    and known labels with unrecognized remark structures are therefore flagged
+    and excluded instead of silently disappearing from the user-facing report.
     """
     source = df.copy()
     if 'base_id' not in source.columns:
@@ -441,7 +552,16 @@ def _collect_unknown_transaction_unusual_transactions(
     known_mask = transactions.isin(KNOWN_SUMMARY_TRANSACTION_LABELS)
     unknown_mask = ~reversal_mask & ~known_mask
 
-    unusual_df = source.loc[unknown_mask].copy()
+    normalized_remarks = source['Remarks'].map(_normalize_remark_pattern)
+    remark_mismatch_mask = pd.Series(False, index=source.index)
+    for transaction, known_patterns in KNOWN_TRANSACTION_REMARK_PATTERNS.items():
+        transaction_mask = transactions.eq(transaction)
+        remark_mismatch_mask |= (
+            transaction_mask & ~normalized_remarks.isin(known_patterns)
+        )
+
+    unusual_mask = unknown_mask | remark_mismatch_mask
+    unusual_df = source.loc[unusual_mask].copy()
     excluded_indices = set(unusual_df.index)
     if unusual_df.empty:
         unusual_df['base_id'] = pd.Series(dtype='object')
@@ -449,8 +569,12 @@ def _collect_unknown_transaction_unusual_transactions(
         return unusual_df, excluded_indices
 
     unusual_df['unusual_reason'] = [
-        _unknown_transaction_reason(value)
-        for value in unusual_df['Transaction']
+        (
+            _unknown_transaction_reason(source.at[index, 'Transaction'])
+            if bool(unknown_mask.at[index])
+            else _unknown_remark_reason(source.at[index, 'Transaction'])
+        )
+        for index in unusual_df.index
     ]
     unusual_df = unusual_df.sort_values(['base_id', 'No']).reset_index(drop=True)
     return unusual_df, excluded_indices
@@ -621,6 +745,7 @@ def preprocess_transaction_labels(df: pd.DataFrame) -> pd.DataFrame:
     calculation/detail paths.
     """
     result = relabel_reversal_transactions(df)
+    result = relabel_standalone_sellthru_transactions(result)
     result = relabel_out_cluster_transactions(result)
     result = relabel_pembelian_recharge_out_cluster_transactions(result)
     return result
@@ -744,16 +869,21 @@ def prepare_reversal_summary_transactions(
     flagged and excluded.
     """
     result = ensure_reversal_labels_prepared(df)
-    fee_cap_unusual_df, fee_cap_excluded_indices = (
-        _collect_fee_cap_excess_transactions(result)
+    unknown_unusual_df, unknown_excluded_indices = (
+        _collect_unknown_transaction_or_remark_unusual_transactions(result)
     )
-    validation_result = (
-        result.drop(index=sorted(fee_cap_excluded_indices))
-        if fee_cap_excluded_indices
+    known_result = (
+        result.drop(index=sorted(unknown_excluded_indices))
+        if unknown_excluded_indices
         else result
     )
-    unknown_unusual_df, unknown_excluded_indices = (
-        _collect_unknown_transaction_unusual_transactions(validation_result)
+    fee_cap_unusual_df, fee_cap_excluded_indices = (
+        _collect_fee_cap_excess_transactions(known_result)
+    )
+    validation_result = (
+        known_result.drop(index=sorted(fee_cap_excluded_indices))
+        if fee_cap_excluded_indices
+        else known_result
     )
     unusual_df, excluded_indices, categorized_counts = (
         _collect_reversal_unusual_transactions(validation_result)
@@ -860,16 +990,21 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     positives. Downstream calculation tasks still perform their own dedup step.
     """
     deduplicated_df, duplicate_unusual_df = deduplicate_rows_by_minute_with_report(df)
-    fee_cap_unusual_df, fee_cap_excluded_indices = (
-        _collect_fee_cap_excess_transactions(deduplicated_df)
+    unknown_unusual_df, unknown_excluded_indices = (
+        _collect_unknown_transaction_or_remark_unusual_transactions(deduplicated_df)
     )
-    validation_df = (
-        deduplicated_df.drop(index=sorted(fee_cap_excluded_indices))
-        if fee_cap_excluded_indices
+    known_df = (
+        deduplicated_df.drop(index=sorted(unknown_excluded_indices))
+        if unknown_excluded_indices
         else deduplicated_df
     )
-    unknown_unusual_df, _ = _collect_unknown_transaction_unusual_transactions(
-        validation_df
+    fee_cap_unusual_df, fee_cap_excluded_indices = (
+        _collect_fee_cap_excess_transactions(known_df)
+    )
+    validation_df = (
+        known_df.drop(index=sorted(fee_cap_excluded_indices))
+        if fee_cap_excluded_indices
+        else known_df
     )
     fee_unusual_df = _flag_fee_rule_unusual_transactions(validation_df)
     reversal_unusual_df, _, _ = _collect_reversal_unusual_transactions(validation_df)
@@ -900,7 +1035,7 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
 
     print(f'Combined unusual rows      : {len(result)}')
     print(f'Fee cap unusual rows       : {len(fee_cap_unusual_df)}')
-    print(f'Unknown unusual rows       : {len(unknown_unusual_df)}')
+    print(f'Unknown transaction/remarks: {len(unknown_unusual_df)}')
     print(f'Duplicate unusual rows     : {len(duplicate_unusual_df)}')
     print(f'Fee-rule unusual rows      : {len(fee_unusual_df)}')
     print(f'Reversal unusual rows      : {len(reversal_unusual_df)}')
