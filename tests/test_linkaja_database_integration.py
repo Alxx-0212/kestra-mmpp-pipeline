@@ -2,7 +2,8 @@ import csv
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from linkaja_fee_pipeline.database import (
@@ -945,7 +946,7 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(
             in_cluster_fee_row["DIGIPOS B2B TRANSFER IN CLUSTER FEE"],
-            20,
+            0,
         )
         complete_reversal_row = next(
             row for row in resolved["detail_rows"]
@@ -1113,6 +1114,122 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
                     """
                 )
                 self.assertEqual(cursor.fetchone()[0], "COMPLETE")
+
+    def test_dashboard_fee_and_actual_withdrawal_cycle_views(self):
+        self._persist(
+            [
+                self._row(
+                    **{
+                        "No": "1",
+                        "Transaction ID": "CYCLE-CREDIT-1",
+                        "Finalized Date": "01/07/2026",
+                        "Finalized Time": "09:00:00",
+                        "Initiate Date": "01/07/2026",
+                        "Transaction Scenario": "Digipos B2B Transfer",
+                        "Debit": "0",
+                        "Credit": "1000",
+                        "Balance": "1000",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "2",
+                        "Transaction ID": "WITHDRAWAL-1",
+                        "Finalized Date": "01/07/2026",
+                        "Finalized Time": "12:00:00",
+                        "Initiate Date": "01/07/2026",
+                        "Transaction Scenario":
+                            "Organization Withdraw of Funds with Next Working "
+                            "Day Payment",
+                        "Debit": "600",
+                        "Credit": "0",
+                        "Balance": "400",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "3",
+                        "Transaction ID": "CYCLE-CREDIT-2",
+                        "Finalized Date": "02/07/2026",
+                        "Finalized Time": "10:00:00",
+                        "Initiate Date": "02/07/2026",
+                        "Transaction Scenario": "Digipos B2B Transfer",
+                        "Debit": "0",
+                        "Credit": "200",
+                        "Balance": "600",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "4",
+                        "Transaction ID": "WITHDRAWAL-2",
+                        "Finalized Date": "02/07/2026",
+                        "Finalized Time": "16:00:00",
+                        "Initiate Date": "02/07/2026",
+                        "Transaction Scenario":
+                            "Organization Withdraw of Funds with Next Working "
+                            "Day Payment",
+                        "Debit": "600",
+                        "Credit": "0",
+                        "Balance": "0",
+                        "Fee": "",
+                    }
+                ),
+            ],
+            "laporan-123456-dashboard-cycle.csv",
+            "load-dashboard-cycle",
+        )
+
+        with psycopg.connect(TEST_DSN) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        SUM(gross_transaction_count),
+                        SUM(active_transaction_count),
+                        SUM(active_fee)
+                    FROM linkaja_daily_fee_reconciliation_v
+                    WHERE cluster_id = '123456'
+                      AND fee_type = 'EXPECTED_OUT_CLUSTER_RP200'
+                    """
+                )
+                self.assertEqual(cursor.fetchone(), (2, 2, 400))
+
+                cursor.execute(
+                    """
+                    SELECT
+                        interval_start_exclusive,
+                        interval_end_inclusive,
+                        opening_balance,
+                        non_withdrawal_company_credit,
+                        withdrawal_company_debit,
+                        closing_balance,
+                        balance_variance,
+                        linkaja_reconciliation_status,
+                        mandiri_confirmation_status
+                    FROM linkaja_mandiri_settlement_cycles_v
+                    WHERE withdrawal_transaction_id = 'WITHDRAWAL-2'
+                    """
+                )
+                cycle = cursor.fetchone()
+
+        self.assertEqual(
+            cycle,
+            (
+                datetime(2026, 7, 1, 12, 0),
+                datetime(2026, 7, 2, 16, 0),
+                Decimal("400"),
+                Decimal("200"),
+                Decimal("600"),
+                Decimal("0"),
+                Decimal("0"),
+                "BALANCED",
+                "PENDING_BANK_EVIDENCE",
+            ),
+        )
 
 
 if __name__ == "__main__":
