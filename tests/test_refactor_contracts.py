@@ -54,7 +54,8 @@ def _base_rows(transactions):
             "processed_transaction_label": transaction,
             "Nomor RS": "",
             "Remarks": (
-                "biaya pembelian recharge"
+                "Biaya Pembelian recharge sejumlah 100 rupiah, "
+                "dari 081234567890 ke 411311"
                 if idx == 1
                 else "platform fee recharge rp. 20,-"
             ),
@@ -63,6 +64,17 @@ def _base_rows(transactions):
 
 
 def _non_reversal_rows(transactions):
+    known_remarks = {
+        "QRISDUWIT": (
+            "Disburse Qris Duwit atas Transaksi pembayaran QRIS pada tanggal "
+            "03-06-2026 sejumlah Rp 15000,00"
+        ),
+        "RECHARGE": (
+            "Biaya Pembelian recharge sejumlah 100000 rupiah, "
+            "dari 081234567890 ke 411311"
+        ),
+        "SELLTHRU": "Sellthru Sales Fee",
+    }
     rows = []
     for idx, transaction in enumerate(transactions, start=1):
         rows.append({
@@ -78,7 +90,7 @@ def _non_reversal_rows(transactions):
             "raw_transaction_label": transaction,
             "processed_transaction_label": transaction,
             "Nomor RS": "",
-            "Remarks": "",
+            "Remarks": known_remarks.get(transaction, ""),
         })
     return pd.DataFrame(rows)
 
@@ -153,6 +165,12 @@ class UnknownTransactionContractTest(unittest.TestCase):
             },
         )
 
+    def test_every_known_summary_transaction_has_remark_patterns(self):
+        self.assertLessEqual(
+            classification.KNOWN_SUMMARY_TRANSACTION_LABELS,
+            set(classification.KNOWN_TRANSACTION_REMARK_PATTERNS),
+        )
+
     def test_unknown_transaction_is_reported_as_unusual(self):
         df = _non_reversal_rows(["QRISDUWIT", "NEWPAY"])
 
@@ -177,6 +195,89 @@ class UnknownTransactionContractTest(unittest.TestCase):
             unusual.iloc[0]["unusual_reason"],
             "unknown transaction label: NEWPAY; excluded from summary",
         )
+
+    def test_known_transaction_with_unknown_remarks_is_reported_and_excluded(self):
+        df = _non_reversal_rows(["QRISDUWIT"])
+        df.loc[0, "Remarks"] = "Unexpected QRIS settlement wording"
+
+        unusual = classification.flag_unusual_transactions(df)
+        summary_ready, summary_unusual = (
+            classification.prepare_reversal_summary_transactions(df)
+        )
+
+        self.assertEqual(len(unusual), 1)
+        self.assertEqual(
+            unusual.iloc[0]["unusual_reason"],
+            "unknown remarks pattern for transaction: QRISDUWIT; "
+            "excluded from summary",
+        )
+        self.assertEqual(
+            unusual.iloc[0]["Remarks"],
+            "Unexpected QRIS settlement wording",
+        )
+        self.assertTrue(summary_ready.empty)
+        self.assertEqual(len(summary_unusual), 1)
+
+    def test_variable_values_in_known_remarks_are_ignored(self):
+        df = _non_reversal_rows(["QRISDUWIT", "QRISDUWIT"])
+        df.loc[0, "Remarks"] = (
+            "Disburse Qris Duwit atas Transaksi pembayaran QRIS pada tanggal "
+            "01-05-2026 sejumlah Rp 180,00"
+        )
+        df.loc[1, "Remarks"] = (
+            "Disburse Qris Duwit atas Transaksi pembayaran QRIS pada tanggal "
+            "31-12-2027 sejumlah Rp 9876543,25"
+        )
+
+        unusual = classification.flag_unusual_transactions(df)
+        summary_ready, summary_unusual = (
+            classification.prepare_reversal_summary_transactions(df)
+        )
+
+        self.assertTrue(unusual.empty)
+        self.assertEqual(len(summary_ready), 2)
+        self.assertTrue(summary_unusual.empty)
+
+
+class StandaloneSellthruClassificationContractTest(unittest.TestCase):
+    def test_recharge_with_transaksi_sellthru_remarks_becomes_st(self):
+        df = _non_reversal_rows(["RECHARGE"])
+        df.loc[0, "Remarks"] = "Transaksi Sellthru"
+        original_remarks = df.loc[0, "Remarks"]
+
+        preprocessed = classification.preprocess_transaction_labels(df)
+        preprocessed["raw_transaction_label"] = df["Transaction"]
+        preprocessed["processed_transaction_label"] = preprocessed["Transaction"]
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, summary_unusual = (
+            classification.prepare_reversal_summary_transactions(preprocessed)
+        )
+
+        self.assertEqual(preprocessed.loc[0, "Transaction"], "SELLTHRU")
+        self.assertEqual(preprocessed.loc[0, "raw_transaction_label"], "RECHARGE")
+        self.assertEqual(preprocessed.loc[0, "Remarks"], original_remarks)
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["SELLTHRU"])
+
+    def test_other_recharge_with_sellthru_remarks_is_unusual(self):
+        df = _non_reversal_rows(["RECHARGE"])
+        df.loc[0, "Remarks"] = "Sellthru Sales Fee"
+        preprocessed = classification.preprocess_transaction_labels(df)
+        preprocessed["processed_transaction_label"] = preprocessed["Transaction"]
+
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, _ = classification.prepare_reversal_summary_transactions(
+            preprocessed,
+        )
+
+        self.assertEqual(preprocessed.loc[0, "Transaction"], "RECHARGE")
+        self.assertEqual(len(unusual), 1)
+        self.assertEqual(
+            unusual.iloc[0]["unusual_reason"],
+            "unknown remarks pattern for transaction: RECHARGE; excluded from summary",
+        )
+        self.assertTrue(summary_ready.empty)
 
 
 class SharedSpreadsheetOpenContractTest(unittest.TestCase):
