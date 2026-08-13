@@ -644,7 +644,10 @@ def _baseline_existing_schema(
             require_ledger_signed_amount=has_ledger_signed_amount,
         )
         if has_ledger_signed_amount:
-            baseline_migrations = migrations
+            # Version 007 changes fee-view behavior without changing its
+            # columns, so a structurally current unversioned schema can only
+            # be proven through version 006. Migration 007 must still run.
+            baseline_migrations = migrations[:6]
         elif has_monthly_fee_summary:
             baseline_migrations = migrations[:5]
         else:

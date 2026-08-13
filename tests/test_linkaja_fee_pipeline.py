@@ -183,6 +183,26 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
                     load_id="load-1",
                 )
 
+    def test_normalizer_preserves_blank_balance_as_null(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "laporan-123456-BLANK-BALANCE.csv"
+            output = Path(temp_dir) / "normalized.csv"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=LINKAJA_SOURCE_COLUMNS)
+                writer.writeheader()
+                writer.writerow(self.full_source_row(**{"Balance": ""}))
+
+            normalize_linkaja_csv(
+                source,
+                output,
+                filename_hint=source.name,
+                load_id="load-blank-balance",
+            )
+            with output.open(newline="", encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle))
+
+        self.assertEqual(row["balance"], "")
+
     def test_normalizer_requires_exact_source_header(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "laporan-123456-TEST.csv"

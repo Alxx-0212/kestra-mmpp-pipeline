@@ -9,6 +9,9 @@ The approved read-only Taipy architecture, complete column lineage, report
 contracts, schema suitability assessment, and delivery sequence are in
 [`TAIPY_DASHBOARD_PLAN.md`](TAIPY_DASHBOARD_PLAN.md).
 
+The reproducible July source-bundle result and finance-readiness assessment are
+in [`JULY_2026_WORKFLOW_TEST_SUMMARY.md`](JULY_2026_WORKFLOW_TEST_SUMMARY.md).
+
 The source export is an account ledger, not one row per business transaction.
 One transaction can have one or more ledger rows because LinkAja reports the
 movement of each affected account. All calculations therefore start by
@@ -91,8 +94,9 @@ The normalizer enforces these rules:
   `Finalized Time` are required.
 - Dates are parsed as `DD/MM/YYYY`; source timestamps are local business time
   in `Asia/Makassar` (WITA), with no automatic timezone conversion.
-- Debit, credit, balance, and fee are normalized as decimal values. Blank
-  optional values remain null where the schema permits it.
+- Debit and credit are normalized as decimal values, with blank values treated
+  as zero movement. Blank optional Balance and Fee values remain null so
+  unknown evidence is not converted into a verified zero.
 - A manifest records cluster ID, source file, row count, posting dates,
   scenario counts, and the Kestra execution ID used as `load_id`.
 
@@ -222,9 +226,9 @@ create temporary raw stage
 -> commit
 ```
 
-The stage rejects a transaction ID whose source rows disagree on posting date,
-scenario, status, transaction type, original transaction ID, non-null fee
-value, or company Purchase Account. This prevents silently aggregating an
+The stage rejects a transaction ID whose source rows disagree on posting date
+or time, scenario, status, transaction type, original transaction ID, non-null
+fee value, or company Purchase Account. This prevents silently aggregating an
 ambiguous business event.
 
 Daily reruns are idempotent at transaction identity. They replace the uploaded
@@ -239,10 +243,10 @@ The active daily fee report is a monitoring calculation from
 
 ```text
 expected recharge / out-cluster fee
-    = count(Digipos B2B Transfer facts with positive company credit) * 200
+    = count(active Digipos B2B Transfer facts with positive company credit) * 200
 
 in-cluster fee
-    = count(Digipos B2B Transfer In Cluster facts that are not reversal rows) * 20
+    = count(active Digipos B2B Transfer In Cluster original facts) * 20
 
 daily total fee
     = expected recharge / out-cluster fee + in-cluster fee
@@ -250,6 +254,14 @@ daily total fee
 
 The calculation is at transaction grain, not source-row grain. A two-row
 internal transfer produces one qualifying transaction, never two fees.
+
+An active fact is an original transaction that has no completed same-cluster
+reversal referencing it through `Original Transaction ID`. When a completed
+reversal arrives, the original date is included in the affected-date refresh
+and that original contributes zero to the active daily fee. The reversal stays
+on its actual posting date, contributes no fee itself, and remains visible in
+the reversal measures. Gross ledger debit, credit, and source Fee evidence are
+never removed.
 
 The expected out-cluster fee is derived monitoring information. It is not
 proof that a 200 fee was posted, invoiced, or paid on that same date.
@@ -275,12 +287,12 @@ accumulating execution JSON files:
 - `queries/linkaja_daily_detail_measures.sql` for daily scenario measures; and
 - `queries/linkaja_unresolved_reversals.sql` for the exception queue.
 
-Daily measures are gross posting-date monitoring values. When a later reversal
-arrives, the original date is recalculated and the original fact becomes
-`is_reversed = true`, but the existing expected/in-cluster daily fee query does
-not remove that original. The reversal stays on its actual posting date. A
-dashboard that needs daily net/active fees should present gross, reversal
-adjustment, and net as separate measures instead of rewriting ledger history.
+Daily company movement and source evidence remain gross posting-date measures.
+Expected/in-cluster fee values are active values: they exclude an original once
+`is_reversed = true`. The reversal stays on its actual posting date, and the
+detail report retains reversal counts and fee-adjustment evidence so a
+dashboard can present gross activity, reversal adjustment, and active fee
+without rewriting ledger history.
 
 ## Scenario-Specific Interpretation
 
@@ -289,14 +301,16 @@ adjustment, and net as separate measures instead of rewriting ledger history.
 This is usually a two-row internal transfer: company Purchase Account credit
 and merchant General Account debit. Count it once for company principal
 movement. The active daily in-cluster fee is one completed transaction times
-20; retain any source `Fee` for audit, but do not add it to the principal.
+20 while the original is not reversed; retain any source `Fee` for audit, but
+do not add it to the principal.
 
 ### `Digipos B2B Transfer`
 
 This usually represents an out-cluster company Purchase Account credit. A
 transaction qualifies for the daily expected fee only when it has positive
-company credit. The result is `1 * 200` per qualifying transaction. It is an
-expected fee, not the posted `Digipos B2B Transfer Fee` amount.
+company credit and is not reversed. The result is `1 * 200` per active
+qualifying transaction. It is an expected fee, not the posted `Digipos B2B
+Transfer Fee` amount.
 
 ### `Digipos B2B Transfer Fee`
 
@@ -407,6 +421,9 @@ Digipos fee
 
 Only original transaction facts are targets. The report keeps gross totals,
 then excludes `is_reversed` facts from active, net, and payable totals.
+The reversal event itself contributes no fee. This cancellation applies only
+to the directly referenced original transaction; a separately posted fee is
+not linked or cancelled by amount, date, organization, or counterparty.
 
 For each category, the result includes:
 
@@ -440,6 +457,13 @@ to zero. Missing counts are populated and `CALCULATION STATUS` becomes
 `INCOMPLETE_MISSING_FEE`. A verified zero remains different from missing data.
 The monthly result artifact and Kestra outputs expose `incomplete_fee_rows` and
 `monthly_payable_complete` so this condition is visible before release.
+Missing Fee on a reversed PPOB original remains visible in gross and reversed
+missing counts but does not make the active calculation incomplete.
+
+Both approved fee categories are always returned for a preview and for the
+latest published cluster-month. A category with no qualifying transactions has
+zero counts, zero fee values, and `CALCULATION STATUS = COMPLETE`; this makes a
+verified empty category different from a missing result row.
 
 Unresolved reversals are counted separately for the closing window and are not
 assigned to PPOB or Digipos monthly fee categories until their originals are
@@ -483,6 +507,7 @@ Schema DDL belongs only in the immutable SQL files under
 | 004 | `live_views_and_monthly_snapshots` | Splits live daily views from the physical monthly snapshot and adds the monthly audit table. |
 | 005 | `monthly_fee_summary_view` | Adds the canonical PostgreSQL monthly Digipos/PPOB fee summary view. |
 | 006 | `ledger_signed_amount` | Redefines `signed_amount` as total ledger debit minus total ledger credit and places it beside those totals in the live view. |
+| 007 | `monthly_fee_category_stability` | Returns stable Digipos/PPOB rows and bases fee completeness on missing active fees, while retaining reversed evidence. |
 
 The migration runner:
 
@@ -607,8 +632,9 @@ docker build -f Dockerfile.linkaja -t linkaja-fee-pipeline:3.11 .
 ```
 
 The PostgreSQL integration tests require `LINKAJA_TEST_DSN` to point to a
-dedicated disposable database. They truncate LinkAja business and audit tables;
-never target production or a shared development database.
+dedicated disposable database and `LINKAJA_TEST_DATABASE_GUARD` to equal that
+database's exact `current_database()` value. They truncate LinkAja business and
+audit tables; never target production or a shared development database.
 
 ## Non-Negotiable Rules
 

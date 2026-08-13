@@ -291,9 +291,9 @@ def _raise_stage_conflicts(conflicts: list[tuple[Any, ...]]) -> None:
     for row in conflicts[:5]:
         examples.append(
             f"{row[0]}/{row[1]} "
-            f"(dates={row[2]}, scenarios={row[3]}, statuses={row[4]}, "
-            f"types={row[5]}, originals={row[6]}, fee_values={row[7]}, "
-            f"company_accounts={row[8]})"
+            f"(dates={row[2]}, times={row[3]}, scenarios={row[4]}, "
+            f"statuses={row[5]}, types={row[6]}, originals={row[7]}, "
+            f"fee_values={row[8]}, company_accounts={row[9]})"
         )
     raise ValueError(
         "LinkAja staged transactions violate the transaction-grain contract: "
@@ -515,7 +515,7 @@ def materialize_linkaja_month(
             )
             unresolved_reversal_count = len(unresolved_reversal_rows)
 
-            cursor.execute(MONTHLY_FEE_SUMMARY_STATEMENT)
+            cursor.execute(MONTHLY_FEE_SUMMARY_STATEMENT, params)
             fee_rows = _monthly_fee_rows(cursor.fetchall())
             incomplete_fee_rows = sum(
                 row["CALCULATION STATUS"] != "COMPLETE"

@@ -42,11 +42,13 @@ SELECT
     ) AS source_fee_missing_count,
     COUNT(*) FILTER (
         WHERE NOT is_reversal
+          AND NOT is_reversed
           AND transaction_scenario = 'Digipos B2B Transfer'
           AND company_credit > 0
     ) * 200 AS expected_fee,
     COUNT(*) FILTER (
         WHERE NOT is_reversal
+          AND NOT is_reversed
           AND transaction_scenario = 'Digipos B2B Transfer In Cluster'
     ) * 20 AS in_cluster_fee,
     COUNT(*) FILTER (

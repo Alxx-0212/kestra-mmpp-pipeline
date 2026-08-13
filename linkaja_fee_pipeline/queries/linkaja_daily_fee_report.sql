@@ -2,9 +2,10 @@
 Daily LinkAja central-fee monitoring query.
 
 Set cluster_id and the inclusive/exclusive report-date interval. The returned
-EXPECTED FEE and IN CLUSTER FEE values match the live daily fee calculation:
-out-cluster completed company-credit transactions * 200, plus non-reversal
-in-cluster transactions * 20.
+EXPECTED FEE and IN CLUSTER FEE values match the live active daily fee
+calculation: non-reversed out-cluster completed company-credit transactions *
+200, plus non-reversed in-cluster transactions * 20. Completed reversal events
+remain on their actual posting date but contribute no fee.
 */
 
 WITH parameters AS (
@@ -28,11 +29,14 @@ transaction_totals AS (
         COUNT(*) FILTER (
             WHERE transaction.transaction_scenario = 'Digipos B2B Transfer'
               AND transaction.company_credit > 0
+              AND NOT transaction.is_reversal
+              AND NOT transaction.is_reversed
         ) * 200 AS expected_fee,
         COUNT(*) FILTER (
             WHERE transaction.transaction_scenario =
                     'Digipos B2B Transfer In Cluster'
               AND NOT transaction.is_reversal
+              AND NOT transaction.is_reversed
         ) * 20 AS in_cluster_fee
     FROM linkaja_transactions_current_v AS transaction
     CROSS JOIN parameters

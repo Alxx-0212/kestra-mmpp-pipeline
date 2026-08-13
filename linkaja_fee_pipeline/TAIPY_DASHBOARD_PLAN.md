@@ -411,24 +411,23 @@ the dashboard as an approval or settlement surface:
 
 ### Required before dashboard release
 
+The 2026-08-12 operational correction pass completed blank Balance handling,
+active daily reversal treatment, active-missing PPOB status, and stable monthly
+fee-category rows. Migration 007 carries the published-view changes. The
+remaining dashboard-release work is:
+
 1. Add a canonical read-only daily fee summary view or repository query with
    gross, reversed, active/net, reversal-event, and unresolved measures. Keep
-   the existing gross execution artifact for backward compatibility.
-2. Correct blank `Balance` normalization so a missing balance remains null
-   instead of becoming numeric zero.
-3. Make monthly `calculation_status` depend on
-   `active_missing_fee_count`, matching the payable-null rule. The current SQL
-   uses the stricter gross-missing count for status even when only a reversed
-   PPOB original lacks Fee.
-4. Return stable zero rows for both monthly fee categories when a cluster-month
-   has no matching transactions, so dashboard categories do not disappear.
-5. Expose data freshness explicitly. Add a load-audit relation containing
+   the existing execution artifact keys for backward compatibility. Current
+   expected/in-cluster fee values are active, while company/source evidence and
+   reversal measures remain available separately.
+2. Expose data freshness explicitly. Add a load-audit relation containing
    execution/load ID, cluster, source file, start/end state, row count, affected
    dates, and error state, or read equivalent execution status from Kestra.
-6. Create and test a read-only dashboard database role and approved-view grants.
+3. Create and test a read-only dashboard database role and approved-view grants.
 
 All database changes must be additive numbered migrations. Do not edit already
-applied migrations 001 through 006.
+applied migrations 001 through 007.
 
 ### Follow-up hardening
 
@@ -445,9 +444,10 @@ applied migrations 001 through 006.
 
 1. **Current repository change** — remove LinkAja Sheet tasks and credentials;
    keep daily and monthly Kestra database/artifact outputs.
-2. **Reporting contract migration** — implement the required daily summary,
-   monthly status/category stability, balance null fix, freshness audit, and
-   read-only grants with integration tests.
+2. **Reporting contract migration** — finish the gross/reversed/active daily
+   summary, freshness audit, and read-only grants. Monthly status/category
+   stability and the Balance null fix are implemented but still require
+   disposable-database acceptance.
 3. **Taipy MVP** — build Overview, Daily ledger, Daily fees, Reversals, Monthly
    close, and Transaction detail against read-only PostgreSQL queries.
 4. **Legacy integration** — deploy behind the existing authenticated reverse
