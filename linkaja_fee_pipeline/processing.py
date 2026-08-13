@@ -424,7 +424,11 @@ def normalize_linkaja_csv(
                     row.get("Credit"), source_name, row_number, "Credit"
                 ),
                 "balance": _decimal_text(
-                    row.get("Balance"), source_name, row_number, "Balance"
+                    row.get("Balance"),
+                    source_name,
+                    row_number,
+                    "Balance",
+                    blank_is_null=True,
                 ),
                 "fee": _decimal_text(
                     row.get("Fee"),
