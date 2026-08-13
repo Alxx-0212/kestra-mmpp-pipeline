@@ -508,7 +508,6 @@ Schema DDL belongs only in the immutable SQL files under
 | 005 | `monthly_fee_summary_view` | Adds the canonical PostgreSQL monthly Digipos/PPOB fee summary view. |
 | 006 | `ledger_signed_amount` | Redefines `signed_amount` as total ledger debit minus total ledger credit and places it beside those totals in the live view. |
 | 007 | `monthly_fee_category_stability` | Returns stable Digipos/PPOB rows and bases fee completeness on missing active fees, while retaining reversed evidence. |
-| 008 | `dashboard_reconciliation_views` | Adds daily four-category fee evidence, actual-withdrawal Mandiri cycles, exception rows, and source-load freshness for read-only dashboard consumers. |
 
 The migration runner:
 
@@ -524,31 +523,6 @@ The migration runner:
 Never edit an applied migration file. Add a new numbered migration for any
 schema change. Do not create a competing schema through ad hoc SQL in a Kestra
 task.
-
-## Reconciliation Read Models
-
-Migration 008 provides PostgreSQL read models for daily fee evidence, LinkAja
-withdrawals, actual-withdrawal settlement cycles, normalized exceptions, and
-successful-load freshness. These relations are presentation-neutral: a future
-dashboard may query them, but no Taipy runtime is part of the accepted data
-model checkpoint.
-
-The July 1 through August 9 disposable replay loaded all 43 source files through
-the unchanged daily Kestra workflow. It retained 1,560,180 raw ledger rows and
-produced 999,898 current transaction facts. All 228 withdrawals mapped to one
-closed cycle, each Purchase Account retained one open cycle, no cycle ID was
-duplicated, and the daily workflow left the frozen monthly relations empty.
-
-The model deliberately exposes unresolved or incomplete evidence. The replay
-contains 588 unresolved reversals, 27 invalid or missing posted-Digipos fee
-rows, and one active missing PPOB Fee. These remain review exceptions; the
-model does not infer missing originals or fees.
-
-The attempted Taipy prototype rendered a blank browser page and its full-range
-query path was too slow for interactive use. Dashboard architecture and
-implementation are deferred to a separate change. See
-`TAIPY_DASHBOARD_PLAN.md` for the model contract, validation evidence, and open
-presentation work.
 
 ## Operating Procedure
 
