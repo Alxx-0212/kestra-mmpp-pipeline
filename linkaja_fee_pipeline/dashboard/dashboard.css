@@ -1,0 +1,242 @@
+:root {
+  --ink: #1f2925;
+  --muted: #64716b;
+  --line: #d9dfdb;
+  --surface: #ffffff;
+  --surface-subtle: #f5f7f5;
+  --canvas: #eef1ef;
+  --accent: #1f6b4f;
+  --accent-dark: #174c3a;
+  --warning: #a86618;
+  --danger: #aa3f36;
+}
+
+html,
+body {
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+}
+
+.MuiContainer-root,
+.taipy-page {
+  max-width: 1480px !important;
+}
+
+.dashboard-header {
+  align-items: flex-end;
+  display: flex;
+  gap: 32px;
+  justify-content: space-between;
+  padding: 28px 0 18px;
+}
+
+.dashboard-header h1 {
+  font-size: clamp(1.85rem, 3vw, 2.65rem);
+  font-weight: 680;
+  letter-spacing: -0.04em;
+  line-height: 1.05;
+  margin: 3px 0 8px;
+}
+
+.eyebrow {
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 750;
+  letter-spacing: 0.15em;
+  margin: 0;
+}
+
+.page-note,
+.section-heading p,
+.card-note {
+  color: var(--muted);
+  margin: 0;
+}
+
+.status-panel {
+  border-left: 3px solid var(--accent);
+  display: grid;
+  gap: 2px;
+  min-width: 210px;
+  padding: 7px 0 7px 16px;
+}
+
+.status-panel .status-label,
+.field-label {
+  color: var(--muted);
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+}
+
+.status-panel strong {
+  color: var(--ink);
+  font-size: 1.05rem;
+}
+
+.status-panel small {
+  color: var(--muted);
+}
+
+.dashboard-nav {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  margin-bottom: 14px;
+  min-height: 48px;
+}
+
+.filter-bar {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 24px;
+  padding: 16px;
+}
+
+.filter-bar .MuiFormControl-root {
+  width: 100%;
+}
+
+.primary-action button,
+button.primary-action {
+  background: var(--accent) !important;
+  border-radius: 6px !important;
+  box-shadow: none !important;
+  color: #ffffff !important;
+  font-weight: 700 !important;
+  min-height: 40px;
+  text-transform: none !important;
+}
+
+.primary-action button:hover,
+button.primary-action:hover {
+  background: var(--accent-dark) !important;
+}
+
+.error-message {
+  color: var(--danger);
+  display: block;
+  font-size: 0.86rem;
+  margin-top: 8px;
+}
+
+.section-heading {
+  align-items: flex-end;
+  display: flex;
+  justify-content: space-between;
+  margin: 4px 0 15px;
+}
+
+.section-heading h2 {
+  font-size: 1.25rem;
+  letter-spacing: -0.015em;
+  margin: 0 0 3px;
+}
+
+.kpi-grid {
+  margin-bottom: 18px;
+}
+
+.kpi-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-height: 126px;
+  padding: 17px 18px;
+}
+
+.kpi-card span {
+  color: var(--muted);
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 650;
+  margin-bottom: 13px;
+}
+
+.kpi-card strong {
+  display: block;
+  font-size: 1.55rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.025em;
+  margin-bottom: 7px;
+}
+
+.kpi-card small {
+  color: var(--muted);
+}
+
+.kpi-alert {
+  border-left: 3px solid var(--warning);
+}
+
+.content-grid {
+  margin-bottom: 18px;
+}
+
+.data-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 18px;
+  overflow: hidden;
+  padding: 18px;
+}
+
+.data-card h3 {
+  font-size: 1rem;
+  margin: 0 0 3px;
+}
+
+.data-card .taipy-table {
+  margin-top: 12px;
+}
+
+.callout {
+  background: #f1f5f2;
+  border-left: 3px solid var(--accent);
+  color: #405049;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+}
+
+.MuiPaper-root {
+  box-shadow: none !important;
+}
+
+.MuiTableCell-head {
+  background: var(--surface-subtle) !important;
+  color: #44514b !important;
+  font-size: 0.74rem !important;
+  font-weight: 750 !important;
+  letter-spacing: 0.025em;
+  white-space: nowrap;
+}
+
+.MuiTableCell-body {
+  border-color: #e6eae7 !important;
+  font-size: 0.8rem !important;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 980px) {
+  .dashboard-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .status-panel {
+    width: 100%;
+  }
+
+  .kpi-grid,
+  .content-grid,
+  .filter-bar .taipy-layout {
+    grid-template-columns: 1fr !important;
+  }
+}
