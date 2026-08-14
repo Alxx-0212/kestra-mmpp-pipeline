@@ -13,6 +13,7 @@ SELECT
     cluster_id,
     transaction_id,
     COUNT(DISTINCT finalized_date) AS finalized_dates,
+    COUNT(DISTINCT finalized_time) AS finalized_times,
     COUNT(DISTINCT transaction_scenario) AS scenarios,
     COUNT(DISTINCT LOWER(BTRIM(COALESCE(transaction_status, '')))) AS statuses,
     COUNT(DISTINCT COALESCE(transaction_type, '<NULL>')) AS transaction_types,
@@ -26,6 +27,7 @@ SELECT
 FROM linkaja_raw_stage
 GROUP BY cluster_id, transaction_id
 HAVING COUNT(DISTINCT finalized_date) > 1
+    OR COUNT(DISTINCT finalized_time) > 1
     OR COUNT(DISTINCT transaction_scenario) > 1
     OR COUNT(DISTINCT LOWER(BTRIM(COALESCE(transaction_status, '')))) > 1
     OR COUNT(DISTINCT COALESCE(transaction_type, '<NULL>')) > 1
@@ -219,11 +221,13 @@ SELECT
     ) AS source_fee_missing_count,
     COUNT(*) FILTER (
         WHERE NOT transactions.is_reversal
+          AND NOT transactions.is_reversed
           AND transactions.transaction_scenario = 'Digipos B2B Transfer'
           AND transactions.company_credit > 0
     ) * %(expected_fee_per_transaction)s AS expected_fee,
     COUNT(*) FILTER (
         WHERE NOT transactions.is_reversal
+          AND NOT transactions.is_reversed
           AND transactions.transaction_scenario =
               'Digipos B2B Transfer In Cluster'
     ) * %(in_cluster_fee_per_transaction)s AS in_cluster_fee,
@@ -254,11 +258,14 @@ WITH transaction_totals AS (
         COUNT(*) FILTER (
             WHERE transaction_scenario = 'Digipos B2B Transfer'
               AND company_credit > 0
+              AND NOT is_reversal
+              AND NOT is_reversed
         ) * %(expected_fee_per_transaction)s AS expected_fee,
         COUNT(*) FILTER (
             WHERE transaction_scenario =
                 'Digipos B2B Transfer In Cluster'
               AND NOT is_reversal
+              AND NOT is_reversed
         ) * %(in_cluster_fee_per_transaction)s AS in_cluster_fee
     FROM linkaja_transactions_current_v
     WHERE cluster_id = %(cluster_id)s
@@ -528,7 +535,13 @@ ORDER BY reversal.finalized_at_local, reversal.transaction_id
 
 
 MONTHLY_FEE_SUMMARY_STATEMENT = """
-WITH monthly_targets AS (
+WITH fee_categories AS (
+    SELECT fee_category
+    FROM (VALUES
+        ('Digipos B2B Transfer Fee'::TEXT),
+        ('General to Purchase B2B Transfer Agent Telco'::TEXT)
+    ) AS categories(fee_category)
+), monthly_targets AS (
     SELECT
         transaction.report_month AS fee_month,
         transaction.cluster_id,
@@ -577,38 +590,44 @@ WITH monthly_targets AS (
     GROUP BY fee_month, cluster_id, fee_category
 )
 SELECT
-    fee_month,
-    cluster_id,
-    fee_category,
-    gross_transaction_count,
-    reversed_transaction_count,
-    active_transaction_count,
+    %(month_start)s::DATE AS fee_month,
+    %(cluster_id)s::TEXT AS cluster_id,
+    category.fee_category,
+    COALESCE(aggregate.gross_transaction_count, 0) AS gross_transaction_count,
+    COALESCE(aggregate.reversed_transaction_count, 0)
+        AS reversed_transaction_count,
+    COALESCE(aggregate.active_transaction_count, 0)
+        AS active_transaction_count,
     CASE
-        WHEN gross_missing_fee_count > 0 THEN NULL
-        ELSE calculated_gross_fee
+        WHEN COALESCE(aggregate.gross_missing_fee_count, 0) > 0 THEN NULL
+        ELSE COALESCE(aggregate.calculated_gross_fee, 0)
     END AS gross_fee,
     CASE
-        WHEN reversed_missing_fee_count > 0 THEN NULL
-        ELSE calculated_reversed_fee
+        WHEN COALESCE(aggregate.reversed_missing_fee_count, 0) > 0 THEN NULL
+        ELSE COALESCE(aggregate.calculated_reversed_fee, 0)
     END AS reversed_fee,
     CASE
-        WHEN active_missing_fee_count > 0 THEN NULL
-        ELSE calculated_net_fee
+        WHEN COALESCE(aggregate.active_missing_fee_count, 0) > 0 THEN NULL
+        ELSE COALESCE(aggregate.calculated_net_fee, 0)
     END AS net_fee,
     CASE
-        WHEN active_missing_fee_count > 0 THEN NULL
-        ELSE calculated_net_fee
+        WHEN COALESCE(aggregate.active_missing_fee_count, 0) > 0 THEN NULL
+        ELSE COALESCE(aggregate.calculated_net_fee, 0)
     END AS monthly_payable_fee,
-    gross_missing_fee_count,
-    reversed_missing_fee_count,
-    active_missing_fee_count,
+    COALESCE(aggregate.gross_missing_fee_count, 0) AS gross_missing_fee_count,
+    COALESCE(aggregate.reversed_missing_fee_count, 0)
+        AS reversed_missing_fee_count,
+    COALESCE(aggregate.active_missing_fee_count, 0)
+        AS active_missing_fee_count,
     CASE
-        WHEN gross_missing_fee_count > 0
+        WHEN COALESCE(aggregate.active_missing_fee_count, 0) > 0
             THEN 'INCOMPLETE_MISSING_FEE'
         ELSE 'COMPLETE'
     END AS calculation_status
-FROM monthly_aggregates
-ORDER BY fee_month, cluster_id, fee_category
+FROM fee_categories AS category
+LEFT JOIN monthly_aggregates AS aggregate
+  ON aggregate.fee_category = category.fee_category
+ORDER BY category.fee_category
 """
 
 

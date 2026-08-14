@@ -207,6 +207,110 @@ MONTHLY_FEE_SUMMARY_VIEW_COLUMNS = {
     "calculation_status",
 }
 
+DAILY_FEE_RECONCILIATION_VIEW_COLUMNS = {
+    "cluster_id",
+    "report_date",
+    "fee_type",
+    "gross_transaction_count",
+    "reversed_transaction_count",
+    "active_transaction_count",
+    "gross_fee",
+    "reversed_fee",
+    "active_fee",
+    "missing_fee_count",
+    "active_missing_fee_count",
+    "invalid_fee_count",
+    "resolved_reversal_event_count",
+    "unresolved_reversal_count",
+    "calculation_status",
+    "source_files",
+    "latest_load_id",
+    "latest_updated_at",
+}
+
+WITHDRAWAL_EVENTS_VIEW_COLUMNS = {
+    "cluster_id",
+    "withdrawal_transaction_id",
+    "report_date",
+    "finalized_at_local",
+    "company_organization",
+    "company_account",
+    "withdrawal_amount",
+    "balance_before",
+    "closing_balance",
+    "source_ledger_row_count",
+    "source_files",
+    "updated_load_id",
+    "updated_at",
+}
+
+MANDIRI_SETTLEMENT_CYCLES_VIEW_COLUMNS = {
+    "cluster_id",
+    "company_account",
+    "settlement_cycle_id",
+    "previous_withdrawal_transaction_id",
+    "withdrawal_transaction_id",
+    "interval_start_exclusive",
+    "interval_end_inclusive",
+    "opening_balance",
+    "non_withdrawal_company_credit",
+    "non_withdrawal_company_debit",
+    "withdrawal_company_debit",
+    "closing_balance",
+    "calculated_closing_balance",
+    "balance_variance",
+    "withdrawal_transaction_count",
+    "source_transaction_count",
+    "source_ledger_row_count",
+    "resolved_reversal_count",
+    "unresolved_reversal_count",
+    "source_fee_missing_count",
+    "source_files",
+    "latest_load_id",
+    "latest_updated_at",
+    "data_status",
+    "reversal_status",
+    "linkaja_reconciliation_status",
+    "mandiri_confirmation_status",
+}
+
+RECONCILIATION_EXCEPTIONS_VIEW_COLUMNS = {
+    "cluster_id",
+    "report_date",
+    "finalized_at_local",
+    "transaction_id",
+    "exception_code",
+    "severity",
+    "detail",
+    "source_files",
+    "updated_load_id",
+    "updated_at",
+}
+
+LOAD_FRESHNESS_VIEW_COLUMNS = {
+    "cluster_id",
+    "load_id",
+    "source_file",
+    "source_row_count",
+    "transaction_count",
+    "min_report_date",
+    "max_report_date",
+    "ingestion_started_at",
+    "ingestion_completed_at",
+    "load_status",
+}
+
+DASHBOARD_VIEW_COLUMNS = {
+    "linkaja_daily_fee_reconciliation_v":
+        DAILY_FEE_RECONCILIATION_VIEW_COLUMNS,
+    "linkaja_withdrawal_events_v": WITHDRAWAL_EVENTS_VIEW_COLUMNS,
+    "linkaja_mandiri_settlement_cycles_v":
+        MANDIRI_SETTLEMENT_CYCLES_VIEW_COLUMNS,
+    "linkaja_reconciliation_exceptions_v":
+        RECONCILIATION_EXCEPTIONS_VIEW_COLUMNS,
+    "linkaja_load_freshness_v": LOAD_FRESHNESS_VIEW_COLUMNS,
+}
+
 RAW_TRANSACTION_COLUMNS = {
     "cluster_id",
     "source_file",
@@ -442,6 +546,7 @@ def _assert_current_business_schema(
     *,
     require_monthly_fee_summary: bool = True,
     require_ledger_signed_amount: bool = True,
+    require_dashboard_views: bool = True,
 ) -> None:
     if not _relation_exists(cursor, "linkaja_raw_transactions"):
         raise RuntimeError("LinkAja raw table is missing")
@@ -501,6 +606,17 @@ def _assert_current_business_schema(
             raise RuntimeError(
                 "LinkAja monthly fee summary view does not match the schema"
             )
+    if require_dashboard_views:
+        for view_name, expected_columns in DASHBOARD_VIEW_COLUMNS.items():
+            if not _relation_exists(cursor, view_name):
+                raise RuntimeError(
+                    f"LinkAja dashboard view is missing: {view_name}"
+                )
+            if _table_columns(cursor, view_name) != expected_columns:
+                raise RuntimeError(
+                    "LinkAja dashboard view does not match the schema: "
+                    f"{view_name}"
+                )
     if _primary_key_columns(
         cursor, "linkaja_raw_transactions"
     ) != ("load_id", "source_row_number"):
@@ -642,9 +758,13 @@ def _baseline_existing_schema(
             cursor,
             require_monthly_fee_summary=has_monthly_fee_summary,
             require_ledger_signed_amount=has_ledger_signed_amount,
+            require_dashboard_views=False,
         )
         if has_ledger_signed_amount:
-            baseline_migrations = migrations
+            # Version 007 changes fee-view behavior without changing its
+            # columns, so a structurally current unversioned schema can only
+            # be proven through version 006. Migration 007 must still run.
+            baseline_migrations = migrations[:6]
         elif has_monthly_fee_summary:
             baseline_migrations = migrations[:5]
         else:

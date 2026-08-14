@@ -1,6 +1,7 @@
 # LinkAja Reversal and July Close Implementation Plan
 
-Status: proposed implementation and validation plan, 2026-08-11.
+Status: operational fee-correction and full-July source replay implemented
+locally; disposable-database/Kestra acceptance remain pending, 2026-08-12.
 
 This document maps the current LinkAja runtime, records the weaknesses found in
 the July 1 through August 9 source bundle, and defines a staged path to a tested
@@ -9,6 +10,14 @@ change the existing calculation contract by itself.
 
 The immediate target is LinkAja only. FinPay remains outside this work until the
 LinkAja model, close process, and July acceptance run are complete.
+
+Local validation on 2026-08-12 built and smoke-tested the Python 3.11 LinkAja
+image. The later source-replay test adds one local acceptance test to that
+baseline. Nine destructive
+PostgreSQL tests were skipped because this lane has no disposable test DSN.
+Those skips are not database acceptance. Repository-wide host discovery also
+remains unprovisioned because the host Python environment lacks the FinPay
+`pandas` dependency.
 
 ## Executive decision
 
@@ -29,6 +38,28 @@ zero unexplained parity differences and production use is explicitly approved.
 The present exact reversal rule remains unchanged: a reversal resolves only
 through `Original Transaction ID` in the same cluster. Amount, date,
 counterparty, and outlet are evidence only and must never create a relationship.
+
+Business decision recorded on 2026-08-12: a completed resolved reversal makes
+the directly referenced original transaction inactive for daily and monthly
+fee calculations, and the reversal event itself contributes no fee. Gross and
+reversed evidence remain visible. A principal reversal does not implicitly
+cancel a separately posted fee transaction without an exact source ID link.
+
+### Operational correction impact and rollback
+
+- Existing daily fee keys and SQL columns keep their names, but expected,
+  in-cluster, and total fee values now exclude directly reversed originals.
+- Existing monthly columns keep their shape. Both approved categories are now
+  always present, and a reversed-only missing PPOB Fee no longer makes the
+  active calculation incomplete.
+- Blank Balance now persists as null, and a staged transaction with conflicting
+  finalized times is rejected instead of silently using the earliest time.
+- Workflow IDs, task IDs, inputs, public imports, artifacts, output keys,
+  relation names, secret names, and the runtime image name are unchanged.
+- If the daily semantic change must be rolled back before release, revert the
+  Python/runtime SQL change. If migration 007 has already been applied, never
+  edit it; add a forward migration that deliberately restores the approved
+  published-view semantics.
 
 ## Empirical July baseline
 
@@ -186,8 +217,8 @@ New outputs must be additive.
 - Daily replacement remains idempotent by `cluster_id + transaction_id`.
 - A published cluster-month remains frozen until explicit republication.
 - The monthly cutoff remains an exclusive local WITA timestamp.
-- Digipos and PPOB monthly rules remain unchanged until the business decisions
-  at the end of this document are answered.
+- Directly reversed Digipos and PPOB originals contribute zero active/net/
+  payable fee while gross and reversed evidence remains available.
 
 ## Confirmed weaknesses
 
@@ -202,10 +233,10 @@ New outputs must be additive.
 | High | A preview and later publication are fresh calculations | Raw state can change between approval and publication | Add a source fingerprint/high-water mark and recheck it inside publication |
 | High | Refresh-candidate detection relies on current replacement rows | A correction moved out of July can leave a stale July snapshot undetected | Persist load/change audit evidence covering old and new affected months |
 | Medium | Resolution has no chronology anomaly state | A self-reference, negative lag, chain, or cycle can look resolved | Add dbt tests and explicit review reason codes; use synthetic fixtures |
-| Medium | Stage conflicts compare finalized date but not finalized time | A transaction can silently use the minimum inconsistent timestamp | Add finalized-time coherence validation |
-| Medium | Blank Balance normalizes to zero | Balance evidence loses null/unknown semantics | Preserve blank Balance as null and add normalization tests |
-| Medium | PPOB status uses gross missing count while payable uses active missing count | A reversed missing-fee row can incorrectly mark status incomplete | Make status depend on active missing count, with parity tests |
-| Medium | Empty monthly categories disappear | Consumers cannot distinguish zero from missing result generation | Emit stable zero rows for both approved fee categories |
+| Resolved locally; DB acceptance pending | Stage conflicts compared finalized date but not finalized time | A transaction could silently use the minimum inconsistent timestamp | Finalized-time coherence validation is implemented |
+| Resolved locally | Blank Balance normalized to zero | Balance evidence lost null/unknown semantics | Blank Balance is preserved as null and has a normalization test |
+| Resolved locally; DB acceptance pending | PPOB status used gross missing count while payable used active missing count | A reversed missing-fee row could incorrectly mark status incomplete | Runtime SQL and migration 007 use active missing count |
+| Resolved locally; DB acceptance pending | Empty monthly categories disappeared | Consumers could not distinguish zero from missing result generation | Runtime SQL and migration 007 emit both approved categories |
 | Medium | dbt currently reads only the published snapshot | It cannot validate live facts or a preview candidate | Expand sources and build a shadow fact/mart DAG |
 | Medium | PostgreSQL integration tests skip without `LINKAJA_TEST_DSN` | Default green tests do not prove database behavior | Make a disposable test database mandatory for the candidate acceptance run |
 
@@ -374,6 +405,14 @@ Validation:
 
 ### Pass 1: add regression coverage for current behavior and defects
 
+Status on 2026-08-12: partially implemented. Local normalization/schema tests
+cover blank Balance, finalized-time coherence, reversal-neutral daily fees,
+active missing-fee status, and stable categories. Disposable PostgreSQL tests
+were added for those behaviors, multiple reversals without double subtraction,
+and cross-cluster ID isolation; they are protected by an exact database-name
+guard but have not executed in this lane. Negative lag, self-reference,
+chains/cycles, moved-out-of-month correction, and the full-bundle runner remain.
+
 Current behavior:
 
 - Unit/schema tests cover key contracts, but database integration tests are
@@ -418,6 +457,12 @@ Validation:
 
 ### Pass 3: correct operational reporting gaps additively
 
+Status on 2026-08-12: partially implemented. Blank Balance, finalized-time
+coherence, active PPOB status, stable fee categories, and active daily reversal
+treatment are implemented. Migration 007 is new and migrations 001 through 006
+remain unchanged. Scope splitting, source audit/fingerprint evidence, and close
+readiness remain pending.
+
 Current behavior:
 
 - The existing runtime has the Balance, PPOB status, category stability, scope,
@@ -444,6 +489,15 @@ Validation:
   valid.
 
 ### Pass 4: run the full July candidate test
+
+Status on 2026-08-12: source replay complete for all 43 files and all six
+clusters at the August 1, August 5, and August 10 cutoffs. Transaction/reversal
+baselines reproduced exactly, and every per-cluster fee result was identical
+across the three cutoffs because the supplied bundle contains no resolved late
+August reversal of a July original. The result is recorded in
+[`JULY_2026_WORKFLOW_TEST_SUMMARY.md`](JULY_2026_WORKFLOW_TEST_SUMMARY.md).
+Guarded PostgreSQL execution, runtime-preview/published-view parity, and Kestra
+validation remain pending and are not implied by the source replay.
 
 Current behavior:
 
@@ -636,11 +690,11 @@ unknown.
   existing publication path can be restored without deleting raw or snapshot
   data.
 
-## Decisions required before implementation
+## Recorded decision and remaining decisions
 
-1. **Fee semantics:** Does reversal of `Digipos B2B Transfer` principal also
-   cancel a separately posted `Digipos B2B Transfer Fee`, or does payable change
-   only when the fee transaction itself is directly referenced by a reversal?
+1. **Fee semantics — decided 2026-08-12:** a completed reversal cancels the fee
+   contribution of its directly referenced original. It does not cancel a
+   separate fee transaction without an exact source ID link.
 2. **Unresolved release policy:** Must every unresolved July reversal be backed
    by official source data, or can an authorized reviewer disposition and waive
    a frozen exception with evidence?
@@ -659,8 +713,7 @@ unknown.
 8. **dbt promotion:** After July parity, may dbt become a mandatory monthly
    validation gate while Python remains the publication implementation?
 
-The recommended defaults are: direct fee reversal only until contrary source
-evidence is approved; unresolved rows require documented review rather than
-amount inference; August 10 is the frozen July test cutoff; approval remains
-per cluster initially; and dbt begins as a shadow validator before becoming a
-switchable publication gate.
+The remaining recommended defaults are: unresolved rows require documented
+review rather than amount inference; August 10 is the frozen July test cutoff;
+approval remains per cluster initially; and dbt remains a shadow validator
+before any separately approved, switchable publication gate.

@@ -4,10 +4,11 @@ from pathlib import Path
 import linkaja_pipeline
 
 from linkaja_fee_pipeline.migrations import (
-    MONTHLY_FEE_SUMMARY_VIEW_COLUMNS,
     CURRENT_TRANSACTION_VIEW_COLUMN_ORDER,
     CURRENT_TRANSACTION_VIEW_COLUMNS,
     CURRENT_TRANSACTION_COLUMNS,
+    DASHBOARD_VIEW_COLUMNS,
+    MONTHLY_FEE_SUMMARY_VIEW_COLUMNS,
     _load_migrations,
     latest_linkaja_schema_version,
 )
@@ -21,6 +22,7 @@ from linkaja_fee_pipeline.sql import (
     MONTHLY_FEE_SUMMARY_STATEMENT,
     MONTHLY_UNRESOLVED_REVERSALS_STATEMENT,
     REPLACE_RAW_STATEMENTS,
+    STAGE_CONFLICTS_STATEMENT,
 )
 
 
@@ -30,9 +32,9 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
 
         self.assertEqual(
             [migration.version for migration in migrations],
-            [1, 2, 3, 4, 5, 6],
+            [1, 2, 3, 4, 5, 6, 7, 8],
         )
-        self.assertEqual(latest_linkaja_schema_version(), 6)
+        self.assertEqual(latest_linkaja_schema_version(), 8)
         self.assertTrue(all(len(migration.checksum) == 64 for migration in migrations))
 
     def test_final_transaction_schema_keeps_facts_not_report_amounts(self):
@@ -53,6 +55,39 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
         self.assertNotIn("report_month", CURRENT_TRANSACTION_VIEW_COLUMNS)
         self.assertIn("monthly_payable_fee", MONTHLY_FEE_SUMMARY_VIEW_COLUMNS)
         self.assertIn("calculation_status", MONTHLY_FEE_SUMMARY_VIEW_COLUMNS)
+
+    def test_dashboard_views_keep_fee_and_bank_evidence_separate(self):
+        self.assertEqual(
+            set(DASHBOARD_VIEW_COLUMNS),
+            {
+                "linkaja_daily_fee_reconciliation_v",
+                "linkaja_withdrawal_events_v",
+                "linkaja_mandiri_settlement_cycles_v",
+                "linkaja_reconciliation_exceptions_v",
+                "linkaja_load_freshness_v",
+            },
+        )
+        migration_path = (
+            Path(__file__).parents[1]
+            / "linkaja_fee_pipeline"
+            / "migrations"
+            / "008_dashboard_reconciliation_views.sql"
+        )
+        normalized = " ".join(
+            migration_path.read_text(encoding="utf-8").lower().split()
+        )
+        self.assertIn("expected_out_cluster_rp200", normalized)
+        self.assertIn("ppob_agent_telco_fee", normalized)
+        self.assertIn("pending_bank_evidence", normalized)
+        self.assertIn("interval_start_exclusive", normalized)
+        self.assertIn("interval_end_inclusive", normalized)
+        self.assertIn("settlement_cycle_number", normalized)
+        self.assertIn(
+            "rows between unbounded preceding and 1 preceding",
+            normalized,
+        )
+        self.assertIn("where transaction.is_withdrawal_event", normalized)
+        self.assertNotIn("next available withdrawal", normalized)
 
     def test_live_signed_amount_is_ledger_scoped_and_beside_ledger_totals(self):
         self.assertEqual(
@@ -116,15 +151,26 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
         self.assertIn("%(reversal_in_cluster_fee_per_transaction)s", normalized)
         self.assertIn("reversal_resolution_status = 'complete'", normalized)
         self.assertIn("reversal_resolution_status = 'unresolved'", normalized)
+        self.assertGreaterEqual(normalized.count("not transactions.is_reversed"), 2)
 
         fee_normalized = " ".join(FEE_SUMMARY_STATEMENT.lower().split())
         self.assertIn("from linkaja_transactions_current_v", fee_normalized)
         self.assertIn("%(in_cluster_fee_per_transaction)s", fee_normalized)
+        self.assertGreaterEqual(fee_normalized.count("not is_reversed"), 2)
         self.assertNotIn(
             "sum(source_fee) filter ( where transaction_scenario = "
             "'digipos b2b transfer in cluster'",
             fee_normalized,
         )
+
+    def test_stage_rejects_inconsistent_finalized_times(self):
+        normalized = " ".join(STAGE_CONFLICTS_STATEMENT.lower().split())
+
+        self.assertIn(
+            "count(distinct finalized_time) as finalized_times",
+            normalized,
+        )
+        self.assertIn("or count(distinct finalized_time) > 1", normalized)
 
     def test_daily_persistence_does_not_write_monthly_snapshot(self):
         normalized = " ".join(LOAD_COUNTS_STATEMENT.lower().split())
@@ -138,7 +184,7 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
             Path(__file__).parents[1]
             / "linkaja_fee_pipeline"
             / "migrations"
-            / "005_monthly_fee_summary_view.sql"
+            / "007_monthly_fee_category_stability.sql"
         )
         published = " ".join(
             migration_path.read_text(encoding="utf-8").lower().split()
@@ -150,8 +196,34 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
             self.assertIn("where not transaction.is_reversal", normalized)
             self.assertIn("where not is_reversed", normalized)
             self.assertIn("incomplete_missing_fee", normalized)
+            self.assertIn("general to purchase b2b transfer agent telco", normalized)
+            self.assertIn("fee_categories as", normalized)
+            self.assertIn("aggregate.active_missing_fee_count", normalized)
             self.assertNotIn("transaction.company_credit", normalized)
             self.assertNotIn("digipos_debet_variance", normalized)
+        self.assertIn("cross join fee_categories", published)
+
+    def test_daily_operational_queries_use_active_original_fees(self):
+        query_directory = (
+            Path(__file__).parents[1]
+            / "linkaja_fee_pipeline"
+            / "queries"
+        )
+        for query_name in (
+            "linkaja_daily_fee_report.sql",
+            "linkaja_daily_detail_measures.sql",
+        ):
+            normalized = " ".join(
+                (query_directory / query_name)
+                .read_text(encoding="utf-8")
+                .lower()
+                .split()
+            )
+            active_predicates = (
+                normalized.count("not is_reversed")
+                + normalized.count("not transaction.is_reversed")
+            )
+            self.assertGreaterEqual(active_predicates, 2)
 
     def test_monthly_preview_exposes_reversal_aware_daily_raw_rows(self):
         normalized = " ".join(MONTHLY_DAILY_RAW_STATEMENT.lower().split())

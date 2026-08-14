@@ -2,7 +2,8 @@ import csv
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from linkaja_fee_pipeline.database import (
@@ -17,11 +18,33 @@ from linkaja_fee_pipeline.processing import (
 
 
 TEST_DSN = os.environ.get("LINKAJA_TEST_DSN", "").strip()
+TEST_DATABASE_GUARD = os.environ.get(
+    "LINKAJA_TEST_DATABASE_GUARD",
+    "",
+).strip()
 
 try:
     import psycopg
 except ModuleNotFoundError:
     psycopg = None
+
+
+def _assert_disposable_database_target(dsn, expected_database):
+    if not expected_database:
+        raise RuntimeError(
+            "LINKAJA_TEST_DATABASE_GUARD must name the exact disposable "
+            "database before destructive LinkAja integration tests can run"
+        )
+    with psycopg.connect(dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT current_database()")
+            actual_database = str(cursor.fetchone()[0])
+    if actual_database != expected_database:
+        raise RuntimeError(
+            "LinkAja destructive test guard mismatch: connected to "
+            f"{actual_database!r}, expected {expected_database!r}"
+        )
+    return actual_database
 
 
 @unittest.skipUnless(
@@ -31,6 +54,7 @@ except ModuleNotFoundError:
 class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        _assert_disposable_database_target(TEST_DSN, TEST_DATABASE_GUARD)
         migrate_linkaja_database(TEST_DSN)
 
     def setUp(self):
@@ -289,6 +313,224 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
             ],
         )
 
+    def test_daily_fee_totals_treat_reversed_originals_as_inactive(self):
+        initial = self._persist(
+            [
+                self._row(
+                    **{
+                        "Transaction ID": "DAILY-OUT-1",
+                        "Finalized Date": "01/07/2026",
+                        "Initiate Date": "01/07/2026",
+                        "Transaction Scenario": "Digipos B2B Transfer",
+                        "Debit": "0",
+                        "Credit": "1000",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "2",
+                        "Transaction ID": "DAILY-IN-1",
+                        "Finalized Date": "01/07/2026",
+                        "Initiate Date": "01/07/2026",
+                        "Transaction Scenario":
+                            "Digipos B2B Transfer In Cluster",
+                        "Debit": "0",
+                        "Credit": "1000",
+                        "Fee": "",
+                    }
+                ),
+            ],
+            "laporan-123456-daily-originals.csv",
+            "load-daily-originals",
+        )
+        initial_fee = initial["fee_rows"][0]
+        self.assertEqual(initial_fee["EXPECTED RECHARGE OUT CLUSTER FEE"], 200)
+        self.assertEqual(
+            initial_fee["DIGIPOS B2B TRANSFER IN CLUSTER FEE"],
+            20,
+        )
+
+        reversed_result = self._persist(
+            [
+                self._row(
+                    **{
+                        "Transaction ID": "DAILY-OUT-REV-1",
+                        "Original Transaction ID": "DAILY-OUT-1",
+                        "Finalized Date": "02/07/2026",
+                        "Initiate Date": "02/07/2026",
+                        "Transaction Scenario":
+                            "Buy Goods Reversal for General Merchant",
+                        "Debit": "1000",
+                        "Credit": "0",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "2",
+                        "Transaction ID": "DAILY-IN-REV-1",
+                        "Original Transaction ID": "DAILY-IN-1",
+                        "Finalized Date": "02/07/2026",
+                        "Initiate Date": "02/07/2026",
+                        "Transaction Scenario":
+                            "Buy Goods Reversal for General Merchant",
+                        "Debit": "1000",
+                        "Credit": "0",
+                        "Fee": "",
+                    }
+                ),
+            ],
+            "laporan-123456-daily-reversals.csv",
+            "load-daily-reversals",
+        )
+        fee_by_date = {
+            row["REPORT DATE"]: row for row in reversed_result["fee_rows"]
+        }
+        july_first = fee_by_date["01/07/2026"]
+        self.assertEqual(july_first["EXPECTED RECHARGE OUT CLUSTER FEE"], 0)
+        self.assertEqual(
+            july_first["DIGIPOS B2B TRANSFER IN CLUSTER FEE"],
+            0,
+        )
+        self.assertEqual(july_first["TOTAL FEE"], 0)
+
+    def test_stage_rejects_inconsistent_finalized_times(self):
+        with self.assertRaisesRegex(ValueError, r"times=2"):
+            self._persist(
+                [
+                    self._row(**{"Transaction ID": "TIME-CONFLICT"}),
+                    self._row(
+                        **{
+                            "No": "2",
+                            "Transaction ID": "TIME-CONFLICT",
+                            "Finalized Time": "12:00:01",
+                        }
+                    ),
+                ],
+                "laporan-123456-time-conflict.csv",
+                "load-time-conflict",
+            )
+
+    def test_multiple_reversals_do_not_double_subtract_or_cross_clusters(self):
+        shared_id = "SHARED-FEE-1"
+        self._persist(
+            [
+                self._row(
+                    **{
+                        "Transaction ID": shared_id,
+                        "Finalized Date": "01/07/2026",
+                        "Initiate Date": "01/07/2026",
+                        "Fee": "200",
+                    }
+                )
+            ],
+            "laporan-123456-shared-original.csv",
+            "load-123456-shared-original",
+        )
+        self._persist(
+            [
+                self._row(
+                    **{
+                        "Top Organization": "654321-OTHER COMPANY",
+                        "Parent Organization": "654321-OTHER COMPANY",
+                        "Organization": "654321-OTHER COMPANY",
+                        "Transaction ID": shared_id,
+                        "Finalized Date": "01/07/2026",
+                        "Initiate Date": "01/07/2026",
+                        "Fee": "200",
+                    }
+                )
+            ],
+            "laporan-654321-shared-original.csv",
+            "load-654321-shared-original",
+        )
+        self._persist(
+            [
+                self._row(
+                    **{
+                        "Transaction ID": "SHARED-REVERSAL-1",
+                        "Original Transaction ID": shared_id,
+                        "Finalized Date": "02/08/2026",
+                        "Initiate Date": "02/08/2026",
+                        "Transaction Scenario":
+                            "Buy Goods Reversal for General Merchant",
+                        "Debit": "200",
+                        "Credit": "0",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "2",
+                        "Transaction ID": "SHARED-REVERSAL-2",
+                        "Original Transaction ID": shared_id,
+                        "Finalized Date": "03/08/2026",
+                        "Initiate Date": "03/08/2026",
+                        "Transaction Scenario":
+                            "Buy Goods Reversal for General Merchant",
+                        "Debit": "200",
+                        "Credit": "0",
+                        "Fee": "",
+                    }
+                ),
+            ],
+            "laporan-123456-multiple-reversals.csv",
+            "load-123456-multiple-reversals",
+        )
+
+        reversed_month = materialize_linkaja_month(
+            TEST_DSN,
+            cluster_id="123456",
+            report_month="2026-07",
+            calculation_cutoff="2026-08-05T00:00:00",
+            materialization_id="month-multiple-reversals",
+            publish=False,
+        )
+        other_cluster_month = materialize_linkaja_month(
+            TEST_DSN,
+            cluster_id="654321",
+            report_month="2026-07",
+            calculation_cutoff="2026-08-05T00:00:00",
+            materialization_id="month-other-cluster",
+            publish=False,
+        )
+        reversed_fee = next(
+            row for row in reversed_month["fee_rows"]
+            if row["FEE CATEGORY"] == "Digipos B2B Transfer Fee"
+        )
+        other_fee = next(
+            row for row in other_cluster_month["fee_rows"]
+            if row["FEE CATEGORY"] == "Digipos B2B Transfer Fee"
+        )
+        self.assertEqual(reversed_fee["GROSS TRANSACTION COUNT"], 1)
+        self.assertEqual(reversed_fee["REVERSED TRANSACTION COUNT"], 1)
+        self.assertEqual(reversed_fee["ACTIVE TRANSACTION COUNT"], 0)
+        self.assertEqual(reversed_fee["MONTHLY PAYABLE FEE"], 0)
+        self.assertEqual(other_fee["GROSS TRANSACTION COUNT"], 1)
+        self.assertEqual(other_fee["REVERSED TRANSACTION COUNT"], 0)
+        self.assertEqual(other_fee["ACTIVE TRANSACTION COUNT"], 1)
+        self.assertEqual(other_fee["MONTHLY PAYABLE FEE"], 200)
+
+        with psycopg.connect(TEST_DSN) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT cluster_id, reversal_count, is_reversed
+                    FROM linkaja_transactions_current_v
+                    WHERE transaction_id = 'SHARED-FEE-1'
+                    ORDER BY cluster_id
+                    """
+                )
+                states = cursor.fetchall()
+        self.assertEqual(
+            states,
+            [
+                ("123456", 2, True),
+                ("654321", 0, False),
+            ],
+        )
+
     def test_monthly_fee_contract_uses_source_fee_and_surfaces_missing_ppob(self):
         july_date = {
             "Finalized Date": "01/07/2026",
@@ -480,6 +722,137 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
             ],
         )
 
+    def test_reversed_missing_ppob_is_complete_and_categories_are_stable(self):
+        self._persist(
+            [
+                self._row(
+                    **{
+                        "Transaction ID": "PPOB-MISSING-REVERSED",
+                        "Finalized Date": "01/07/2026",
+                        "Initiate Date": "01/07/2026",
+                        "Transaction Scenario":
+                            "General to Purchase B2B Transfer Agent Telco",
+                        "Organization": "628111-AGENT",
+                        "Account": "5001 - General Organization MFS Account",
+                        "Debit": "100000",
+                        "Credit": "0",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "2",
+                        "Transaction ID": "PPOB-MISSING-REVERSAL",
+                        "Original Transaction ID": "PPOB-MISSING-REVERSED",
+                        "Finalized Date": "02/08/2026",
+                        "Initiate Date": "02/08/2026",
+                        "Transaction Scenario":
+                            "Buy Goods Reversal for General Merchant",
+                        "Debit": "100000",
+                        "Credit": "0",
+                        "Fee": "",
+                    }
+                ),
+            ],
+            "laporan-123456-reversed-missing-ppob.csv",
+            "load-reversed-missing-ppob",
+        )
+
+        result = materialize_linkaja_month(
+            TEST_DSN,
+            cluster_id="123456",
+            report_month="2026-07",
+            calculation_cutoff="2026-08-05T00:00:00",
+            materialization_id="month-reversed-missing-ppob",
+            publish=True,
+        )
+        rows = {row["FEE CATEGORY"]: row for row in result["fee_rows"]}
+        self.assertEqual(
+            set(rows),
+            {
+                "Digipos B2B Transfer Fee",
+                "General to Purchase B2B Transfer Agent Telco",
+            },
+        )
+        digipos = rows["Digipos B2B Transfer Fee"]
+        self.assertEqual(digipos["GROSS TRANSACTION COUNT"], 0)
+        self.assertEqual(digipos["MONTHLY PAYABLE FEE"], 0)
+        self.assertEqual(digipos["CALCULATION STATUS"], "COMPLETE")
+
+        ppob = rows["General to Purchase B2B Transfer Agent Telco"]
+        self.assertEqual(ppob["GROSS TRANSACTION COUNT"], 1)
+        self.assertEqual(ppob["REVERSED TRANSACTION COUNT"], 1)
+        self.assertEqual(ppob["ACTIVE TRANSACTION COUNT"], 0)
+        self.assertEqual(ppob["GROSS MISSING FEE COUNT"], 1)
+        self.assertEqual(ppob["REVERSED MISSING FEE COUNT"], 1)
+        self.assertEqual(ppob["ACTIVE MISSING FEE COUNT"], 0)
+        self.assertIsNone(ppob["GROSS FEE"])
+        self.assertIsNone(ppob["REVERSED FEE"])
+        self.assertEqual(ppob["NET FEE"], 0)
+        self.assertEqual(ppob["MONTHLY PAYABLE FEE"], 0)
+        self.assertEqual(ppob["CALCULATION STATUS"], "COMPLETE")
+        self.assertTrue(result["monthly_payable_complete"])
+
+        with psycopg.connect(TEST_DSN) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT fee_category, monthly_payable_fee, calculation_status
+                    FROM linkaja_monthly_fee_summary_v
+                    WHERE cluster_id = '123456'
+                      AND report_month = DATE '2026-07-01'
+                    ORDER BY fee_category
+                    """
+                )
+                published_rows = cursor.fetchall()
+        self.assertEqual(
+            published_rows,
+            [
+                ("Digipos B2B Transfer Fee", 0, "COMPLETE"),
+                (
+                    "General to Purchase B2B Transfer Agent Telco",
+                    0,
+                    "COMPLETE",
+                ),
+            ],
+        )
+
+    def test_empty_month_returns_both_zero_fee_categories(self):
+        result = materialize_linkaja_month(
+            TEST_DSN,
+            cluster_id="123456",
+            report_month="2026-07",
+            calculation_cutoff="2026-08-01T00:00:00",
+            materialization_id="month-empty",
+            publish=True,
+        )
+
+        self.assertEqual(result["transaction_rows"], 0)
+        self.assertEqual(len(result["fee_rows"]), 2)
+        for row in result["fee_rows"]:
+            self.assertEqual(row["GROSS TRANSACTION COUNT"], 0)
+            self.assertEqual(row["REVERSED TRANSACTION COUNT"], 0)
+            self.assertEqual(row["ACTIVE TRANSACTION COUNT"], 0)
+            self.assertEqual(row["MONTHLY PAYABLE FEE"], 0)
+            self.assertEqual(row["CALCULATION STATUS"], "COMPLETE")
+
+        with psycopg.connect(TEST_DSN) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT fee_category, monthly_payable_fee, calculation_status
+                    FROM linkaja_monthly_fee_summary_v
+                    WHERE cluster_id = '123456'
+                      AND report_month = DATE '2026-07-01'
+                    ORDER BY fee_category
+                    """
+                )
+                published_rows = cursor.fetchall()
+        self.assertEqual(len(published_rows), 2)
+        self.assertTrue(
+            all(row[1:] == (0, "COMPLETE") for row in published_rows)
+        )
+
     def test_unresolved_reversal_becomes_complete_when_original_arrives(self):
         unresolved = self._persist(
             [
@@ -573,7 +946,7 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(
             in_cluster_fee_row["DIGIPOS B2B TRANSFER IN CLUSTER FEE"],
-            20,
+            0,
         )
         complete_reversal_row = next(
             row for row in resolved["detail_rows"]
@@ -741,6 +1114,122 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
                     """
                 )
                 self.assertEqual(cursor.fetchone()[0], "COMPLETE")
+
+    def test_dashboard_fee_and_actual_withdrawal_cycle_views(self):
+        self._persist(
+            [
+                self._row(
+                    **{
+                        "No": "1",
+                        "Transaction ID": "CYCLE-CREDIT-1",
+                        "Finalized Date": "01/07/2026",
+                        "Finalized Time": "09:00:00",
+                        "Initiate Date": "01/07/2026",
+                        "Transaction Scenario": "Digipos B2B Transfer",
+                        "Debit": "0",
+                        "Credit": "1000",
+                        "Balance": "1000",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "2",
+                        "Transaction ID": "WITHDRAWAL-1",
+                        "Finalized Date": "01/07/2026",
+                        "Finalized Time": "12:00:00",
+                        "Initiate Date": "01/07/2026",
+                        "Transaction Scenario":
+                            "Organization Withdraw of Funds with Next Working "
+                            "Day Payment",
+                        "Debit": "600",
+                        "Credit": "0",
+                        "Balance": "400",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "3",
+                        "Transaction ID": "CYCLE-CREDIT-2",
+                        "Finalized Date": "02/07/2026",
+                        "Finalized Time": "10:00:00",
+                        "Initiate Date": "02/07/2026",
+                        "Transaction Scenario": "Digipos B2B Transfer",
+                        "Debit": "0",
+                        "Credit": "200",
+                        "Balance": "600",
+                        "Fee": "",
+                    }
+                ),
+                self._row(
+                    **{
+                        "No": "4",
+                        "Transaction ID": "WITHDRAWAL-2",
+                        "Finalized Date": "02/07/2026",
+                        "Finalized Time": "16:00:00",
+                        "Initiate Date": "02/07/2026",
+                        "Transaction Scenario":
+                            "Organization Withdraw of Funds with Next Working "
+                            "Day Payment",
+                        "Debit": "600",
+                        "Credit": "0",
+                        "Balance": "0",
+                        "Fee": "",
+                    }
+                ),
+            ],
+            "laporan-123456-dashboard-cycle.csv",
+            "load-dashboard-cycle",
+        )
+
+        with psycopg.connect(TEST_DSN) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        SUM(gross_transaction_count),
+                        SUM(active_transaction_count),
+                        SUM(active_fee)
+                    FROM linkaja_daily_fee_reconciliation_v
+                    WHERE cluster_id = '123456'
+                      AND fee_type = 'EXPECTED_OUT_CLUSTER_RP200'
+                    """
+                )
+                self.assertEqual(cursor.fetchone(), (2, 2, 400))
+
+                cursor.execute(
+                    """
+                    SELECT
+                        interval_start_exclusive,
+                        interval_end_inclusive,
+                        opening_balance,
+                        non_withdrawal_company_credit,
+                        withdrawal_company_debit,
+                        closing_balance,
+                        balance_variance,
+                        linkaja_reconciliation_status,
+                        mandiri_confirmation_status
+                    FROM linkaja_mandiri_settlement_cycles_v
+                    WHERE withdrawal_transaction_id = 'WITHDRAWAL-2'
+                    """
+                )
+                cycle = cursor.fetchone()
+
+        self.assertEqual(
+            cycle,
+            (
+                datetime(2026, 7, 1, 12, 0),
+                datetime(2026, 7, 2, 16, 0),
+                Decimal("400"),
+                Decimal("200"),
+                Decimal("600"),
+                Decimal("0"),
+                Decimal("0"),
+                "BALANCED",
+                "PENDING_BANK_EVIDENCE",
+            ),
+        )
 
 
 if __name__ == "__main__":
