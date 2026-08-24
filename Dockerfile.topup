@@ -1,0 +1,8 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+RUN pip install --no-cache-dir psycopg[binary] requests openpyxl kestra
+COPY finpay_topup_pipeline/ /app/finpay_topup_pipeline/
+COPY skills/digipos-topup-monitoring/ /app/skills/digipos-topup-monitoring/
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "finpay_topup_pipeline"]

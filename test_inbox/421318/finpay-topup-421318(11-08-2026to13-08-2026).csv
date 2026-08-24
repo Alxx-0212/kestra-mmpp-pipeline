@@ -1,0 +1,11 @@
+No,Transaction Date,Sender,Receiver,Transaction Type,Amount,Currency,Remarks
+1,"2026-08-11 08:00:00","","","Kredit",1000000,"IDR","Initial deposit"
+2,"2026-08-11 09:30:00","","","Debit",50000,"IDR","Top up customer A"
+3,"2026-08-11 10:15:00","","","Debit",75000,"IDR","Top up customer B"
+4,"2026-08-12 08:00:00","","","Kredit",2000000,"IDR","Refill"
+5,"2026-08-12 09:00:00","","","Debit",100000,"IDR","Top up customer C"
+6,"2026-08-12 11:00:00","","","Debit",25000,"IDR","Top up customer D"
+7,"2026-08-13 08:00:00","","","Kredit",500000,"IDR","Refill"
+8,"2026-08-13 10:00:00","","","Debit",30000,"IDR","Top up customer E"
+9,"2026-08-13 14:00:00","","","Debit",45000,"IDR","Top up customer F"
+10,"2026-08-13 16:00:00","","","Debit",20000,"IDR","Top up customer G"

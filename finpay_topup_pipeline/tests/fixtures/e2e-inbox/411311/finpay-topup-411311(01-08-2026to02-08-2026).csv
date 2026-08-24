@@ -1,0 +1,4 @@
+"No","Transaction Date","Sender","Receiver","Transaction Type","Amount","Currency","Remarks"
+"1","2026-08-01 08:00:00","FINPAY","CLUSTER-411311","Kredit","1000.00","IDR","E2E credit"
+"2","2026-08-01 09:00:00","FINPAY","CLUSTER-411311","Debit","300.00","IDR","E2E debit"
+"3","2026-08-02 08:00:00","FINPAY","CLUSTER-411311","Debit","100.00","IDR","E2E debit next day"

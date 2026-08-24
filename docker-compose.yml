@@ -1,45 +1,45 @@
-volumes:
-  postgres-data:
-    driver: local
-  finpay-postgres-data:
-    driver: local
-  pgadmin-data:
-    driver: local
-  kestra-data:
-    driver: local
-
-networks:
-  finpay-network:
-    name: finpay-network
-    driver: bridge
+# MMPP finance local stack
+# Shared network: mmpp-finance-network
+# Single PostgreSQL instance hosting: kestra, finpay, finpay_txn, superset, linkaja, grist
+# Secret management: Docker Secrets (files in ./secrets/)
 
 services:
+  # Single PostgreSQL instance hosting all project databases
+  # - kestra:      Kestra metadata (workflows, executions, queue)
+  # - finpay:      FinPay Top Up + reconciliation data (existing contract DB)
+  # - finpay_txn:  FinPay Transaction processing data (new, separate from top-up)
+  # - superset:    Superset metadata database (charts, dashboards, users)
+  # - linkaja:     LinkAja fee pipeline data (future)
+  # - grist:       Grist metadata database
   postgres:
     image: postgres:18.4
     networks:
-      - finpay-network
+      - mmpp-finance-network
     volumes:
       - postgres-data:/var/lib/postgresql
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     environment:
       POSTGRES_DB: ${KESTRA_POSTGRES_DB}
       POSTGRES_USER: ${KESTRA_POSTGRES_USER}
-      POSTGRES_PASSWORD: ${KESTRA_POSTGRES_PASSWORD}
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
-      interval: 30s
-      timeout: 10s
-      retries: 10
-
-  finpay-postgres:
-    image: postgres:18.4
-    networks:
-      - finpay-network
-    volumes:
-      - finpay-postgres-data:/var/lib/postgresql
-    environment:
-      POSTGRES_DB: ${FINPAY_DB_NAME}
-      POSTGRES_USER: ${FINPAY_DB_USER}
-      POSTGRES_PASSWORD: ${FINPAY_DB_PASSWORD}
+      POSTGRES_PASSWORD_FILE: /run/secrets/kestra_postgres_password
+      # Project database credentials consumed by init script
+      FINPAY_DB_NAME: ${FINPAY_DB_NAME}
+      FINPAY_DB_USER: ${FINPAY_DB_USER}
+      FINPAY_DB_PASSWORD_FILE: /run/secrets/finpay_db_password
+      FINPAY_TXN_DB_NAME: ${FINPAY_TXN_DB_NAME}
+      FINPAY_TXN_DB_USER: ${FINPAY_TXN_DB_USER}
+      FINPAY_TXN_DB_PASSWORD_FILE: /run/secrets/finpay_txn_db_password
+      SUPERSET_DB_NAME: ${SUPERSET_DB_NAME}
+      SUPERSET_DB_USER: ${SUPERSET_DB_USER}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD}
+      SUPERSET_DB_PASSWORD_FILE: /run/secrets/superset_db_password
+      LINKAJA_DB_NAME: ${LINKAJA_DB_NAME}
+      LINKAJA_DB_USER: ${LINKAJA_DB_USER}
+      LINKAJA_DB_PASSWORD_FILE: /run/secrets/linkaja_db_password
+      GRIST_DB_NAME: ${GRIST_DB_NAME}
+      GRIST_DB_USER: ${GRIST_DB_USER}
+      GRIST_DB_PASSWORD_FILE: /run/secrets/grist_db_password
+      FINPAY_READONLY_PASSWORD_FILE: /run/secrets/finpay_readonly_password
     ports:
       - "5433:5432"
     healthcheck:
@@ -47,26 +47,32 @@ services:
       interval: 30s
       timeout: 10s
       retries: 10
+    secrets:
+      - kestra_postgres_password
+      - finpay_db_password
+      - finpay_txn_db_password
+      - superset_db_password
+      - linkaja_db_password
+      - grist_db_password
+      - finpay_readonly_password
 
-  finpay-pgadmin:
-    image: dpage/pgadmin4:9.16
+  redis:
+    image: redis:7-alpine
     networks:
-      - finpay-network
-    environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      - mmpp-finance-network
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
-      - pgadmin-data:/var/lib/pgadmin
-    ports:
-      - "5050:80"
-    depends_on:
-      finpay-postgres:
-        condition: service_healthy
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
   kestra:
     image: kestra/kestra:v1.3.26
     networks:
-      - finpay-network
+      - mmpp-finance-network
     stop_grace_period: 6m
     user: "root"
     command: server standalone
@@ -85,6 +91,8 @@ services:
             username: ${KESTRA_POSTGRES_USER}
             password: ${KESTRA_POSTGRES_PASSWORD}
         kestra:
+          secrets:
+            type: env
           server:
             basic-auth:
               username: ${KESTRA_BASIC_AUTH_USERNAME}
@@ -109,11 +117,220 @@ services:
               - type: io.kestra.plugin.scripts.runner.docker.Docker
                 values:
                   volumeEnabled: true
-                  networkMode: finpay-network
+                  networkMode: mmpp-finance-network
     ports:
       - "8081:8080"
     depends_on:
       postgres:
         condition: service_healthy
-      finpay-postgres:
+    secrets:
+      - kestra_basic_auth_password
+
+  # ─────────────────────────────────────────────────────────────────
+  # Superset Webserver: Gunicorn production server
+  # ─────────────────────────────────────────────────────────────────
+  superset:
+    build:
+      context: .
+      dockerfile: Dockerfile.superset
+    image: mmpp-superset:6.1.0-postgres-mcp
+    networks:
+      - mmpp-finance-network
+    volumes:
+      - superset-home:/app/superset_home
+      - ./config/superset_config.py:/app/pythonpath/superset_config.py:ro
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      # Core
+      SUPERSET_SECRET_KEY_FILE: /run/secrets/superset_secret_key
+      SUPERSET_LOAD_EXAMPLES: "no"
+      # Admin (created on first run)
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME:-admin}
+      SUPERSET_ADMIN_PASSWORD_FILE: /run/secrets/superset_admin_password
+      SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL:-admin@example.com}
+      SUPERSET_ADMIN_FIRSTNAME: ${SUPERSET_ADMIN_FIRSTNAME:-Finance}
+      SUPERSET_ADMIN_LASTNAME: ${SUPERSET_ADMIN_LASTNAME:-Admin}
+      # Security
+      ENABLE_PROXY_FIX: "true"
+      SUPERSET_WEBSERVER_ADDRESS: ${SUPERSET_WEBSERVER_ADDRESS:-http://localhost:8088}
+      WEBDRIVER_BASEURL: ${WEBDRIVER_BASEURL:-http://superset:8088/}
+      # Metadata DB (PostgreSQL) - base URI without password (will be constructed at runtime)
+      SQLALCHEMY_DATABASE_URI: postgresql://${SUPERSET_DB_USER}:@postgres:5432/${SUPERSET_DB_NAME}
+      SQLALCHEMY_ENGINE_OPTIONS: '{"pool_size": 10, "max_overflow": 10, "pool_timeout": 30, "pool_pre_ping": true}'
+      # Redis caching
+      CACHE_CONFIG: '{"CACHE_TYPE": "RedisCache", "CACHE_REDIS_URL": "redis://redis:6379/1", "CACHE_DEFAULT_TIMEOUT": 300}'
+      DATA_CACHE_CONFIG: '{"CACHE_TYPE": "RedisCache", "CACHE_REDIS_URL": "redis://redis:6379/2", "CACHE_DEFAULT_TIMEOUT": 3600}'
+      # Celery
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      CELERY_CONFIG: '{"broker_url": "redis://redis:6379/0", "imports": ["superset.sql_lab", "superset.tasks.scheduler"], "result_backend": "redis://redis:6379/0", "worker_prefetch_multiplier": 10, "task_acks_late": true, "task_annotations": {"sql_lab.get_sql_results": {"rate_limit": "100/s"}}}'
+      # MCP Production Auth
+      MCP_AUTH_ENABLED: ${MCP_AUTH_ENABLED:-true}
+      MCP_JWT_ISSUER: ${MCP_JWT_ISSUER:-}
+      MCP_JWKS_URI: ${MCP_JWKS_URI:-}
+      MCP_DEV_USERNAME: ${MCP_DEV_USERNAME:-}
+      MCP_SERVICE_URL: ${MCP_SERVICE_URL:-http://superset:8088}
+      MCP_SERVICE_HOST: ${MCP_SERVICE_HOST:-0.0.0.0}
+      MCP_SERVICE_PORT: ${MCP_SERVICE_PORT:-5008}
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        # Read password from secret file
+        SUPERSET_DB_PASSWORD=$$(cat /run/secrets/superset_db_password)
+        export SQLALCHEMY_DATABASE_URI="postgresql://${SUPERSET_DB_USER}:$${SUPERSET_DB_PASSWORD}@postgres:5432/${SUPERSET_DB_NAME}"
+        
+        /app/.venv/bin/superset db upgrade &&
+        (/app/.venv/bin/superset fab create-admin \
+          --username "$${SUPERSET_ADMIN_USERNAME}" \
+          --firstname "$${SUPERSET_ADMIN_FIRSTNAME}" \
+          --lastname "$${SUPERSET_ADMIN_LASTNAME}" \
+          --email "$${SUPERSET_ADMIN_EMAIL}" \
+          --password "$$(cat /run/secrets/superset_admin_password)" || true) &&
+        /app/.venv/bin/superset init &&
+        /app/.venv/bin/gunicorn \
+          -w 4 \
+          -k gevent \
+          --worker-connections 1000 \
+          --timeout 120 \
+          -b 0.0.0.0:8088 \
+          --limit-request-line 0 \
+          --limit-request-field_size 0 \
+          "superset.app:create_app()"
+    ports:
+      - "8088:8088"
+    depends_on:
+      postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    secrets:
+      - superset_secret_key
+      - superset_admin_password
+      - superset_db_password
+
+  # ─────────────────────────────────────────────────────────────────
+  # MCP Server: Internal-only, programmatic chart/dataset access
+  #  - NO host port mapping (internal only)
+  #  - JWT auth required in production (MCP_AUTH_ENABLED=true)
+  #  - Healthcheck on /mcp endpoint via JSON-RPC initialize
+  # ─────────────────────────────────────────────────────────────────
+  superset-mcp:
+    image: mmpp-superset:6.1.0-postgres-mcp
+    networks:
+      - mmpp-finance-network
+    volumes:
+      - superset-home:/app/superset_home
+      - ./config/superset_config.py:/app/pythonpath/superset_config.py:ro
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY_FILE: /run/secrets/superset_secret_key
+      SUPERSET_MCP_AUTH_ENABLED: ${MCP_AUTH_ENABLED:-true}
+      SUPERSET_MCP_DEV_USERNAME: ${MCP_DEV_USERNAME:-}
+      SUPERSET_WEBDRIVER_BASEURL: http://superset:8088/
+      MCP_SERVICE_HOST: 0.0.0.0
+      MCP_SERVICE_PORT: 5008
+      MCP_AUTH_ENABLED: ${MCP_AUTH_ENABLED:-true}
+      MCP_JWT_ISSUER: ${MCP_JWT_ISSUER:-}
+      MCP_JWKS_URI: ${MCP_JWKS_URI:-}
+      MCP_SERVICE_URL: ${MCP_SERVICE_URL:-http://superset:8088}
+      SQLALCHEMY_DATABASE_URI: postgresql://${SUPERSET_DB_USER}:@postgres:5432/${SUPERSET_DB_NAME}
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        SUPERSET_DB_PASSWORD=$$(cat /run/secrets/superset_db_password)
+        export SQLALCHEMY_DATABASE_URI="postgresql://${SUPERSET_DB_USER}:$${SUPERSET_DB_PASSWORD}@postgres:5432/${SUPERSET_DB_NAME}"
+        exec /app/.venv/bin/superset mcp run --host 0.0.0.0 --port 5008
+    # NO ports mapping - MCP is internal only
+    depends_on:
+      superset:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/python -c \"import json, urllib.request; req = urllib.request.Request('http://127.0.0.1:5008/mcp', data=json.dumps({'jsonrpc': '2.0', 'method': 'initialize', 'params': {'protocolVersion': '2024-11-05', 'capabilities': {}, 'clientInfo': {'name': 'healthcheck', 'version': '1.0'}}, 'id': 1}).encode(), headers={'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'}); resp = urllib.request.urlopen(req, timeout=5); assert resp.status == 200\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    secrets:
+      - superset_secret_key
+      - superset_db_password
+
+  # ─────────────────────────────────────────────────────────────────
+  # Grist: Excel-like spreadsheet-database for finance dashboards
+  # ─────────────────────────────────────────────────────────────────
+  grist:
+    image: gristlabs/grist:1.7.17
+    networks:
+      - mmpp-finance-network
+    volumes:
+      - grist-data:/persist
+    working_dir: /grist
+    environment:
+      - PORT=8484
+      - GRIST_DEFAULT_EMAIL=finance@mmpp.local
+      - GRIST_DB_NAME=grist
+      - GRIST_DB_USER=grist
+      - GRIST_BOOT_KEY=f0ogWd4MiWByPXdlDlwOYfbhFjUOb1eQyBzqi303nXI=
+      - GRIST_DB_PASSWORD=oRLvBCtbt/1Z/357HZMZmt576rTDU2nNd0gNJrgrpOw=
+      - DATABASE_URL=postgresql://grist:oRLvBCtbt/1Z/357HZMZmt576rTDU2nNd0gNJrgrpOw=@postgres:5432/grist
+    command: ./sandbox/run.sh
+    ports:
+      - "8484:8484"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8484"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────────
+  # Kestra Orchestration (existing, unchanged)
+  # ─────────────────────────────────────────────────────────────────
+
+volumes:
+  postgres-data:
+    driver: local
+  kestra-data:
+    driver: local
+  superset-home:
+    driver: local
+  redis-data:
+    driver: local
+  grist-data:
+    driver: local
+
+networks:
+  mmpp-finance-network:
+    name: mmpp-finance-network
+    driver: bridge
+
+secrets:
+  kestra_postgres_password:
+    file: ./secrets/kestra_postgres_password.txt
+  finpay_db_password:
+    file: ./secrets/finpay_db_password.txt
+  finpay_txn_db_password:
+    file: ./secrets/finpay_txn_db_password.txt
+  superset_db_password:
+    file: ./secrets/superset_db_password.txt
+  linkaja_db_password:
+    file: ./secrets/linkaja_db_password.txt
+  grist_db_password:
+    file: ./secrets/grist_db_password.txt
+  finpay_readonly_password:
+    file: ./secrets/finpay_readonly_password.txt
+  kestra_basic_auth_password:
+    file: ./secrets/kestra_basic_auth_password.txt
+  superset_secret_key:
+    file: ./secrets/superset_secret_key.txt
+  superset_admin_password:
+    file: ./secrets/superset_admin_password.txt

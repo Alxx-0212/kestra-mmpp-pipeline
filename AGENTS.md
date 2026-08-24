@@ -46,6 +46,11 @@ owner implements and validates the FinPay-side adapter.
 - File acquisition and scheduling are external today. Adding Hermes scraping,
   a cron replacement, or a Kestra trigger is a separate ingestion migration;
   do not mix it into a behavior-preserving calculation refactor.
+- Shared documentation tooling is integrator-owned. The Context7 MCP server
+  (remote, `https://mcp.context7.com/mcp`) is configured in `.codex/config.toml`
+  and root `.mcp.json`, and the npm-free fetcher lives in `scripts/context7_docs.py`
+  (caches results under `docs/context7/`). These are shared contracts; domain
+  agents should not edit them.
 
 ## Multi-agent workflow
 

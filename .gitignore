@@ -15,3 +15,7 @@ linkaja_fee_pipeline/dbt/profiles.yml
 linkaja_fee_pipeline/dbt/target/
 linkaja_fee_pipeline/dbt/logs/
 linkaja_fee_pipeline/dbt/dbt_packages/
+
+# Docker Secrets (never commit actual secrets)
+secrets/*.txt
+!secrets/.gitkeep

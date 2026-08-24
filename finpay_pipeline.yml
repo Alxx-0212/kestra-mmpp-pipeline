@@ -217,7 +217,7 @@ tasks:
     containerImage: finpay-pipeline:3.11
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: finpay-network
+      networkMode: mmpp-finance-network
     pythonVersion: "3.11"
     timeout: PT5M
     inputFiles:
@@ -360,7 +360,7 @@ tasks:
         containerImage: finpay-pipeline:3.11
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
-          networkMode: finpay-network
+          networkMode: mmpp-finance-network
         pythonVersion: "3.11"
         timeout: PT5M
         inputFiles:
@@ -583,7 +583,7 @@ tasks:
                     containerImage: finpay-pipeline:3.11
                     taskRunner:
                       type: io.kestra.plugin.scripts.runner.docker.Docker
-                      networkMode: finpay-network
+                      networkMode: mmpp-finance-network
                     pythonVersion: "3.11"
                     timeout: PT5M
                     inputFiles:
@@ -734,7 +734,7 @@ tasks:
                     containerImage: finpay-pipeline:3.11
                     taskRunner:
                       type: io.kestra.plugin.scripts.runner.docker.Docker
-                      networkMode: finpay-network
+                      networkMode: mmpp-finance-network
                     pythonVersion: "3.11"
                     timeout: PT5M
                     inputFiles:
@@ -908,7 +908,7 @@ tasks:
                     containerImage: finpay-pipeline:3.11
                     taskRunner:
                       type: io.kestra.plugin.scripts.runner.docker.Docker
-                      networkMode: finpay-network
+                      networkMode: mmpp-finance-network
                     pythonVersion: "3.11"
                     timeout: PT5M
                     inputFiles:

@@ -1,0 +1,244 @@
+  id: finpay_topup_pipeline_v1
+  namespace: finance.finpay
+
+  inputs:
+    - id: start
+      type: DATE
+      displayName: "Start date"
+      required: true
+    - id: end
+      type: DATE
+      displayName: "End date"
+      required: true
+    - id: users
+      type: STRING
+      displayName: "Users or cluster IDs (space-separated)"
+      required: false
+    - id: dry_run
+      type: BOOLEAN
+      displayName: "Dry run?"
+      defaults: false
+      required: true
+    - id: requested_by
+      type: STRING
+      displayName: "Requested by"
+      defaults: "finance"
+      required: true
+    - id: trigger_source
+      type: STRING
+      displayName: "Trigger source"
+      defaults: "manual"
+      required: true
+    - id: verify_bucket_topup
+      type: BOOLEAN
+      displayName: "Verify DigiPOS BUCKET TOP UP?"
+      defaults: true
+      required: true
+
+  triggers:
+    - id: finpay-topup
+      type: io.kestra.plugin.core.trigger.Webhook
+      key: "{{ secret('FINPAY_TOPUP_WEBHOOK_KEY') }}"
+
+  tasks:
+    - id: ingest_topup
+      type: io.kestra.plugin.scripts.python.Script
+      containerImage: finpay-topup-pipeline:3.11
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: mmpp-finance-network
+      pythonVersion: "3.11"
+      timeout: PT30M
+      env:
+        FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+        FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+        FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+        FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+        FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+        DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+        OUTPUT_DIR: "/tmp/kestra-wd/finpay-topup-inbox"
+        DRY_RUN: "{{ inputs.dry_run }}"
+      script: |
+        import os
+        import sys
+        from datetime import date
+        sys.path.insert(0, "/app")
+        from finpay_topup_pipeline.config import dsn_from_env
+        from finpay_topup_pipeline.extract import run_extract
+        from finpay_topup_pipeline.schema import ensure_schema
+        from finpay_topup_pipeline.loader import load_inbox
+        from finpay_topup_pipeline.audit import start_refresh, update_refresh_status, upsert_cluster_status
+
+        import psycopg
+        start = "{{ inputs.start }}"
+        end = "{{ inputs.end }}"
+        default_users = [
+            "411311_A", "421306_A", "421307_A", "421315_A",
+            "421318_A", "421320_A",
+        ]
+        users = "{{ inputs.users }}".split() if "{{ inputs.users }}" else default_users
+        password = os.environ.get("DIGIPOS_PASSWORD")
+        refresh_id = None
+        conn = None
+        if os.environ.get("DRY_RUN", "false").lower() != "true":
+            conn = psycopg.connect(dsn_from_env())
+            ensure_schema(conn)
+            refresh_id = start_refresh(
+                conn,
+                start,
+                end,
+                users,
+                requested_by="{{ inputs.requested_by }}",
+                trigger_source="{{ inputs.trigger_source }}",
+            )
+        out = run_extract(start, end, users=users, output_dir=os.environ["OUTPUT_DIR"], password=password)
+        print(out["stdout"])
+        if out["returncode"] != 0:
+            print(out["stderr"], file=sys.stderr)
+            if conn is not None and refresh_id is not None:
+                update_refresh_status(conn, refresh_id, "FAILED", out["stderr"][-1000:] or "Top Up download failed")
+                conn.close()
+            raise SystemExit(out["returncode"])
+        if os.environ.get("DRY_RUN", "false").lower() == "true":
+            print("DRY RUN — skipping PostgreSQL load.")
+        else:
+            try:
+                update_refresh_status(conn, refresh_id, "DOWNLOADED")
+                res = load_inbox(conn, os.environ["OUTPUT_DIR"])
+                for cluster_id, counts in res.items():
+                    upsert_cluster_status(
+                        conn,
+                        refresh_id,
+                        cluster_id,
+                        status="LOADED",
+                        source_row_count=counts["seen"],
+                        loaded_seen=counts["seen"],
+                        loaded_inserted=counts["inserted"],
+                    )
+                update_refresh_status(conn, refresh_id, "LOADED")
+            except Exception as exc:
+                update_refresh_status(conn, refresh_id, "FAILED", str(exc))
+                raise
+            finally:
+                conn.close()
+            print(res)
+            total_inserted = sum(v["inserted"] for v in res.values())
+            total_seen = sum(v["seen"] for v in res.values())
+            from kestra import Kestra
+            Kestra.outputs({
+                "refresh_id": refresh_id,
+                "per_cluster": res,
+                "total_inserted": total_inserted,
+                "total_seen": total_seen,
+            })
+
+    - id: refresh_saldo
+      type: io.kestra.plugin.scripts.python.Script
+      runIf: "{{ inputs.dry_run == false }}"
+      containerImage: finpay-topup-pipeline:3.11
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: mmpp-finance-network
+      pythonVersion: "3.11"
+      timeout: PT10M
+      env:
+        FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+        FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+        FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+        FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+        FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+        DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+        OUTPUT_DIR: "/tmp/kestra-wd/finpay-topup-inbox"
+        VERIFY_BUCKET_TOPUP: "{{ inputs.verify_bucket_topup }}"
+      script: |
+        import os
+        import sys
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+        sys.path.insert(0, "/app")
+        from finpay_topup_pipeline.config import dsn_from_env
+        from finpay_topup_pipeline.schema import ensure_schema
+        from finpay_topup_pipeline.saldo import update_opening_balance_from_latest, summary_by_cluster
+        from finpay_topup_pipeline.verify import bucket_cutoff_for_refresh, verify_live_bucket_topup
+        from finpay_topup_pipeline.audit import update_refresh_status, upsert_cluster_status
+        from finpay_topup_pipeline.extract import run_extract
+        from finpay_topup_pipeline.loader import load_inbox
+
+        import psycopg
+        conn = psycopg.connect(dsn_from_env())
+        ensure_schema(conn)
+        refresh_id = {{ outputs.ingest_topup.vars.refresh_id }}
+        verify_bucket = os.environ.get("VERIFY_BUCKET_TOPUP", "true").lower() == "true"
+        start = "{{ inputs.start }}"
+        end = "{{ inputs.end }}"
+        end_date = date.fromisoformat(end)
+        today = datetime.now(ZoneInfo("Asia/Makassar")).date()
+        bucket_cutoff_date = bucket_cutoff_for_refresh(end_date, today)
+        users = "{{ inputs.users }}".split() if "{{ inputs.users }}" else [
+            "411311_A", "421306_A", "421307_A", "421315_A",
+            "421318_A", "421320_A",
+        ]
+        verification = {"status": "SKIPPED", "clusters": {}}
+        if verify_bucket:
+            password = os.environ.get("DIGIPOS_PASSWORD")
+                verification = verify_live_bucket_topup(
+                    conn,
+                    refresh_id,
+                    users,
+                    password,
+                    cutoff_date=bucket_cutoff_date,
+                    verification_attempt=1,
+                    report_date=end,
+                )
+            if verification["status"] == "VERIFY_FAILED":
+                # A CMS transaction can arrive after the first extract but
+                # before BUCKET TOP UP is captured. Re-query once and retain
+                # the final evidence if it still does not reconcile.
+                retry = run_extract(
+                    start,
+                    end,
+                    users=users,
+                    output_dir=os.environ["OUTPUT_DIR"],
+                    password=password,
+                )
+                if retry["returncode"] == 0:
+                    retry_load = load_inbox(conn, os.environ["OUTPUT_DIR"])
+                    for cluster_id, counts in retry_load.items():
+                        upsert_cluster_status(
+                            conn,
+                            refresh_id,
+                            cluster_id,
+                            status="LOADED",
+                            source_row_count=counts["seen"],
+                            loaded_seen=counts["seen"],
+                            loaded_inserted=counts["inserted"],
+                        )
+                    verification = verify_live_bucket_topup(
+                        conn,
+                        refresh_id,
+                        users,
+                        password,
+                        cutoff_date=bucket_cutoff_date,
+                        verification_attempt=2,
+                    )
+                else:
+                    print("Snapshot retry download failed; retaining first verification evidence.", file=sys.stderr)
+            if verification["status"] == "VERIFIED":
+                if end_date < today:
+                    update_opening_balance_from_latest(conn)
+                else:
+                    print("Verified live snapshot; no next-day opening checkpoint is written for an in-progress date.")
+            else:
+                print("BUCKET TOP UP verification failed; loaded rows remain visible and checkpoint is unchanged.")
+        else:
+            update_refresh_status(conn, refresh_id, "VERIFY_SKIPPED")
+            print("BUCKET TOP UP verification skipped; checkpoint is unchanged.")
+        rows = summary_by_cluster(conn)
+        conn.close()
+        print(rows)
+        import json
+        from kestra import Kestra
+        Kestra.outputs({
+            "summary": json.loads(json.dumps(rows, default=str)),
+            "verification": json.loads(json.dumps(verification, default=str)),
+        })
