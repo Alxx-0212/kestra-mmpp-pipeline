@@ -13,13 +13,11 @@
       },
       "enabled": true
     },
-    "playwright": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "@playwright/mcp@0.0.38"
-      ]
+    "kestra": {
+      "type": "remote",
+      "url": "https://api.kestra.io/v1/mcp",
+      "enabled": true,
+      "timeout": 15000
     }
   }
 }
