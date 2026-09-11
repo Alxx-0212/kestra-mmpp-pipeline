@@ -6,6 +6,7 @@ tmp/kestra-wd/secrets/gcp-sa-key.json
 __pycache__/
 data/
 .idea/
+.kilo/
 main.ipynb
 docs/context7/
 docs/__pycache__/
