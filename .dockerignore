@@ -4,6 +4,7 @@
 .env
 .env_encoded
 .env.*
+secrets/
 data/
 tmp/
 docs/

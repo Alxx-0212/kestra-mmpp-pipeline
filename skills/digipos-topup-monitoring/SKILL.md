@@ -1,6 +1,6 @@
 ---
 name: digipos-topup-monitoring
-description: Download DigiPOS CMS (digipos-cms.finpay.id) Monitoring Top Up data per cluster for a custom date range via the JSON API, output CSV for the Finpay Top Up Kestra pipeline. Trigger-based (finance-initiated), not scheduled.
+description: Download DigiPOS CMS (digipos-cms.finpay.id) Monitoring Top Up data per cluster for a custom date range via the JSON API, output CSV for the FinPay Top-Up Kestra pipeline. Used by finance-triggered and scheduled refreshes.
 version: 1.0.0
 tags: [digipos, finpay, topup, monitoring-topup, csv, kestra, trigger]
 ---
@@ -10,9 +10,8 @@ tags: [digipos, finpay, topup, monitoring-topup, csv, kestra, trigger]
 Download **Monitoring Top Up** data from DigiPOS CMS for one or more clusters
 over a **custom date range**, for hand-off to the Finpay Top Up Kestra workflow.
 
-This is the **Top Up** extract. It is NOT the same as `digipos-cms-scraper`
-(which pulls `monitoring-riwayat` / Riwayat Saldo Transaksi). Different endpoint,
-different columns, different downstream.
+This is the active **Top Up** extract. Browser-based Riwayat Saldo Transaksi
+acquisition is historical and is not part of the active Top-Up runtime.
 
 ## Target
 
@@ -128,16 +127,11 @@ This skill is invoked on demand (finance triggers it), not on a schedule:
 The server is behind a VPN, so Google Sheets cannot webhook INTO Kestra. Use the
 **poll (egress) pattern**: Hermes/server pulls the Sheet, never inbound.
 
-## Differences vs digipos-cms-scraper
+## Active workflow boundary
 
-| | digipos-cms-scraper | digipos-topup-monitoring |
-|---|---|---|
-| Menu | monitoring-riwayat | monitoring-topup-detail |
-| Method | Playwright browser | requests JSON API |
-| Format | Excel (.xlsx) | CSV |
-| Columns | saldo movement (No, Saldo Awal, Kredit, Debet, Saldo Akhir, Nomor RS...) | topup (trxdate, sender, receiver, tipe, amount, remarks) |
-| Trigger | scheduled (cron) | trigger-based (finance) |
-| Downstream | Kestra v5 riwayat saldo | Kestra Top Up pipeline |
+This skill serves the `finance.finpay.finpay_topup_pipeline_v1` Kestra flow. The
+flow owns staging, validation, hash deduplication, verification, and review;
+this skill owns only authenticated Monitoring Top Up API extraction.
 
 ## Pitfalls
 

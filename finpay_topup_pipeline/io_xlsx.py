@@ -1,6 +1,7 @@
 import openpyxl
 
 from .io_csv import parse_amount, parse_transaction_date
+from .legacy_outlet import row_outlet_candidates
 
 
 def _header_map(headers):
@@ -23,6 +24,7 @@ def parse_morowali_xlsx(path, default_cluster_id="MOROWALI"):
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     txns = []
     openings = []
+    errors = []
     for ws in wb.worksheets:
         rows = list(ws.iter_rows(values_only=True))
         if not rows:
@@ -35,15 +37,28 @@ def parse_morowali_xlsx(path, default_cluster_id="MOROWALI"):
         type_i = hm.get("transaction type")
         remarks_i = hm.get("remarks")
         cluster_i = hm.get("cluster")
+        outlet_i = next(
+            (hm.get(name) for name in ("outlet", "outlet name", "location", "lokasi", "lokasi outlet") if name in hm),
+            None,
+        )
         saldo_i = hm.get("saldo")
         setor_i = hm.get("setor")
         topup_i = hm.get("topup")
         kredit_i = hm.get("kredit")
         debit_i = hm.get("debit")
-        for r in rows[1:]:
+        for row_number, r in enumerate(rows[1:], 2):
             if r is None:
                 continue
-            tdate = parse_transaction_date(_cell(r, date_i))
+            try:
+                tdate = parse_transaction_date(_cell(r, date_i))
+            except (TypeError, ValueError) as exc:
+                errors.append({
+                    "sheet": ws.title,
+                    "row": row_number,
+                    "error": str(exc),
+                    "value": str(_cell(r, date_i)),
+                })
+                continue
             ttype = (str(_cell(r, type_i) or "")).strip()
             canonical_type = {"debit": "Debit", "kredit": "Kredit"}.get(ttype.lower())
             saldo_raw = _cell(r, saldo_i)
@@ -60,6 +75,16 @@ def parse_morowali_xlsx(path, default_cluster_id="MOROWALI"):
                     amount = parse_amount(_cell(r, debit_i))
             cluster_id = (str(_cell(r, cluster_i)).strip() if _cell(r, cluster_i) else None) or default_cluster_id
             remarks = (str(_cell(r, remarks_i)).strip() if _cell(r, remarks_i) else None)
+            outlet_candidates = row_outlet_candidates(r, remarks_i, cluster_id, outlet_i)
+            outlet_labels = {candidate[0] for candidate in outlet_candidates}
+            outlet_label = next(iter(outlet_labels)) if len(outlet_labels) == 1 else None
+            outlet_confidence = (
+                "exact"
+                if outlet_label and all(candidate[1] == "exact" for candidate in outlet_candidates)
+                else "derived"
+                if outlet_label
+                else None
+            )
             saldo_val = parse_amount(saldo_raw)
             if amount is not None and canonical_type is not None:
                 txns.append({
@@ -72,6 +97,10 @@ def parse_morowali_xlsx(path, default_cluster_id="MOROWALI"):
                     "currency": "IDR",
                     "remarks": remarks,
                     "saldo": saldo_val,
+                    "outlet_label": outlet_label,
+                    "outlet_raw": outlet_candidates[0][2] if len(outlet_candidates) == 1 else None,
+                    "outlet_confidence": outlet_confidence,
+                    "outlet_ambiguous": sorted(outlet_labels) if len(outlet_labels) > 1 else [],
                 })
             elif saldo_val is not None and tdate is not None and amount is None:
                 openings.append({
@@ -80,4 +109,4 @@ def parse_morowali_xlsx(path, default_cluster_id="MOROWALI"):
                     "opening_balance": saldo_val,
                     "note": remarks,
                 })
-    return {"txns": txns, "openings": openings}
+    return {"txns": txns, "openings": openings, "errors": errors}

@@ -15,6 +15,13 @@ def _conn():
     return psycopg.connect(_dsn())
 
 
+def assert_disposable_database(conn):
+    if conn.info.dbname != "finpay_test":
+        raise RuntimeError(
+            "Refusing destructive top-up tests outside database finpay_test"
+        )
+
+
 class RequiresPostgres(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

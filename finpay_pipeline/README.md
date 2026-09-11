@@ -13,7 +13,7 @@ Postgres, and writes reports to Google Sheets.
 The active flow is:
 
 ```text
-finpay_pipeline.yml
+workflows/finpay_pipeline.yml
 id: finpay_daily_pipeline_v5
 namespace: finance.finpay
 ```
@@ -21,12 +21,11 @@ namespace: finance.finpay
 Kestra tasks run the Docker image `finpay-pipeline:3.11` and import Python with:
 
 ```python
-from pipeline import ...
+from finpay_pipeline import ...
 ```
 
-`pipeline.py` re-exports `finpay_pipeline`. Keep this compatibility layer unless
-every Kestra import is updated. `pipeline_refactored.py` is also a compatibility
-shim for older local scripts and notebooks.
+`pipeline.py` and `pipeline_refactored.py` remain package-local compatibility
+shims for older callers; new Kestra code imports `finpay_pipeline` directly.
 
 ### Current Invocation And Inputs
 
@@ -54,7 +53,7 @@ date.
 An unconfigured cluster, non-matching filename, or legacy `.xls` file fails
 before processing. Convert `.xls` exports to CSV or XLSX first.
 
-Current cluster routing is embedded in `finpay_pipeline.yml`:
+Current cluster routing is embedded in `workflows/finpay_pipeline.yml`:
 
 | Cluster ID | Base worksheet | Spreadsheet | Default starting balance |
 |---|---|---|---:|
@@ -71,7 +70,7 @@ execution date.
 
 ## Editing Rules
 
-- Keep changes aligned with the workflow task boundaries in `finpay_pipeline.yml`.
+- Keep changes aligned with the workflow task boundaries in `workflows/finpay_pipeline.yml`.
 - Do not put secrets, emails, spreadsheet IDs, or credentials in committed code.
   Runtime workflow values are passed through Kestra secrets, commonly from
   base64 values in local `.env_encoded`.
@@ -578,23 +577,22 @@ Google Sheets upload tasks also use exponential retry.
 
 For both categories the current retry policy starts at 15 seconds, caps at 60
 seconds, and allows three attempts. PostgreSQL tasks do not declare an explicit
-Kestra retry policy. The flow-level error task currently writes execution details
-to logs only; it does not send a production failure alert. Treat retry,
-notification, and same-date concurrency controls as required release work before
-increasing execution frequency or automating file ingestion.
+Kestra retry policy. Treat retry, notification, and same-date concurrency
+controls as release contracts before increasing execution frequency or
+automating file ingestion.
 
 ## Testing Checklist
 
-Run the dependency-free workflow contract checks on any host Python. Run FinPay
-behavior tests with Python 3.11 and all dependencies from `requirements.txt`:
+Run FinPay behavior tests with Python 3.11 and the package manifest at
+`finpay_pipeline/requirements.txt`:
 
 ```bash
-python3 -m unittest -v tests.test_finpay_workflow_contracts
+python3.11 -m unittest discover -s finpay_pipeline/tests
 docker run --rm \
   -e PYTHONPYCACHEPREFIX=/tmp/finpay-pycache \
   -v "$PWD:/workspace:ro" -w /workspace \
   finpay-pipeline:3.11 \
-  python -m unittest -v tests.test_refactor_contracts
+  python -m unittest discover -s finpay_pipeline/tests
 git diff --check
 git diff --cached --check
 ```
@@ -606,17 +604,17 @@ dependency or zero executed FinPay behavior tests is a failed validation.
 When dependencies or Docker-copied source files change, rebuild:
 
 ```bash
-docker build -t finpay-pipeline:3.11 .
+docker build -f finpay_pipeline/Dockerfile -t finpay-pipeline:3.11 .
 ```
 
 Keep the root `.dockerignore` protections in place before building. When the
 workflow changes, also validate it against the same Kestra version deployed
-on-premises and smoke-test all `from pipeline import ...` symbols in the image.
+on-premises and smoke-test all `from finpay_pipeline import ...` symbols in the image.
 The repository provides a secret-free, in-memory local validator configuration:
 
 ```bash
 docker run --rm \
-  -v "$PWD/finpay_pipeline.yml:/flows/finpay_pipeline.yml:ro" \
+  -v "$PWD/finpay_pipeline/workflows/finpay_pipeline.yml:/flows/finpay_pipeline.yml:ro" \
   -v "$PWD/config/kestra-validation.yml:/validation.yml:ro" \
   kestra/kestra:v1.3.26 \
   flow validate /flows --local --config /validation.yml

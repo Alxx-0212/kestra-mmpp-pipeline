@@ -1,4 +1,7 @@
-## Before starting any task
-1. Scan Skills: Review .kilo/skills/. If a skill matches the task, read its full SKILL.md to understand its syntax and requirements before writing code.
-2. Check MCP Tools: Review connected MCPs. If a tool fits this task's category (API, DB, service), prefer it over ad hoc scripting. Verify its exact parameters and syntax before calling it.
-3. Declare: State briefly which skill/tool you will use (and its required parameters), or that none applied, before starting work.
+# Task Preflight
+
+1. Read the root [`AGENTS.md`](AGENTS.md) and the closest project guide before editing.
+2. Apply the configured Ponytail skill and scan `.kilo/skills/` for task-specific guidance.
+3. Review connected MCPs. Prefer a relevant MCP for API, database, service, or library documentation; use Context7 for library syntax and the Kestra MCP for Kestra contracts.
+4. Declare the lane, secondary skills/MCPs, and exact file allowlist in the first progress update.
+5. Start with read-only discovery and `git status --short`; preserve unrelated dirty work.

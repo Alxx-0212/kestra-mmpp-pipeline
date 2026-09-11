@@ -70,10 +70,6 @@ def cmd_extract(args):
     print(res)
 
 
-def cmd_refresh_service(args):
-    refresh_service.main()
-
-
 def cmd_restore_dashboard_data(args):
     import json
 
@@ -145,9 +141,6 @@ def main(argv=None):
     ex.add_argument("--output-dir", default="finpay-topup-inbox")
     ex.add_argument("--password", default=None)
     ex.set_defaults(func=cmd_extract)
-
-    rs = sub.add_parser("refresh-service")
-    rs.set_defaults(func=cmd_refresh_service)
 
     rd = sub.add_parser("restore-dashboard-data")
     rd.add_argument("--legacy-xlsx", default="data/FINPAY MOROWALI.xlsx")

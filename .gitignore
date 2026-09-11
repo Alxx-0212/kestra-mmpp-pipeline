@@ -7,7 +7,8 @@ __pycache__/
 data/
 .idea/
 main.ipynb
-docs/
+docs/context7/
+docs/__pycache__/
 
 # Local dbt learning/runtime artifacts
 .venv-dbt/

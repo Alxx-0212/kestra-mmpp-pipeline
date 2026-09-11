@@ -4,9 +4,11 @@ from datetime import datetime, timezone
 
 import psycopg
 
+from finpay_topup_pipeline.tests.conftest import assert_disposable_database
 from finpay_topup_pipeline.config import (
     dsn_from_env,
     TABLE_TXN,
+    TABLE_TXN_STAGING,
     TABLE_CLASS,
     TABLE_BALANCE,
     TABLE_REFRESH,
@@ -23,6 +25,7 @@ from finpay_topup_pipeline.io_xlsx import parse_morowali_xlsx
 from finpay_topup_pipeline.audit import start_refresh
 from finpay_topup_pipeline.bucket import BucketTopupSnapshot
 from finpay_topup_pipeline.verify import verify_bucket_topup_values
+from finpay_topup_pipeline.review import approve_refresh
 
 
 def _dsn():
@@ -34,6 +37,7 @@ class IntegrationDbTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.conn = psycopg.connect(_dsn(), connect_timeout=10)
+        assert_disposable_database(cls.conn)
         ensure_schema(cls.conn)
         cls._truncate()
 
@@ -46,7 +50,7 @@ class IntegrationDbTest(unittest.TestCase):
         cls.conn.rollback()
         with cls.conn.cursor() as cur:
             cur.execute(
-                f"TRUNCATE {TABLE_TXN}, {TABLE_CLASS}, {TABLE_BALANCE}, {TABLE_REFRESH} "
+                f"TRUNCATE {TABLE_TXN}, {TABLE_TXN_STAGING}, {TABLE_CLASS}, {TABLE_BALANCE}, {TABLE_REFRESH} "
                 f"RESTART IDENTITY CASCADE"
             )
         cls.conn.commit()
@@ -169,8 +173,10 @@ class IntegrationDbTest(unittest.TestCase):
         first = verify_bucket_topup_values(
             self.conn, refresh_id, [bucket], verification_attempt=1
         )
-        self.assertEqual(first["status"], "VERIFY_FAILED")
-        self.assertEqual(first["clusters"][cluster_id]["verification_diff"], 300000.0)
+        self.assertEqual(first["status"], "MISMATCH")
+        # The first CMS snapshot is before the downloaded transaction timestamp,
+        # so timestamp-bounded verification reports the full missing movement.
+        self.assertEqual(first["clusters"][cluster_id]["verification_diff"], 4232515.0)
 
         retry_extract = load_rows(
             self.conn,
@@ -187,8 +193,16 @@ class IntegrationDbTest(unittest.TestCase):
             "retry.csv",
         )
         self.assertEqual(retry_extract["inserted"], 1)
+        late_bucket = BucketTopupSnapshot(
+            bucket.username,
+            bucket.cluster_id,
+            bucket.value,
+            bucket.text,
+            datetime(2026, 8, 18, 13, 6, 0, tzinfo=timezone.utc),
+            bucket.url,
+        )
         second = verify_bucket_topup_values(
-            self.conn, refresh_id, [bucket], verification_attempt=2
+            self.conn, refresh_id, [late_bucket], verification_attempt=2
         )
         self.assertEqual(second["status"], "VERIFIED")
         self.assertEqual(second["clusters"][cluster_id]["computed_saldo"], 64604585.0)
@@ -201,12 +215,27 @@ class IntegrationDbTest(unittest.TestCase):
                 f"WHERE r.refresh_id = %s",
                 (refresh_id,),
             ).fetchone()
-        self.assertEqual(status[0], "VERIFIED")
+        self.assertEqual(status[0], "PENDING_REVIEW")
         self.assertEqual(status[1], "VERIFIED")
         self.assertEqual(status[2], 2)
         self.assertEqual(status[3], 64604585)
         self.assertEqual(status[4], 64604585)
         self.assertEqual(status[5], 0)
+        match_hash = second["clusters"][cluster_id]["matching_row_hash"]
+        self.assertIsNotNone(match_hash)
+        self.assertEqual(approve_refresh(self.conn, refresh_id, "reviewer")["status"], "COMMITTED")
+        with self.conn.cursor() as cur:
+            matched = cur.execute(
+                f"SELECT matching_transaction_id, matching_row_hash "
+                f"FROM {TABLE_REFRESH_CLUSTER} WHERE refresh_id = %s AND cluster_id = %s",
+                (refresh_id, cluster_id),
+            ).fetchone()
+            ledger_match = cur.execute(
+                f"SELECT txn_id FROM {TABLE_TXN} WHERE row_hash = %s",
+                (match_hash,),
+            ).fetchone()
+        self.assertEqual(matched[1], match_hash)
+        self.assertEqual(matched[0], ledger_match[0])
 
     def test_backfill_and_running_saldo_matches_legacy(self):
         self._truncate()

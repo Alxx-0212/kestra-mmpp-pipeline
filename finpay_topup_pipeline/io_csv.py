@@ -1,11 +1,13 @@
 import hashlib
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import csv
 
 
 TRANSACTION_TYPES = {"Kredit", "Debit"}
+LOCAL_TZ = ZoneInfo("Asia/Makassar")
 CSV_COLUMNS = {
     "No",
     "Transaction Date",
@@ -37,12 +39,12 @@ def parse_transaction_date(raw):
     s = str(raw).strip().replace("T", " ")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
         try:
-            return datetime.strptime(s, fmt)
+            return datetime.strptime(s, fmt).replace(tzinfo=LOCAL_TZ)
         except ValueError:
             continue
     digits = "".join(ch for ch in s if ch.isdigit())
     if len(digits) >= 8:
-        return datetime.strptime(digits[:10], "%Y%m%d%H")
+        return datetime.strptime(digits[:10], "%Y%m%d%H").replace(tzinfo=LOCAL_TZ)
     raise ValueError(f"Unparseable transaction date: {raw!r}")
 
 
@@ -50,6 +52,11 @@ def parse_topup_csv(path):
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames:
+            reader.fieldnames = [
+                (field or "").lstrip("\ufeff").strip().strip('"')
+                for field in reader.fieldnames
+            ]
         missing = CSV_COLUMNS - set(reader.fieldnames or [])
         if missing:
             raise ValueError(f"Top Up CSV missing columns: {sorted(missing)}")

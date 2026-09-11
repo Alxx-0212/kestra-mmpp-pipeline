@@ -1,7 +1,8 @@
 # Codex lane manager command reference
 
-`scripts/codex-lanes` manages three isolated Codex development lanes for this
-repository:
+`scripts/codex-lanes` manages the three isolated Codex worktrees currently
+configured for this repository. FinPay Top-Up and Telegram remain separate
+ownership lanes but do not have dedicated launcher worktrees yet.
 
 | Lane | Default branch | Default checkout |
 |---|---|---|
@@ -74,7 +75,7 @@ scripts/codex-lanes start --linkaja-picker
 The LinkAja window runs `codex fork --all`, allowing selection from sessions
 created in other working directories. After selecting the conversation, tell
 it to continue on `agent/linkaja-next` using
-`linkaja_fee_pipeline/LINKAJA_REVERSAL_IMPLEMENTATION_PLAN.md` as the durable
+`linkaja_fee_pipeline/docs/plans/reversal-close.md` as the durable
 plan.
 
 #### Start LinkAja without previous chat context
@@ -155,8 +156,10 @@ The allowlists are:
 
 | Lane | Allowed paths |
 |---|---|
-| FinPay | `finpay_pipeline/**`, `finpay_pipeline.yml`, `pipeline.py`, `pipeline_refactored.py`, `Dockerfile`, `requirements.txt`, `tests/test_refactor_contracts.py`, `tests/test_finpay_workflow_contracts.py` |
-| LinkAja | `linkaja_fee_pipeline/**`, `linkaja_fee_pipeline.yml`, `linkaja_monthly_materialization.yml`, `linkaja_pipeline.py`, `Dockerfile.linkaja`, `requirements-linkaja.txt`, `tests/test_linkaja_*.py` |
+| FinPay reporting | `finpay_pipeline/**`, related reporting tests |
+| FinPay Top-Up | `finpay_topup_pipeline/**`, related Top-Up tests |
+| Telegram | `services/telegram_bot/**`, related bot tests |
+| LinkAja | `linkaja_fee_pipeline/**`, related LinkAja tests |
 
 Run the relevant check before asking the integrator to review or integrate a
 domain branch. Passing this check verifies file ownership only; it does not run

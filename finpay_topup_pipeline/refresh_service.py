@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 
 DEFAULT_USERS = ["411311_A", "421306_A", "421307_A", "421315_A", "421318_A", "421320_A"]
+CLUSTER_USERS = {user[:-2]: user for user in DEFAULT_USERS}
+REFRESH_MODES = frozenset({"FULL", "AUTO_CLUSTER", "AUTO_ALL"})
 DEFAULT_TIMEZONE = "Asia/Makassar"
 
 
@@ -37,7 +40,7 @@ def normalize_window(start, end, today=None):
 
 
 def _multipart_form(fields):
-    boundary = "finpay-topup-refresh-boundary"
+    boundary = "finpay-topup-boundary"
     body = bytearray()
     for key, value in fields.items():
         body.extend(f"--{boundary}\r\n".encode("utf-8"))
@@ -65,19 +68,51 @@ def submit_kestra_refresh(
     users,
     dry_run=False,
     requested_by="finance",
+    trigger_source="refresh_service",
+    verify_bucket_topup=True,
+    refresh_mode="FULL",
+    checkpoint_dates=None,
     api_token=None,
     basic_user=None,
     basic_password=None,
     timeout=30,
 ):
+    users = [str(user).strip() for user in users]
     fields = {
         "start": start,
         "end": end,
         "users": " ".join(users),
         "dry_run": "true" if dry_run else "false",
         "requested_by": requested_by,
-        "trigger_source": "refresh_service",
+        "trigger_source": trigger_source,
+        "verify_bucket_topup": "true" if verify_bucket_topup else "false",
     }
+    if refresh_mode is not None:
+        refresh_mode = str(refresh_mode).strip().upper()
+        if refresh_mode not in REFRESH_MODES:
+            raise ValueError(f"unsupported refresh mode: {refresh_mode!r}")
+        if refresh_mode == "AUTO_CLUSTER" and (
+            len(users) != 1 or users[0] not in CLUSTER_USERS.values()
+        ):
+            raise ValueError("AUTO_CLUSTER requires one configured DigiPOS user")
+        if refresh_mode == "AUTO_ALL" and (
+            len(users) != len(DEFAULT_USERS) or set(users) != set(DEFAULT_USERS)
+        ):
+            raise ValueError("AUTO_ALL requires all configured DigiPOS users")
+        fields["refresh_mode"] = refresh_mode
+        if checkpoint_dates is not None:
+            fields["checkpoint_dates"] = json.dumps(
+                {
+                    str(cluster_id): (
+                        value.isoformat()
+                        if hasattr(value, "isoformat")
+                        else str(value)
+                    )
+                    for cluster_id, value in checkpoint_dates.items()
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
     body, content_type = _multipart_form(fields)
     req = urllib.request.Request(
         kestra_execution_url(base_url, namespace, flow_id),
@@ -97,6 +132,33 @@ def submit_kestra_refresh(
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         return {"status_code": exc.code, "body": raw, "json": _loads_json(raw)}
+    except urllib.error.URLError as exc:
+        return _unreachable_result(getattr(exc, "reason", None) or exc)
+    except OSError as exc:
+        # socket.timeout / connection resets raised outside URLError.
+        return _unreachable_result(exc)
+
+
+def _sanitized_reason(exc):
+    """Bounded single-line detail; never contains request headers or credentials."""
+    text = " ".join(str(exc).split())
+    text = re.sub(r"(?i)(basic\s+|bearer\s+)[^\s,;]+", r"\1[redacted]", text)
+    text = re.sub(
+        r"(?i)(authorization|password|passwd|token|secret|credential)\s*[:=]\s*[^\s,;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)(https?://)[^/\s]*:[^/\s@]+@", r"\1[redacted]@", text)
+    text = re.sub(r"(?i)\b[\w.+-]+@[\w.-]+:[^\s,;]+", "[redacted]", text)
+    return text[:200] or "unknown transport error"
+
+
+def _unreachable_result(reason):
+    return {
+        "status_code": 0,
+        "body": f"Kestra unreachable: {_sanitized_reason(reason)}",
+        "json": None,
+    }
 
 
 def _loads_json(raw):
@@ -111,8 +173,8 @@ def execution_id_from_response(result):
     if isinstance(payload, dict):
         for key in ("id", "executionId", "execution_id"):
             value = payload.get(key)
-            if value:
-                return str(value)
+            if value is not None and str(value).strip():
+                return str(value).strip()
     return None
 
 
@@ -332,11 +394,7 @@ class RefreshServer(ThreadingHTTPServer):
 
 
 def main():
-    host = os.environ.get("FINPAY_REFRESH_HOST", "127.0.0.1")
-    port = int(os.environ.get("FINPAY_REFRESH_PORT", "8095"))
-    server = RefreshServer((host, port))
-    print(f"FinPay Top Up refresh service listening on http://{host}:{port}/refresh", flush=True)
-    server.serve_forever()
+    raise SystemExit("Standalone refresh service removed; use the Kestra or Telegram trigger.")
 
 
 if __name__ == "__main__":

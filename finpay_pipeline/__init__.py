@@ -1,6 +1,6 @@
 """Public FinPay pipeline API used by Kestra tasks.
 
-The Kestra workflow imports these names via ``from pipeline import ...``.
+The Kestra workflow imports these names via ``from finpay_pipeline import ...``.
 This package keeps the implementation split by workflow concern while exposing
 the same public function names.
 """

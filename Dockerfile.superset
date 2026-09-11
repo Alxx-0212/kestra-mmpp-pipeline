@@ -1,6 +1,0 @@
-FROM apache/superset:6.1.0
-
-USER root
-RUN . /app/.venv/bin/activate && \
-    uv pip install --no-cache "apache-superset[fastmcp]==6.1.0" psycopg2-binary gevent
-USER superset

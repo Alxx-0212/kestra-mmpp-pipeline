@@ -1,0 +1,45 @@
+name: Publish Telegram Bot Image
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "telegram-bot-v*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/alxx-0212/kestra-mmpp-telegram-bot
+          tags: |
+            type=match,pattern=telegram-bot-v(.*),group=1
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/telegram-bot-v') }}
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/telegram_bot/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

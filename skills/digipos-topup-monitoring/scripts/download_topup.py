@@ -5,8 +5,8 @@ Site:   https://digipos-cms.finpay.id
 Menu:   Deposit -> Monitoring Top Up
 API:    POST /deposit/monitoring-topup-detail  (DataTables JSON, no browser needed)
 
-This is the Top Up extract, NOT the Riwayat Saldo Transaksi extract
-(see digipos-cms-scraper for that). Different endpoint, different columns.
+This is the active Top Up extract, not the historical Riwayat Saldo Transaksi
+extract. It uses a different endpoint and column contract.
 
 Output: one CSV per user under OUTPUT_DIR/{cluster_id}/, named:
     finpay-topup-{cluster_id}(DD-MM-YYYYtoDD-MM-YYYY).csv

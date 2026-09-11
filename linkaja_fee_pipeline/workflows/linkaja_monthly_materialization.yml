@@ -1,0 +1,127 @@
+id: linkaja_monthly_materialization_v1
+namespace: finance.linkaja
+
+inputs:
+  - id: cluster_id
+    type: STRING
+    displayName: "LinkAja cluster ID"
+    description: "The numeric/string cluster ID used by the daily LinkAja CSV workflow."
+    required: true
+
+  - id: report_month
+    type: STRING
+    displayName: "Report month"
+    description: "Month to calculate in YYYY-MM format."
+    required: true
+
+  - id: calculation_cutoff
+    type: STRING
+    displayName: "Calculation cutoff"
+    description: "Exclusive local Asia/Makassar cutoff in ISO format, for example 2026-08-10T00:00:00."
+    required: true
+
+  - id: publish
+    type: BOOLEAN
+    displayName: "Publish monthly snapshot?"
+    description: "false previews the month. true atomically replaces this cluster-month in linkaja_transactions."
+    defaults: false
+
+tasks:
+  - id: calculate_and_optionally_publish_month
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: linkaja-fee-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: mmpp-finance-network
+    pythonVersion: "3.11"
+    timeout: PT30M
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT60S
+      maxAttempts: 3
+    outputFiles:
+      - linkaja_monthly_result.json
+      - linkaja_daily_raw_calculation.csv
+      - linkaja_unresolved_reversals.csv
+    env:
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      REPORT_MONTH: "{{ inputs.report_month }}"
+      CALCULATION_CUTOFF: "{{ inputs.calculation_cutoff }}"
+      MATERIALIZATION_ID: "{{ execution.id }}"
+      PUBLISH: "{{ inputs.publish }}"
+    script: |
+      import os
+      import sys
+      from kestra import Kestra
+
+      sys.path.insert(0, "/app")
+      from linkaja_fee_pipeline import (
+          linkaja_postgres_dsn_from_env,
+          materialize_linkaja_month,
+          migrate_linkaja_database,
+          write_linkaja_monthly_artifacts,
+      )
+
+      try:
+          dsn = linkaja_postgres_dsn_from_env()
+          migration = migrate_linkaja_database(dsn)
+          result = materialize_linkaja_month(
+              dsn=dsn,
+              cluster_id=os.environ["CLUSTER_ID"],
+              report_month=os.environ["REPORT_MONTH"],
+              calculation_cutoff=os.environ["CALCULATION_CUTOFF"],
+              materialization_id=os.environ["MATERIALIZATION_ID"],
+              publish=os.environ.get("PUBLISH", "false").lower() == "true",
+          )
+      except Exception as exc:
+          print(
+              f"❌ LinkAja monthly materialization failed: {exc}",
+              file=sys.stderr,
+          )
+          sys.exit(1)
+
+      write_linkaja_monthly_artifacts(
+          result,
+          result_path="linkaja_monthly_result.json",
+          daily_path="linkaja_daily_raw_calculation.csv",
+          unresolved_path="linkaja_unresolved_reversals.csv",
+      )
+      action = "published" if result["published"] else "previewed"
+      print(f"✅ Current schema version : {migration['current_version']}")
+      print(f"✅ Month {action}         : {result['report_month']}")
+      print(f"🗂  Cluster               : {result['cluster_id']}")
+      print(f"⏱  Calculation cutoff    : {result['calculation_cutoff']}")
+      print(f"📊 Transaction rows      : {result['transaction_rows']}")
+      print(f"📅 Daily raw rows        : {len(result['daily_rows'])}")
+      print(
+          "⚠️  Unresolved reversals : "
+          f"{result['unresolved_reversal_count']}"
+      )
+      print(f"💰 Fee summary rows      : {len(result['fee_rows'])}")
+      print(
+          "⚠️  Incomplete fee rows  : "
+          f"{result['incomplete_fee_rows']}"
+      )
+      Kestra.outputs({
+          "schema_version": migration["current_version"],
+          "applied_schema_versions": migration["applied_versions"],
+          "cluster_id": result["cluster_id"],
+          "report_month": result["report_month"],
+          "calculation_cutoff": result["calculation_cutoff"],
+          "materialization_id": result["materialization_id"],
+          "published": result["published"],
+          "transaction_rows": result["transaction_rows"],
+          "daily_rows": len(result["daily_rows"]),
+          "unresolved_reversal_count":
+              result["unresolved_reversal_count"],
+          "incomplete_fee_rows": result["incomplete_fee_rows"],
+          "monthly_payable_complete":
+              result["monthly_payable_complete"],
+          "fee_rows": len(result["fee_rows"]),
+      })

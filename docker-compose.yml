@@ -1,6 +1,6 @@
 # MMPP finance local stack
 # Shared network: mmpp-finance-network
-# Single PostgreSQL instance hosting: kestra, finpay, finpay_txn, superset, linkaja, grist
+# Single PostgreSQL instance hosting: kestra, finpay, finpay_txn, linkaja
 # Secret management: Docker Secrets (files in ./secrets/)
 
 services:
@@ -8,7 +8,7 @@ services:
   # - kestra:      Kestra metadata (workflows, executions, queue)
   # - finpay:      FinPay Top Up + reconciliation data (existing contract DB)
   # - finpay_txn:  FinPay Transaction processing data (new, separate from top-up)
-  # - superset:    Superset metadata database (charts, dashboards, users)
+  # - superset/grist: optional dashboard metadata (disabled by default profile)
   # - linkaja:     LinkAja fee pipeline data (future)
   # - grist:       Grist metadata database
   postgres:
@@ -36,8 +36,8 @@ services:
       LINKAJA_DB_NAME: ${LINKAJA_DB_NAME}
       LINKAJA_DB_USER: ${LINKAJA_DB_USER}
       LINKAJA_DB_PASSWORD_FILE: /run/secrets/linkaja_db_password
-      GRIST_DB_NAME: ${GRIST_DB_NAME}
-      GRIST_DB_USER: ${GRIST_DB_USER}
+      GRIST_DB_NAME: ${GRIST_DB_NAME:-grist}
+      GRIST_DB_USER: ${GRIST_DB_USER:-grist}
       GRIST_DB_PASSWORD_FILE: /run/secrets/grist_db_password
       FINPAY_READONLY_PASSWORD_FILE: /run/secrets/finpay_readonly_password
     ports:
@@ -56,7 +56,70 @@ services:
       - grist_db_password
       - finpay_readonly_password
 
+  # Idempotent Top-Up schema/foundation setup. It never imports legacy rows.
+  finpay-topup-db-init:
+    build:
+      context: .
+      dockerfile: finpay_topup_pipeline/Dockerfile
+    image: finpay-topup-pipeline:3.11
+    pull_policy: never
+    restart: "no"
+    networks:
+      - mmpp-finance-network
+    environment:
+      FINPAY_DB_HOST: postgres
+      FINPAY_DB_PORT: "5432"
+      FINPAY_DB_NAME: ${FINPAY_DB_NAME}
+      FINPAY_DB_USER: ${FINPAY_DB_USER}
+      FINPAY_DB_PASSWORD_FILE: /run/secrets/finpay_db_password
+    command: ["python", "-m", "finpay_topup_pipeline.bootstrap"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      finpay-db-provision:
+        condition: service_completed_successfully
+    secrets:
+      - finpay_db_password
+
+  # Idempotently creates project roles/databases even when the Postgres volume
+  # predates the initdb scripts. It never deletes or resets existing data.
+  finpay-db-provision:
+    image: postgres:18.4
+    pull_policy: if_not_present
+    restart: "no"
+    networks:
+      - mmpp-finance-network
+    environment:
+      KESTRA_POSTGRES_DB: ${KESTRA_POSTGRES_DB}
+      KESTRA_POSTGRES_USER: ${KESTRA_POSTGRES_USER}
+      FINPAY_DB_NAME: ${FINPAY_DB_NAME}
+      FINPAY_DB_USER: ${FINPAY_DB_USER}
+      FINPAY_TXN_DB_NAME: ${FINPAY_TXN_DB_NAME}
+      FINPAY_TXN_DB_USER: ${FINPAY_TXN_DB_USER}
+      LINKAJA_DB_NAME: ${LINKAJA_DB_NAME}
+      LINKAJA_DB_USER: ${LINKAJA_DB_USER}
+      SUPERSET_DB_NAME: ${SUPERSET_DB_NAME}
+      SUPERSET_DB_USER: ${SUPERSET_DB_USER}
+      GRIST_DB_NAME: ${GRIST_DB_NAME:-grist}
+      GRIST_DB_USER: ${GRIST_DB_USER:-grist}
+    volumes:
+      - ./docker/provision/01-provision-databases.sh:/usr/local/bin/provision-databases.sh:ro
+    command: ["bash", "/usr/local/bin/provision-databases.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - kestra_postgres_password
+      - finpay_db_password
+      - finpay_txn_db_password
+      - superset_db_password
+      - linkaja_db_password
+      - grist_db_password
+      - finpay_readonly_password
+
   redis:
+    # Disabled by default; enable with --profile optional-dashboard.
+    profiles: ["optional-dashboard"]
     image: redis:7-alpine
     networks:
       - mmpp-finance-network
@@ -75,7 +138,19 @@ services:
       - mmpp-finance-network
     stop_grace_period: 6m
     user: "root"
-    command: server standalone
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${KESTRA_LOCAL_MODE:-true}" = "true" ]; then
+          # The local Docker network is named postgres; env_file may retain a
+          # production hostname. The alert alias keeps the flow contract stable.
+           export SECRET_FINPAY_DB_HOST=cG9zdGdyZXM=
+           export SECRET_TELEGRAM_ALERT_CHAT_ID="$${SECRET_TELEGRAM_ALERT_CHAT_ID:-$${SECRET_TELEGRAM_CHAT_ID:-}}"
+         fi
+         if [ -r /run/secrets/telegram_bot_token ]; then
+           export SECRET_FINPAY_TELEGRAM_BOT_TOKEN="$$(tr -d '\r\n' < /run/secrets/telegram_bot_token | base64 | tr -d '\n')"
+         fi
+         exec /app/kestra server standalone
     volumes:
       - kestra-data:/app/storage
       - /var/run/docker.sock:/var/run/docker.sock
@@ -83,6 +158,7 @@ services:
     env_file:
       - .env_encoded
     environment:
+      KESTRA_LOCAL_MODE: ${KESTRA_LOCAL_MODE:-true}
       KESTRA_CONFIGURATION: |
         datasources:
           postgres:
@@ -118,11 +194,49 @@ services:
                 values:
                   volumeEnabled: true
                   networkMode: mmpp-finance-network
+              - type: io.kestra.plugin.core.trigger.Schedule
+                values:
+                  recoverMissedSchedules: NONE
     ports:
       - "8081:8080"
     depends_on:
       postgres:
         condition: service_healthy
+      finpay-topup-db-init:
+        condition: service_completed_successfully
+    secrets:
+      - kestra_basic_auth_password
+      - telegram_bot_token
+
+  # Deploy the reviewed Top-Up flow after Kestra is reachable. This is
+  # idempotent and creates no execution; it closes the clean-volume gap where
+  # Kestra starts with only tutorial flows loaded.
+  finpay-topup-flow-deploy:
+    image: kestra/kestra:v1.3.26
+    pull_policy: if_not_present
+    restart: "no"
+    user: "0:0"
+    networks:
+      - mmpp-finance-network
+    volumes:
+      - ./finpay_topup_pipeline/workflows:/flows:ro
+    environment:
+      KESTRA_BASIC_AUTH_USERNAME: ${KESTRA_BASIC_AUTH_USERNAME}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        password="$$(tr -d '\r\n' < /run/secrets/kestra_basic_auth_password)"
+        until curl --fail --silent http://kestra:8080/ >/dev/null; do
+          sleep 2
+        done
+        /app/kestra flow updates /flows --no-delete --namespace=finance.finpay \
+          --server=http://kestra:8080 \
+          --user="$${KESTRA_BASIC_AUTH_USERNAME}:$${password}"
+        echo "event=finpay_topup_flow_deploy status=success"
+    depends_on:
+      kestra:
+        condition: service_started
     secrets:
       - kestra_basic_auth_password
 
@@ -130,15 +244,17 @@ services:
   # Superset Webserver: Gunicorn production server
   # ─────────────────────────────────────────────────────────────────
   superset:
+    profiles: ["optional-dashboard"]
+    # Enable with: docker compose --profile optional-dashboard up -d superset
     build:
       context: .
-      dockerfile: Dockerfile.superset
+      dockerfile: services/superset/Dockerfile
     image: mmpp-superset:6.1.0-postgres-mcp
     networks:
       - mmpp-finance-network
     volumes:
       - superset-home:/app/superset_home
-      - ./config/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./services/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
     environment:
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
       # Core
@@ -222,12 +338,14 @@ services:
   #  - Healthcheck on /mcp endpoint via JSON-RPC initialize
   # ─────────────────────────────────────────────────────────────────
   superset-mcp:
+    profiles: ["optional-dashboard"]
+    # Enable with: docker compose --profile optional-dashboard up -d superset-mcp
     image: mmpp-superset:6.1.0-postgres-mcp
     networks:
       - mmpp-finance-network
     volumes:
       - superset-home:/app/superset_home
-      - ./config/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./services/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
     environment:
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
       SUPERSET_SECRET_KEY_FILE: /run/secrets/superset_secret_key
@@ -266,6 +384,8 @@ services:
   # Grist: Excel-like spreadsheet-database for finance dashboards
   # ─────────────────────────────────────────────────────────────────
   grist:
+    profiles: ["optional-dashboard"]
+    # Enable with: docker compose --profile optional-dashboard up -d grist
     image: gristlabs/grist:1.7.17
     networks:
       - mmpp-finance-network
@@ -277,9 +397,9 @@ services:
       - GRIST_DEFAULT_EMAIL=finance@mmpp.local
       - GRIST_DB_NAME=grist
       - GRIST_DB_USER=grist
-      - GRIST_BOOT_KEY=f0ogWd4MiWByPXdlDlwOYfbhFjUOb1eQyBzqi303nXI=
-      - GRIST_DB_PASSWORD=oRLvBCtbt/1Z/357HZMZmt576rTDU2nNd0gNJrgrpOw=
-      - DATABASE_URL=postgresql://grist:oRLvBCtbt/1Z/357HZMZmt576rTDU2nNd0gNJrgrpOw=@postgres:5432/grist
+      - GRIST_BOOT_KEY=${GRIST_BOOT_KEY:-}
+      - GRIST_DB_PASSWORD=${GRIST_DB_PASSWORD:-}
+      - DATABASE_URL=postgresql://${GRIST_DB_USER:-grist}:${GRIST_DB_PASSWORD:-}@postgres:5432/${GRIST_DB_NAME:-grist}
     command: ./sandbox/run.sh
     ports:
       - "8484:8484"
@@ -291,6 +411,133 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+
+  # ─────────────────────────────────────────────────────────────────
+  # Telegram Kredit classification bot: webhook receiver + walkthrough
+  #  - Public HTTPS required in prod; use a tunnel or TLS reverse proxy
+  #  - setWebhook must pass the same secret as telegram_webhook_secret
+  # ─────────────────────────────────────────────────────────────────
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: services/telegram_bot/Dockerfile
+    image: mmpp-telegram-bot:local
+    pull_policy: never
+    restart: unless-stopped
+    networks:
+      - mmpp-finance-network
+    environment:
+      FINPAY_DB_HOST: postgres
+      FINPAY_DB_PORT: "5432"
+      FINPAY_DB_NAME: ${FINPAY_DB_NAME}
+      FINPAY_DB_USER: ${FINPAY_DB_USER}
+      FINPAY_DB_PASSWORD_FILE: /run/secrets/finpay_db_password
+      # TELEGRAM_BOT_TOKEN -> stored in ./secrets/telegram_bot_token.txt (Docker Secret)
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      # TELEGRAM_WEBHOOK_SECRET -> stored in ./secrets/telegram_webhook_secret.txt (Docker Secret)
+      TELEGRAM_WEBHOOK_SECRET_FILE: /run/secrets/telegram_webhook_secret
+      # Temporary local-only default. Replace both allowlists before production.
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-2142781580}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-2142781580}
+      # The webhook registerer owns the ngrok assigned dev-domain URL.
+      TELEGRAM_BOT_PUBLIC_BASE_URL: ""
+      TELEGRAM_BOT_HOST: 0.0.0.0
+      TELEGRAM_BOT_PORT: "8096"
+      # /refresh submits executions to the existing Kestra flow using the same
+      # global Basic-auth environment values Kestra itself reads from .env.
+      KESTRA_BASE_URL: http://kestra:8080
+      KESTRA_NAMESPACE: ${FINPAY_TOPUP_KESTRA_NAMESPACE:-finance.finpay}
+      KESTRA_FLOW_ID: ${FINPAY_TOPUP_KESTRA_FLOW_ID:-finpay_topup_pipeline_v1}
+      KESTRA_PUBLIC_URL: ${KESTRA_PUBLIC_URL:-}
+      KESTRA_BASIC_AUTH_USERNAME: ${KESTRA_BASIC_AUTH_USERNAME}
+      KESTRA_BASIC_AUTH_PASSWORD: ${KESTRA_BASIC_AUTH_PASSWORD}
+      TELEGRAM_REFRESH_COOLDOWN_SECONDS: ${TELEGRAM_REFRESH_COOLDOWN_SECONDS:-600}
+      TELEGRAM_SELECTIVE_REFRESH_ENABLED: ${TELEGRAM_SELECTIVE_REFRESH_ENABLED:-true}
+    ports:
+      - "8096:8096"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kestra:
+        condition: service_started
+      finpay-topup-db-init:
+        condition: service_completed_successfully
+      finpay-topup-flow-deploy:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8096/healthz', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    secrets:
+      - finpay_db_password
+      - telegram_bot_token
+      - telegram_webhook_secret
+
+  ngrok:
+    # Explicit version tag; use a versioned image rather than a digest here.
+    image: ngrok/ngrok:3.39.8-debian
+    restart: unless-stopped
+    command:
+      - http
+      - http://telegram-bot:8096
+    networks:
+      - mmpp-finance-network
+    ports:
+      - "4041:4040"
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    depends_on:
+      telegram-bot:
+        condition: service_healthy
+
+  # Register the account-assigned ngrok dev domain once; it remains stable
+  # across connector restarts and does not require log parsing.
+  telegram-webhook-register:
+    image: curlimages/curl:8.11.1
+    user: "0:0"
+    restart: "no"
+    networks:
+      - mmpp-finance-network
+    depends_on:
+      telegram-bot:
+        condition: service_healthy
+      ngrok:
+        condition: service_started
+    secrets:
+      - telegram_bot_token
+      - telegram_webhook_secret
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        current_url=""
+        while :; do
+          tunnel_url="$$(curl --silent --show-error http://ngrok:4040/api/tunnels \
+            | sed -n 's/.*"public_url":"\(https:[^"]*\)".*/\1/p' \
+            | head -n 1 || true)"
+          if [ -n "$$tunnel_url" ] && [ "$$tunnel_url" != "$$current_url" ]; then
+            token="$$(cat /run/secrets/telegram_bot_token)"
+            secret="$$(cat /run/secrets/telegram_webhook_secret)"
+            response="$$(curl --silent --show-error \
+              "https://api.telegram.org/bot$${token}/setWebhook" \
+              --data-urlencode "url=$${tunnel_url}/telegram/webhook" \
+              --data-urlencode "secret_token=$${secret}" \
+              --data-urlencode 'allowed_updates=["message","callback_query"]' || true)"
+            case "$$response" in
+              *'"ok":true'*)
+                current_url="$$tunnel_url"
+                echo "Telegram webhook registered for ngrok dev domain"
+                exit 0
+                ;;
+              *)
+                echo "Telegram webhook registration pending" >&2
+                ;;
+            esac
+          fi
+          sleep 5
+        done
 
   # ─────────────────────────────────────────────────────────────────
   # Kestra Orchestration (existing, unchanged)
@@ -334,3 +581,7 @@ secrets:
     file: ./secrets/superset_secret_key.txt
   superset_admin_password:
     file: ./secrets/superset_admin_password.txt
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token.txt
+  telegram_webhook_secret:
+    file: ./secrets/telegram_webhook_secret.txt

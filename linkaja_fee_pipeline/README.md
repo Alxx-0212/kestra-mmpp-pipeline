@@ -7,10 +7,10 @@ database-backed report results, and freeze a monthly close.
 
 The approved read-only Taipy architecture, complete column lineage, report
 contracts, schema suitability assessment, and delivery sequence are in
-[`TAIPY_DASHBOARD_PLAN.md`](TAIPY_DASHBOARD_PLAN.md).
+[`docs/dashboard-plan.md`](docs/dashboard-plan.md).
 
 The reproducible July source-bundle result and finance-readiness assessment are
-in [`JULY_2026_WORKFLOW_TEST_SUMMARY.md`](JULY_2026_WORKFLOW_TEST_SUMMARY.md).
+in [`docs/evidence/july-2026-workflow-replay.md`](docs/evidence/july-2026-workflow-replay.md).
 
 The source export is an account ledger, not one row per business transaction.
 One transaction can have one or more ledger rows because LinkAja reports the
@@ -25,11 +25,11 @@ time and may span weekends, adjustments, late postings, and reversals.
 
 | Workflow | Kestra ID | Purpose |
 |---|---|---|
-| `linkaja_fee_pipeline.yml` | `linkaja_fee_pipeline_v1` | Daily CSV ingestion, live database calculation, and downloadable Kestra result artifact. |
-| `linkaja_monthly_materialization.yml` | `linkaja_monthly_materialization_v1` | Manual preview/publication of one frozen cluster-month snapshot plus downloadable daily raw and unresolved-reversal analysis. |
+| `workflows/linkaja_fee_pipeline.yml` | `linkaja_fee_pipeline_v1` | Daily CSV ingestion, live database calculation, and downloadable Kestra result artifact. |
+| `workflows/linkaja_monthly_materialization.yml` | `linkaja_monthly_materialization_v1` | Manual preview/publication of one frozen cluster-month snapshot plus downloadable daily raw and unresolved-reversal analysis. |
 
 Both workflows run the `linkaja-fee-pipeline:3.11` image and import their
-public functions through `linkaja_pipeline.py`.
+public functions through the package-local `linkaja_pipeline.py` facade.
 
 The `dbt/` directory is an isolated learning project over the existing
 PostgreSQL relations. It currently builds only a staging view and tests; it is
@@ -353,7 +353,7 @@ explicit business rule places them elsewhere.
 Monthly close is manual. The daily workflow does not populate
 `linkaja_transactions`.
 
-Use `linkaja_monthly_materialization.yml` for one cluster and one month:
+Use `workflows/linkaja_monthly_materialization.yml` for one cluster and one month:
 
 | Input | Rule |
 |---|---|
@@ -547,7 +547,7 @@ model does not infer missing originals or fees.
 The attempted Taipy prototype rendered a blank browser page and its full-range
 query path was too slow for interactive use. Dashboard architecture and
 implementation are deferred to a separate change. See
-`TAIPY_DASHBOARD_PLAN.md` for the model contract, validation evidence, and open
+`docs/dashboard-plan.md` for the model contract, validation evidence, and open
 presentation work.
 
 ## Operating Procedure
@@ -651,10 +651,10 @@ ORDER BY report_month, refreshed_at DESC;
 Run these checks after changing LinkAja code, SQL, or workflow structure:
 
 ```bash
-python3 -m compileall -q linkaja_pipeline.py linkaja_fee_pipeline tests
+python3 -m compileall -q linkaja_fee_pipeline
 python3 -m unittest discover -s tests
 git diff --check
-docker build -f Dockerfile.linkaja -t linkaja-fee-pipeline:3.11 .
+docker build -f linkaja_fee_pipeline/Dockerfile -t linkaja-fee-pipeline:3.11 .
 ```
 
 The PostgreSQL integration tests require `LINKAJA_TEST_DSN` to point to a

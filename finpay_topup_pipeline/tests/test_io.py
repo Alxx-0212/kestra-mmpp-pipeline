@@ -21,7 +21,9 @@ class TestParseAmount(unittest.TestCase):
 
 class TestParseTransactionDate(unittest.TestCase):
     def test_common(self):
-        self.assertIsNotNone(parse_transaction_date("2026-08-13 17:15:05"))
+        parsed = parse_transaction_date("2026-08-13 17:15:05")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.tzinfo.key, "Asia/Makassar")
         self.assertIsNotNone(parse_transaction_date("2025-08-07 00:00:0"))
 
     def test_empty(self):

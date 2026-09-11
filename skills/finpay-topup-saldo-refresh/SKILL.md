@@ -17,8 +17,8 @@ Read these first:
 - `finpay_topup_pipeline/README.md` for the current reporting contract.
 - `skills/digipos-topup-monitoring/SKILL.md` for Monitoring Top Up JSON
   extraction.
-- `skills/digipos-cms-scraper/SKILL.md` for DigiPOS CMS login, row-count
-  validation, slow-page retry behavior, and browser automation patterns.
+- `skills/digipos-topup-monitoring/SKILL.md` for DigiPOS CMS login, row-count
+  validation, API retry behavior, and CSV extraction.
 
 Do not hard-code, print, or commit DigiPOS, Kestra, database, or dashboard
 credentials. Treat live DigiPOS and Kestra execution as production-affecting

@@ -1,0 +1,6 @@
+# FinPay Top-Up runtime dependencies
+psycopg[binary]==3.2.3
+requests
+openpyxl
+kestra
+pyyaml

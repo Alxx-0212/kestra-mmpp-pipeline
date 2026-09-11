@@ -1,5 +1,7 @@
+import re
 import unittest
-from base64 import b64decode
+import urllib.error
+from base64 import b64decode, b64encode
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +14,12 @@ from finpay_topup_pipeline.refresh_service import (
     normalize_window,
     submit_kestra_refresh,
 )
+from finpay_topup_pipeline.audit import start_refresh
+
+
+def multipart_fields(request):
+    text = request.data.decode("utf-8")
+    return dict(re.findall(r'name="([^"]+)"\r\n\r\n(.*?)\r\n(?=--)', text, re.DOTALL))
 
 
 class TestRefreshService(unittest.TestCase):
@@ -87,3 +95,177 @@ class TestRefreshService(unittest.TestCase):
         self.assertTrue(auth.startswith("Basic "))
         self.assertEqual(b64decode(auth.removeprefix("Basic ")).decode("utf-8"), "admin@example.com:secret")
         self.assertEqual(result["json"]["id"], "exec-1")
+
+    @patch("finpay_topup_pipeline.refresh_service.urllib.request.urlopen")
+    def test_multipart_defaults_keep_refresh_source_and_verification(self, urlopen):
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b'{"id":"exec-1"}'
+        urlopen.return_value.__enter__.return_value = response
+
+        submit_kestra_refresh(
+            base_url="http://kestra:8080",
+            namespace="finance.finpay",
+            flow_id="finpay_topup_pipeline_v1",
+            start="2026-08-18",
+            end="2026-08-19",
+            users=list(DEFAULT_USERS),
+        )
+
+        fields = multipart_fields(urlopen.call_args.args[0])
+        self.assertEqual(fields["trigger_source"], "refresh_service")
+        self.assertEqual(fields["verify_bucket_topup"], "true")
+        self.assertEqual(fields["users"], " ".join(DEFAULT_USERS))
+        self.assertEqual(fields["dry_run"], "false")
+        self.assertEqual(fields["refresh_mode"], "FULL")
+
+    @patch("finpay_topup_pipeline.refresh_service.urllib.request.urlopen")
+    def test_telegram_override_and_unverified_dry_run_fields(self, urlopen):
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b'{"id":"exec-2"}'
+        urlopen.return_value.__enter__.return_value = response
+
+        submit_kestra_refresh(
+            base_url="http://kestra:8080",
+            namespace="finance.finpay",
+            flow_id="finpay_topup_pipeline_v1",
+            start="2026-08-18",
+            end="2026-08-19",
+            users=["421318_A"],
+            dry_run=True,
+            requested_by="telegram_user",
+            trigger_source="telegram-bot",
+            verify_bucket_topup=False,
+        )
+
+        fields = multipart_fields(urlopen.call_args.args[0])
+        self.assertEqual(fields["trigger_source"], "telegram-bot")
+        self.assertEqual(fields["verify_bucket_topup"], "false")
+        self.assertEqual(fields["dry_run"], "true")
+        self.assertEqual(fields["requested_by"], "telegram_user")
+
+    @patch("finpay_topup_pipeline.refresh_service.urllib.request.urlopen")
+    def test_automatic_cluster_mode_and_checkpoint_dates_are_forwarded(self, urlopen):
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b'{"id":"exec-cluster"}'
+        urlopen.return_value.__enter__.return_value = response
+
+        submit_kestra_refresh(
+            base_url="http://kestra:8080",
+            namespace="finance.finpay",
+            flow_id="finpay_topup_pipeline_v1",
+            start="2026-08-18",
+            end="2026-08-19",
+            users=["421318_A"],
+            refresh_mode="AUTO_CLUSTER",
+            checkpoint_dates={"421318": "2026-08-11"},
+        )
+
+        self.assertEqual(
+            multipart_fields(urlopen.call_args.args[0])["refresh_mode"],
+            "AUTO_CLUSTER",
+        )
+        self.assertEqual(
+            multipart_fields(urlopen.call_args.args[0])["checkpoint_dates"],
+            '{"421318":"2026-08-11"}',
+        )
+
+    def test_invalid_refresh_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            submit_kestra_refresh(
+                base_url="http://kestra:8080",
+                namespace="finance.finpay",
+                flow_id="finpay_topup_pipeline_v1",
+                start="2026-08-18",
+                end="2026-08-19",
+                users=["421318_A"],
+                refresh_mode="arbitrary",
+            )
+
+        with self.assertRaises(ValueError):
+            submit_kestra_refresh(
+                base_url="http://kestra:8080",
+                namespace="finance.finpay",
+                flow_id="finpay_topup_pipeline_v1",
+                start="2026-08-18",
+                end="2026-08-19",
+                users=["421318_A"],
+                refresh_mode="AUTO_ALL",
+            )
+
+        with self.assertRaises(ValueError):
+            submit_kestra_refresh(
+                base_url="http://kestra:8080",
+                namespace="finance.finpay",
+                flow_id="finpay_topup_pipeline_v1",
+                start="2026-08-18",
+                end="2026-08-19",
+                users=["421318_A"],
+                refresh_mode="DEBUG_CLUSTER",
+            )
+
+    def test_auto_refresh_audit_records_checkpoint_date(self):
+        conn = MagicMock()
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = []
+        cursor.execute.return_value.fetchone.return_value = (42,)
+
+        refresh_id = start_refresh(
+            conn,
+            "2026-08-11",
+            "2026-08-28",
+            ["421318_A"],
+            refresh_mode="AUTO_CLUSTER",
+            checkpoint_dates={"421318": "2026-08-11"},
+        )
+
+        self.assertEqual(refresh_id, 42)
+        self.assertTrue(
+            any("checkpoint_as_of_date" in call.args[0] for call in cursor.execute.call_args_list)
+        )
+
+    @patch("finpay_topup_pipeline.refresh_service.urllib.request.urlopen")
+    def test_url_error_maps_to_status_zero_without_credential_leakage(self, urlopen):
+        urlopen.side_effect = urllib.error.URLError(
+            "https://admin@example.com:s3cret-password@kestra:8080/refused"
+        )
+
+        result = submit_kestra_refresh(
+            base_url="http://kestra:8080",
+            namespace="finance.finpay",
+            flow_id="finpay_topup_pipeline_v1",
+            start="2026-08-18",
+            end="2026-08-19",
+            users=list(DEFAULT_USERS),
+            basic_user="admin@example.com",
+            basic_password="s3cret-password",
+        )
+
+        self.assertEqual(result["status_code"], 0)
+        self.assertIsNone(result["json"])
+        self.assertTrue(result["body"].startswith("Kestra unreachable:"))
+        self.assertNotIn("s3cret-password", result["body"])
+        self.assertNotIn("admin@example.com", result["body"])
+        credential_pair = "admin@example.com:s3cret-password"
+        encoded = b64decode(b64encode(credential_pair.encode())).decode()
+        self.assertNotIn(encoded, result["body"])
+        self.assertNotIn(credential_pair, result["body"])
+
+    @patch("finpay_topup_pipeline.refresh_service.urllib.request.urlopen")
+    def test_timeout_oserror_maps_to_status_zero(self, urlopen):
+        urlopen.side_effect = TimeoutError("timed out")
+
+        result = submit_kestra_refresh(
+            base_url="http://kestra:8080",
+            namespace="finance.finpay",
+            flow_id="finpay_topup_pipeline_v1",
+            start="2026-08-18",
+            end="2026-08-19",
+            users=list(DEFAULT_USERS),
+        )
+
+        self.assertEqual(result["status_code"], 0)
+        self.assertIsNone(result["json"])
+        self.assertIn("Kestra unreachable:", result["body"])

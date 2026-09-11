@@ -1,0 +1,1118 @@
+id: finpay_topup_pipeline_v1
+namespace: finance.finpay
+
+inputs:
+  - id: start
+    type: DATE
+    displayName: "Start date"
+    required: false
+  - id: end
+    type: DATE
+    displayName: "End date"
+    required: false
+  - id: users
+    type: STRING
+    displayName: "Users or cluster IDs (space-separated)"
+    required: false
+  - id: dry_run
+    type: BOOLEAN
+    displayName: "Dry run?"
+    defaults: false
+    required: true
+  - id: requested_by
+    type: STRING
+    displayName: "Requested by"
+    defaults: "finance"
+    required: true
+  - id: trigger_source
+    type: STRING
+    displayName: "Trigger source"
+    defaults: "manual"
+    required: true
+  - id: verify_bucket_topup
+    type: BOOLEAN
+    displayName: "Verify DigiPOS BUCKET TOP UP?"
+    defaults: true
+    required: true
+  - id: refresh_mode
+    type: STRING
+    displayName: "Refresh mode"
+    defaults: "FULL"
+    required: true
+  - id: checkpoint_dates
+    type: STRING
+    displayName: "Expected checkpoint dates JSON"
+    required: false
+
+triggers:
+  - id: finpay-topup
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "{{ secret('FINPAY_TOPUP_WEBHOOK_KEY') }}"
+  - id: finpay-topup-schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6,11,15,19 * * *"
+    timezone: Asia/Makassar
+
+tasks:
+  - id: topup_working_directory
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: "Keep the extracted CSV inbox available to every sequential data task."
+    outputFiles:
+      - "finpay-topup-inbox/**/*.csv"
+    tasks:
+      - id: prepare_refresh
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT10M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          DRY_RUN: "{{ inputs.dry_run }}"
+          CHECKPOINT_DATES: "{{ inputs.checkpoint_dates ?? '' }}"
+        script: |
+          import os
+          import sys
+          import json
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.audit import start_refresh
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.refresh_service import REFRESH_MODES
+          from finpay_topup_pipeline.saldo import latest_checkpoints
+          from finpay_topup_pipeline.schema import ensure_schema
+
+          import psycopg
+
+          today = datetime.now(ZoneInfo("Asia/Makassar")).date()
+          raw_start = "{{ inputs.start ?? '' }}".strip()
+          raw_end = "{{ inputs.end ?? '' }}".strip()
+          default_users = [
+              "411311_A", "421306_A", "421307_A", "421315_A",
+              "421318_A", "421320_A",
+          ]
+          raw_users = "{{ inputs.users ?? '' }}".strip()
+          users = raw_users.split() if raw_users else default_users
+          refresh_mode = "{{ inputs.refresh_mode ?? 'FULL' }}".strip().upper()
+          if refresh_mode not in REFRESH_MODES:
+              raise ValueError("unsupported refresh mode")
+          raw_checkpoint_dates = os.environ.get("CHECKPOINT_DATES", "").strip()
+          expected_checkpoint_dates = json.loads(raw_checkpoint_dates) if raw_checkpoint_dates else {}
+          if not isinstance(expected_checkpoint_dates, dict):
+              raise ValueError("checkpoint_dates must be a JSON object")
+
+          scope_cluster_ids = None
+          checkpoint_dates = {}
+          refresh_id = None
+          dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+          conn = None
+          if not dry_run:
+              conn = psycopg.connect(dsn_from_env())
+              try:
+                  ensure_schema(conn)
+                  if refresh_mode in {"AUTO_CLUSTER", "AUTO_ALL"}:
+                      if refresh_mode == "AUTO_CLUSTER":
+                          if len(users) != 1 or not users[0].endswith("_A") or users[0][:-2] not in {
+                              value[:-2] for value in default_users
+                          }:
+                              raise ValueError("AUTO_CLUSTER requires one configured DigiPOS user")
+                          scope_cluster_ids = [users[0][:-2]]
+                      else:
+                          if len(users) != len(default_users) or set(users) != set(default_users):
+                              raise ValueError("AUTO_ALL requires all configured DigiPOS users")
+                          scope_cluster_ids = [value[:-2] for value in default_users]
+                      checkpoints = latest_checkpoints(conn, scope_cluster_ids)
+                      if len(checkpoints) != len(scope_cluster_ids):
+                          raise ValueError("a refresh checkpoint is missing")
+                      checkpoint_dates = {
+                          cluster_id: checkpoints[cluster_id]["as_of_date"].isoformat()
+                          for cluster_id in scope_cluster_ids
+                      }
+                      if any(date.fromisoformat(value) > today for value in checkpoint_dates.values()):
+                          raise ValueError("a refresh checkpoint is in the future")
+                      expected_checkpoint_dates = {
+                          str(cluster_id): str(value)
+                          for cluster_id, value in expected_checkpoint_dates.items()
+                      }
+                      if expected_checkpoint_dates and expected_checkpoint_dates != checkpoint_dates:
+                          raise ValueError("refresh checkpoint changed before extraction")
+                      expected_start = min(checkpoint_dates.values())
+                      if raw_start and date.fromisoformat(raw_start).isoformat() != expected_start:
+                          raise ValueError("refresh start does not match its checkpoint")
+                      if raw_end and date.fromisoformat(raw_end).isoformat() != today.isoformat():
+                          raise ValueError("automatic refresh end must be today")
+                      start = expected_start
+                      end = today.isoformat()
+                  else:
+                      start = raw_start or (today - timedelta(days=1)).isoformat()
+                      end = raw_end or today.isoformat()
+                  refresh_id = start_refresh(
+                      conn,
+                      start,
+                      end,
+                      users,
+                      requested_by="{{ inputs.requested_by ?? 'finance' }}",
+                      trigger_source="{{ inputs.trigger_source ?? 'manual' }}",
+                      kestra_execution_id="{{ execution.id }}",
+                      refresh_mode=refresh_mode,
+                      checkpoint_dates=checkpoint_dates if refresh_mode in {"AUTO_CLUSTER", "AUTO_ALL"} else None,
+                  )
+              finally:
+                  conn.close()
+          elif refresh_mode in {"AUTO_CLUSTER", "AUTO_ALL"}:
+              raise ValueError("automatic refresh requires database access")
+          else:
+              start = raw_start or (today - timedelta(days=1)).isoformat()
+              end = raw_end or today.isoformat()
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "refresh_id": refresh_id,
+              "start": start,
+              "end": end,
+              "users": " ".join(users),
+              "refresh_mode": refresh_mode,
+              "checkpoint_dates": json.dumps(checkpoint_dates or {}, sort_keys=True),
+          })
+
+      - id: extract_topup
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT30M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+          DRY_RUN: "{{ inputs.dry_run }}"
+          CHECKPOINT_DATES: "{{ outputs.prepare_refresh.vars.checkpoint_dates ?? '{}' }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.audit import update_refresh_status, upsert_cluster_status
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.extract import run_extract
+
+          import psycopg
+
+          refresh_id_raw = "{{ outputs.prepare_refresh.vars.refresh_id ?? '' }}".strip()
+          refresh_id = int(refresh_id_raw) if refresh_id_raw else None
+          start = "{{ outputs.prepare_refresh.vars.start }}"
+          end = "{{ outputs.prepare_refresh.vars.end }}"
+          users = "{{ outputs.prepare_refresh.vars.users }}".split()
+          checkpoint_dates = json.loads(os.environ.get("CHECKPOINT_DATES", "{}"))
+          requested_cluster_ids = sorted({
+              value[:-2] if value.endswith("_A") else value
+              for value in users
+          })
+          password = os.environ.get("DIGIPOS_PASSWORD")
+          output_dir = os.path.join(
+              os.environ.get("WORKING_DIR", "/tmp/kestra-wd"),
+              "finpay-topup-inbox",
+          )
+          returncode = -1
+          stderr = ""
+          for attempt in (1, 2):
+              out = run_extract(
+                  checkpoint_dates or start,
+                  end,
+                  users=users,
+                  output_dir=output_dir,
+                  password=password,
+              )
+              stdout = out.get("stdout") or ""
+              stderr = out.get("stderr") or ""
+              returncode = out.get("returncode", -1)
+              print(
+                  f"event=topup_extract refresh_id={refresh_id or '-'} attempt={attempt} "
+                  f"returncode={returncode} stdout_bytes={len(stdout)} stderr_bytes={len(stderr)}"
+              )
+              if returncode == 0:
+                  break
+              print(
+                  f"event=topup_extract_failed refresh_id={refresh_id or '-'} attempt={attempt} "
+                  f"returncode={returncode} stderr_bytes={len(stderr)}",
+                  file=sys.stderr,
+              )
+              if attempt == 1:
+                  print(
+                      f"event=topup_extract_retry refresh_id={refresh_id or '-'} next_attempt=2",
+                      file=sys.stderr,
+                  )
+
+          if returncode != 0:
+              if refresh_id is not None:
+                  try:
+                      extraction = json.loads(stdout or "{}")
+                  except json.JSONDecodeError:
+                      extraction = {}
+                  try:
+                      extraction_failures = json.loads(stderr or "[]")
+                  except json.JSONDecodeError:
+                      extraction_failures = []
+                  successful_clusters = {
+                      item.get("user", "").removesuffix("_A"): item
+                      for item in extraction.get("users", [])
+                  }
+                  failed_clusters = {}
+                  for item in extraction_failures:
+                      cluster_id = item.get("user", "").removesuffix("_A")
+                      failed_clusters.setdefault(cluster_id, []).append(item)
+                  conn = psycopg.connect(dsn_from_env())
+                  try:
+                      update_refresh_status(
+                          conn,
+                          refresh_id,
+                          "FAILED",
+                          stderr[-1000:] or "Top Up download failed",
+                      )
+                      for cluster_id in requested_cluster_ids:
+                          if cluster_id in failed_clusters:
+                              details = "; ".join(
+                                  f"{item.get('start', '?')}..{item.get('end', '?')}: "
+                                  f"{item.get('error', 'download failed')}"
+                                  for item in failed_clusters[cluster_id]
+                              )
+                              upsert_cluster_status(
+                                  conn,
+                                  refresh_id,
+                                  cluster_id,
+                                  status="FAILED",
+                                  error_message=details[-1000:],
+                              )
+                          elif cluster_id in successful_clusters:
+                              upsert_cluster_status(
+                                  conn,
+                                  refresh_id,
+                                  cluster_id,
+                                  status="DOWNLOADED",
+                                  source_row_count=successful_clusters[cluster_id].get("rows"),
+                              )
+                          else:
+                              upsert_cluster_status(
+                                  conn,
+                                  refresh_id,
+                                  cluster_id,
+                                  status="FAILED",
+                                  error_message="Top Up download produced no cluster result",
+                              )
+                  finally:
+                      conn.close()
+              raise SystemExit(returncode)
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "succeeded": True,
+              "returncode": returncode,
+              "start": start,
+              "end": end,
+              "users": " ".join(users),
+              "refresh_id": refresh_id,
+          })
+
+      - id: ingest_topup
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ inputs.dry_run == false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT10M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          CHECKPOINT_DATES: "{{ outputs.prepare_refresh.vars.checkpoint_dates ?? '{}' }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.audit import update_refresh_status, upsert_cluster_status
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.loader import load_inbox_staged, purge_staged_rows
+          from finpay_topup_pipeline.refresh_service import REFRESH_MODES
+
+          import psycopg
+
+          refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
+          refresh_mode = "{{ outputs.prepare_refresh.vars.refresh_mode }}".strip().upper()
+          users = "{{ outputs.prepare_refresh.vars.users }}".split()
+          checkpoint_dates = json.loads(os.environ.get("CHECKPOINT_DATES", "{}"))
+          if refresh_mode not in REFRESH_MODES:
+              raise ValueError("unsupported refresh mode")
+          scope_cluster_ids = None
+          if refresh_mode == "AUTO_CLUSTER":
+              scope_cluster_ids = [users[0][:-2]]
+          elif refresh_mode == "AUTO_ALL":
+              scope_cluster_ids = [value[:-2] for value in users]
+          requested_cluster_ids = sorted({
+              value[:-2] if value.endswith("_A") else value
+              for value in users
+          })
+          output_dir = os.path.join(
+              os.environ.get("WORKING_DIR", "/tmp/kestra-wd"),
+              "finpay-topup-inbox",
+          )
+
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              update_refresh_status(conn, refresh_id, "DOWNLOADED")
+              result = load_inbox_staged(
+                  conn,
+                  output_dir,
+                  refresh_id,
+                  cluster_ids=scope_cluster_ids,
+                  checkpoint_dates=checkpoint_dates if refresh_mode in {"AUTO_CLUSTER", "AUTO_ALL"} else None,
+              )
+              for cluster_id in requested_cluster_ids:
+                  counts = result.get(cluster_id, {"seen": 0, "staged": 0})
+                  upsert_cluster_status(
+                      conn,
+                      refresh_id,
+                      cluster_id,
+                      status="STAGED",
+                      source_row_count=counts["seen"],
+                      loaded_seen=counts["seen"],
+                      loaded_inserted=0,
+                      checkpoint_as_of_date=(checkpoint_dates or {}).get(cluster_id),
+                  )
+              update_refresh_status(conn, refresh_id, "STAGED")
+          except Exception as exc:
+              conn.rollback()
+              purge_staged_rows(conn, refresh_id)
+              for cluster_id in requested_cluster_ids:
+                  upsert_cluster_status(
+                      conn,
+                      refresh_id,
+                      cluster_id,
+                      status="FAILED",
+                      error_message="Top Up staging failed",
+                  )
+              update_refresh_status(conn, refresh_id, "FAILED", str(exc)[-1000:])
+              raise
+          finally:
+              conn.close()
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "refresh_id": refresh_id,
+              "per_cluster_json": json.dumps(result, sort_keys=True),
+              "total_staged": sum(value["staged"] for value in result.values()),
+              "total_seen": sum(value["seen"] for value in result.values()),
+          })
+
+      - id: refresh_saldo
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Record VERIFIED or MISMATCH evidence; staged rows retained for finance review."
+        runIf: "{{ inputs.dry_run == false and inputs.verify_bucket_topup == true }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT10M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+          STAGED_BY_CLUSTER_JSON: "{{ outputs.ingest_topup.vars.per_cluster_json ?? '{}' }}"
+        script: |
+          import json
+          import os
+          import sys
+          from datetime import date, datetime
+          from zoneinfo import ZoneInfo
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.audit import update_refresh_status, upsert_cluster_status
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.loader import purge_staged_rows
+          from finpay_topup_pipeline.verify import bucket_cutoff_for_refresh, verify_live_bucket_topup
+
+          import psycopg
+
+          refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
+          start = "{{ outputs.prepare_refresh.vars.start }}"
+          end = "{{ outputs.prepare_refresh.vars.end }}"
+          users = "{{ outputs.prepare_refresh.vars.users }}".split()
+          staged_by_cluster = json.loads(os.environ.get("STAGED_BY_CLUSTER_JSON", "{}"))
+          requested_cluster_ids = sorted({
+              value[:-2] if value.endswith("_A") else value
+              for value in users
+          })
+          end_date = date.fromisoformat(end)
+          today = datetime.now(ZoneInfo("Asia/Makassar")).date()
+          cutoff_date = bucket_cutoff_for_refresh(end_date, today)
+
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              try:
+                  verification = verify_live_bucket_topup(
+                      conn,
+                      refresh_id,
+                      users,
+                      os.environ.get("DIGIPOS_PASSWORD"),
+                      cutoff_date=cutoff_date,
+                      verification_attempt=1,
+                      report_date=end,
+                      include_refresh_id=refresh_id,
+                  )
+              except Exception as exc:
+                  conn.rollback()
+                  purge_staged_rows(conn, refresh_id)
+                  for cluster_id in requested_cluster_ids:
+                      upsert_cluster_status(
+                          conn,
+                          refresh_id,
+                          cluster_id,
+                          status="FAILED",
+                          error_message="Top Up verification failed",
+                      )
+                  update_refresh_status(conn, refresh_id, "FAILED", str(exc)[-1000:])
+                  raise
+          finally:
+              conn.close()
+
+          for cluster_id, counts in staged_by_cluster.items():
+              if cluster_id in verification.get("clusters", {}):
+                  verification["clusters"][cluster_id]["staged_rows"] = counts.get("staged", 0)
+                  verification["clusters"][cluster_id]["downloaded_rows"] = counts.get("seen", 0)
+          for cluster_id in requested_cluster_ids:
+              verification.setdefault("clusters", {}).setdefault(
+                  cluster_id,
+                  {
+                      "status": "VERIFY_FAILED",
+                      "error": "CMS snapshot tidak tersedia untuk wilayah ini",
+                  },
+              )
+          needs_retry = verification["status"] == "VERIFY_FAILED"
+          print(
+              f"event=topup_verification status={verification['status']} "
+              f"refresh_id={refresh_id} needs_retry={needs_retry}"
+          )
+          for cluster_id, evidence in verification.get("clusters", {}).items():
+              print(
+                  f"event=topup_verification_match refresh_id={refresh_id} "
+                  f"cluster_id={cluster_id} calculation_rows={evidence.get('calculation_row_count', 0)} "
+                  f"matching_row={evidence.get('matching_row_number') if evidence.get('matching_row_number') is not None else '-'} "
+                  f"matching_type={evidence.get('matching_type') or '-'} "
+                  f"matching_at={evidence.get('matching_transaction_at') or '-'}"
+              )
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "verification_json": json.dumps(verification, default=str, sort_keys=True),
+              "needs_retry": needs_retry,
+          })
+
+      - id: reextract_topup
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.refresh_saldo.vars.needs_retry ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT30M
+        env:
+          DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+          CHECKPOINT_DATES: "{{ outputs.prepare_refresh.vars.checkpoint_dates ?? '{}' }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.extract import run_extract
+
+          start = "{{ outputs.prepare_refresh.vars.start }}"
+          end = "{{ outputs.prepare_refresh.vars.end }}"
+          users = "{{ outputs.prepare_refresh.vars.users }}".split()
+          checkpoint_dates = json.loads(os.environ.get("CHECKPOINT_DATES", "{}"))
+          try:
+              result = run_extract(
+                  checkpoint_dates or start,
+                  end,
+                  users=users,
+                  output_dir=os.path.join(
+                      os.environ.get("WORKING_DIR", "/tmp/kestra-wd"),
+                      "finpay-topup-inbox",
+                  ),
+                  password=os.environ.get("DIGIPOS_PASSWORD"),
+              )
+              returncode = result.get("returncode", -1)
+              print(
+                  f"event=topup_reextract returncode={returncode} "
+                  f"stdout_bytes={len(result.get('stdout') or '')} "
+                  f"stderr_bytes={len(result.get('stderr') or '')}"
+              )
+              succeeded = returncode == 0
+          except Exception as exc:
+              print(
+                  f"event=topup_reextract status=failed error_type={type(exc).__name__}",
+                  file=sys.stderr,
+              )
+              returncode = -1
+              succeeded = False
+
+          from kestra import Kestra
+          Kestra.outputs({"succeeded": succeeded, "returncode": returncode})
+
+      - id: restage_topup
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.reextract_topup.vars.succeeded ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT10M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          CHECKPOINT_DATES: "{{ outputs.prepare_refresh.vars.checkpoint_dates ?? '{}' }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.audit import update_refresh_status, upsert_cluster_status
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.loader import load_inbox_staged, purge_staged_rows
+
+          import psycopg
+
+          refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
+          users = "{{ outputs.prepare_refresh.vars.users }}".split()
+          refresh_mode = "{{ outputs.prepare_refresh.vars.refresh_mode }}".strip().upper()
+          checkpoint_dates = json.loads(os.environ.get("CHECKPOINT_DATES", "{}"))
+          scope_cluster_ids = None
+          if refresh_mode == "AUTO_CLUSTER":
+              scope_cluster_ids = [users[0][:-2]]
+          elif refresh_mode == "AUTO_ALL":
+              scope_cluster_ids = [value[:-2] for value in users]
+          requested_cluster_ids = sorted({
+              value[:-2] if value.endswith("_A") else value
+              for value in users
+          })
+          output_dir = os.path.join(
+              os.environ.get("WORKING_DIR", "/tmp/kestra-wd"),
+              "finpay-topup-inbox",
+          )
+
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              try:
+                  result = load_inbox_staged(
+                      conn,
+                      output_dir,
+                      refresh_id,
+                      cluster_ids=scope_cluster_ids,
+                      checkpoint_dates=checkpoint_dates if scope_cluster_ids else None,
+                  )
+                  for cluster_id in requested_cluster_ids:
+                      counts = result.get(cluster_id, {"seen": 0, "staged": 0})
+                      upsert_cluster_status(
+                          conn,
+                          refresh_id,
+                          cluster_id,
+                          status="STAGED",
+                          source_row_count=counts["seen"],
+                          loaded_seen=counts["seen"],
+                          loaded_inserted=0,
+                          checkpoint_as_of_date=(checkpoint_dates or {}).get(cluster_id),
+                      )
+              except Exception as exc:
+                  conn.rollback()
+                  purge_staged_rows(conn, refresh_id)
+                  for cluster_id in requested_cluster_ids:
+                      upsert_cluster_status(
+                          conn,
+                          refresh_id,
+                          cluster_id,
+                          status="FAILED",
+                          error_message="Top Up restaging failed",
+                      )
+                  update_refresh_status(conn, refresh_id, "FAILED", str(exc)[-1000:])
+                  raise
+          finally:
+              conn.close()
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "per_cluster_json": json.dumps(result, sort_keys=True),
+              "total_staged": sum(value["staged"] for value in result.values()),
+              "total_seen": sum(value["seen"] for value in result.values()),
+          })
+
+      - id: reverify_saldo
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.reextract_topup.vars.succeeded ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT10M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+          STAGED_BY_CLUSTER_JSON: "{{ outputs.restage_topup.vars.per_cluster_json ?? '{}' }}"
+        script: |
+          import json
+          import os
+          import sys
+          from datetime import date, datetime
+          from zoneinfo import ZoneInfo
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.audit import update_refresh_status, upsert_cluster_status
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.loader import purge_staged_rows
+          from finpay_topup_pipeline.verify import bucket_cutoff_for_refresh, verify_live_bucket_topup
+
+          import psycopg
+
+          refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
+          start = "{{ outputs.prepare_refresh.vars.start }}"
+          end = "{{ outputs.prepare_refresh.vars.end }}"
+          users = "{{ outputs.prepare_refresh.vars.users }}".split()
+          staged_by_cluster = json.loads(os.environ.get("STAGED_BY_CLUSTER_JSON", "{}"))
+          requested_cluster_ids = sorted({
+              value[:-2] if value.endswith("_A") else value
+              for value in users
+          })
+          end_date = date.fromisoformat(end)
+          today = datetime.now(ZoneInfo("Asia/Makassar")).date()
+          cutoff_date = bucket_cutoff_for_refresh(end_date, today)
+
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              try:
+                  verification = verify_live_bucket_topup(
+                      conn,
+                      refresh_id,
+                      users,
+                      os.environ.get("DIGIPOS_PASSWORD"),
+                      cutoff_date=cutoff_date,
+                      verification_attempt=2,
+                      report_date=end,
+                      include_refresh_id=refresh_id,
+                  )
+              except Exception as exc:
+                  conn.rollback()
+                  purge_staged_rows(conn, refresh_id)
+                  for cluster_id in requested_cluster_ids:
+                      upsert_cluster_status(
+                          conn,
+                          refresh_id,
+                          cluster_id,
+                          status="FAILED",
+                          error_message="Top Up re-verification failed",
+                      )
+                  update_refresh_status(conn, refresh_id, "FAILED", str(exc)[-1000:])
+                  raise
+          finally:
+              conn.close()
+
+          for cluster_id, counts in staged_by_cluster.items():
+              if cluster_id in verification.get("clusters", {}):
+                  verification["clusters"][cluster_id]["staged_rows"] = counts.get("staged", 0)
+                  verification["clusters"][cluster_id]["downloaded_rows"] = counts.get("seen", 0)
+          for cluster_id in requested_cluster_ids:
+              verification.setdefault("clusters", {}).setdefault(
+                  cluster_id,
+                  {
+                      "status": "VERIFY_FAILED",
+                      "error": "CMS snapshot tidak tersedia untuk wilayah ini",
+                  },
+              )
+          print(
+               f"event=topup_reverification status={verification['status']} "
+               f"refresh_id={refresh_id}"
+          )
+          for cluster_id, evidence in verification.get("clusters", {}).items():
+              print(
+                  f"event=topup_reverification_match refresh_id={refresh_id} "
+                  f"cluster_id={cluster_id} calculation_rows={evidence.get('calculation_row_count', 0)} "
+                  f"matching_row={evidence.get('matching_row_number') if evidence.get('matching_row_number') is not None else '-'} "
+                  f"matching_type={evidence.get('matching_type') or '-'} "
+                  f"matching_at={evidence.get('matching_transaction_at') or '-'}"
+              )
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "verification_json": json.dumps(verification, default=str, sort_keys=True),
+          })
+
+      - id: finalize_refresh
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ inputs.dry_run == false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT10M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          VERIFY_BUCKET_TOPUP: "{{ inputs.verify_bucket_topup }}"
+        script: |
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.audit import update_refresh_status, upsert_cluster_status
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.loader import commit_staged_rows, purge_staged_rows
+
+          import psycopg
+
+          refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
+          users = "{{ outputs.prepare_refresh.vars.users }}".split()
+          cluster_ids = sorted({
+              value[:-2] if value.endswith("_A") else value
+              for value in users
+          })
+          verify_bucket = os.environ.get("VERIFY_BUCKET_TOPUP", "true").lower() == "true"
+          committed = {"inserted": 0, "staged": 0, "per_cluster": {}}
+          purged = 0
+          conn = psycopg.connect(dsn_from_env())
+          try:
+               if not verify_bucket:
+                   committed = commit_staged_rows(conn, refresh_id)
+                   for cluster_id, inserted in committed["per_cluster"].items():
+                       upsert_cluster_status(
+                           conn,
+                           refresh_id,
+                           cluster_id,
+                           status="VERIFY_SKIPPED",
+                           loaded_inserted=inserted,
+                       )
+                   update_refresh_status(conn, refresh_id, "VERIFY_SKIPPED")
+                   status = "VERIFY_SKIPPED"
+               else:
+                   with conn.cursor() as cur:
+                       cur.execute(
+                           "SELECT status, error_message FROM finpay_topup_refresh WHERE refresh_id = %s",
+                           (refresh_id,),
+                       )
+                       row = cur.fetchone()
+                       cur.execute(
+                           "SELECT cluster_id FROM finpay_topup_refresh_cluster "
+                           "WHERE refresh_id = %s AND status = 'VERIFIED'",
+                           (refresh_id,),
+                       )
+                       verified_cluster_ids = [str(value[0]) for value in cur.fetchall()]
+                   status = row[0] if row else "FAILED"
+                   if status == "VERIFY_FAILED":
+                       if verified_cluster_ids:
+                           update_refresh_status(conn, refresh_id, "PENDING_REVIEW", row[1])
+                           status = "PENDING_REVIEW"
+                       else:
+                           purged = purge_staged_rows(conn, refresh_id)
+               needs_review = status == "PENDING_REVIEW"
+          finally:
+              conn.close()
+
+          print(
+              f"event=topup_finalize refresh_id={refresh_id} status={status} "
+              f"needs_review={needs_review} purged_rows={purged} "
+              f"committed_rows={committed['inserted']}"
+          )
+
+          from kestra import Kestra
+          Kestra.outputs({
+              "refresh_status": status,
+              "needs_review": needs_review,
+              "purged_staged_rows": purged,
+              "committed_json": str(committed),
+          })
+
+      - id: notify_verification_failure
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.finalize_refresh.vars.refresh_status == 'VERIFY_FAILED' }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT5M
+        env:
+          TELEGRAM_REVIEW_BOT_TOKEN: "{{ secret('FINPAY_TELEGRAM_BOT_TOKEN') }}"
+          TELEGRAM_ALERT_CHAT_ID: "{{ secret('TELEGRAM_ALERT_CHAT_ID') }}"
+          EXECUTION_ID: "{{ execution.id }}"
+        script: |
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.notify import format_flow_failure_alert, send_telegram_alert
+
+          token = os.environ.get("TELEGRAM_REVIEW_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_ALERT_CHAT_ID")
+          sent = False
+          try:
+              sent = send_telegram_alert(
+                  format_flow_failure_alert(
+                      os.environ.get("EXECUTION_ID", "-"),
+                      "finance.finpay",
+                      "finpay_topup_pipeline_v1",
+                  ),
+                  token=token,
+                  chat_id=chat_id,
+                  parse_mode="HTML",
+              )
+              print(f"event=topup_verification_failure_alert status={'sent' if sent else 'skipped'}")
+          except Exception as exc:
+              print(
+                  f"event=topup_verification_failure_alert status=failed "
+                  f"error_type={type(exc).__name__}",
+                  file=sys.stderr,
+              )
+
+          from kestra import Kestra
+          Kestra.outputs({"sent": sent})
+
+      - id: notify_review
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.finalize_refresh.vars.needs_review ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT5M
+        env:
+          TELEGRAM_REVIEW_BOT_TOKEN: "{{ secret('FINPAY_TELEGRAM_BOT_TOKEN') }}"
+          TELEGRAM_ALERT_CHAT_ID: "{{ secret('TELEGRAM_ALERT_CHAT_ID') }}"
+          VERIFICATION_JSON: "{{ outputs.reverify_saldo.vars.verification_json ?? outputs.refresh_saldo.vars.verification_json ?? '{}' }}"
+          CHECKPOINT_DATES: "{{ outputs.prepare_refresh.vars.checkpoint_dates ?? '{}' }}"
+          STAGED_ROWS: "{{ outputs.restage_topup.vars.total_staged ?? outputs.ingest_topup.vars.total_staged ?? 0 }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.notify import format_cycle_alert, review_keyboard, send_telegram_alert
+
+          refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
+          start = "{{ outputs.prepare_refresh.vars.start }}"
+          end = "{{ outputs.prepare_refresh.vars.end }}"
+          verification_json = os.environ.get("VERIFICATION_JSON", "{}")
+          verification = json.loads(verification_json)
+          checkpoint_dates = json.loads(os.environ.get("CHECKPOINT_DATES", "{}"))
+          staged_raw = os.environ.get("STAGED_ROWS", "0")
+          staged = int(staged_raw or 0)
+          token = os.environ.get("TELEGRAM_REVIEW_BOT_TOKEN", "")
+          sent = False
+          try:
+              sent = send_telegram_alert(
+                  format_cycle_alert(
+                      refresh_id,
+                      start,
+                      end,
+                      verification,
+                      staged=staged,
+                      checkpoint_dates=checkpoint_dates,
+                  ),
+                  token=token,
+                  chat_id=os.environ.get("TELEGRAM_ALERT_CHAT_ID"),
+                  reply_markup=review_keyboard(refresh_id),
+                  parse_mode="HTML",
+              )
+              print(
+                  f"event=topup_review_alert refresh_id={refresh_id} "
+                  f"status={'sent' if sent else 'skipped'} staged_rows={staged}"
+              )
+              for cluster_id, evidence in verification.get("clusters", {}).items():
+                  print(
+                      f"event=topup_review_match refresh_id={refresh_id} cluster_id={cluster_id} "
+                      f"matching_row={evidence.get('matching_row_number') if evidence.get('matching_row_number') is not None else '-'} "
+                      f"matching_type={evidence.get('matching_type') or '-'} "
+                      f"matching_at={evidence.get('matching_transaction_at') or '-'}"
+                  )
+          except Exception as exc:
+              print(
+                  f"event=topup_review_alert refresh_id={refresh_id} status=failed "
+                  f"error_type={type(exc).__name__}",
+                  file=sys.stderr,
+              )
+
+          from kestra import Kestra
+          Kestra.outputs({"sent": sent, "refresh_id": refresh_id})
+
+      - id: summary_topup
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ inputs.dry_run == false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT5M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+        script: |
+          import json
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.saldo import summary_by_cluster
+
+          import psycopg
+
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              rows = summary_by_cluster(conn)
+          finally:
+              conn.close()
+          for row in rows:
+              print(
+                  f"event=topup_refresh_summary cluster_id={row['cluster_id']} "
+                  f"rows={row['rows']} unclassified={row['unclassified_count']} "
+                  f"saldo={row['current_saldo']}"
+              )
+
+          from kestra import Kestra
+          Kestra.outputs({"summary": json.loads(json.dumps(rows, default=str))})
+
+errors:
+  - id: cleanup_failed_refresh
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-topup-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: mmpp-finance-network
+    pythonVersion: "3.11"
+    timeout: PT5M
+    env:
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+    script: |
+      import os
+      import sys
+
+      sys.path.insert(0, "/app")
+      from finpay_topup_pipeline.audit import update_refresh_status
+      from finpay_topup_pipeline.config import dsn_from_env
+      from finpay_topup_pipeline.loader import purge_staged_rows
+
+      refresh_id_raw = "{{ outputs.prepare_refresh.vars.refresh_id ?? '' }}".strip()
+      refresh_id = int(refresh_id_raw) if refresh_id_raw else None
+      purged = 0
+      status = "none"
+      if refresh_id is not None:
+          import psycopg
+
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              with conn.cursor() as cur:
+                  cur.execute(
+                      "SELECT status FROM finpay_topup_refresh WHERE refresh_id = %s",
+                      (refresh_id,),
+                  )
+                  row = cur.fetchone()
+              status = row[0] if row else "missing"
+              if status in {"REQUESTED", "DOWNLOADED", "STAGED", "VERIFY_FAILED"}:
+                  purged = purge_staged_rows(conn, refresh_id)
+                  update_refresh_status(conn, refresh_id, "FAILED", "Kestra task failed before completion")
+                  status = "FAILED"
+          finally:
+              conn.close()
+
+      print(
+          f"event=topup_failure_cleanup refresh_id={refresh_id or '-'} "
+          f"status={status} purged_rows={purged}"
+      )
+
+  - id: notify_flow_failure
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-topup-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: mmpp-finance-network
+    pythonVersion: "3.11"
+    timeout: PT5M
+    env:
+      TELEGRAM_REVIEW_BOT_TOKEN: "{{ secret('FINPAY_TELEGRAM_BOT_TOKEN') }}"
+      TELEGRAM_ALERT_CHAT_ID: "{{ secret('TELEGRAM_ALERT_CHAT_ID') }}"
+    script: |
+      import os
+      import sys
+      sys.path.insert(0, "/app")
+      from finpay_topup_pipeline.notify import format_flow_failure_alert, send_telegram_alert
+      review_token = os.environ.get("TELEGRAM_REVIEW_BOT_TOKEN")
+      chat_id = os.environ.get("TELEGRAM_ALERT_CHAT_ID")
+      text = format_flow_failure_alert(
+          "{{ execution.id }}",
+          "finance.finpay",
+          "finpay_topup_pipeline_v1",
+      )
+      if review_token and chat_id:
+          try:
+              # sendMessage remains one-way for technical failure alerts.
+              sent = send_telegram_alert(
+                  text,
+                  token=review_token,
+                  chat_id=chat_id,
+                  parse_mode="HTML",
+              )
+              print(f"event=topup_flow_failure_alert status={'sent' if sent else 'skipped'}")
+          except Exception as exc:
+              print(
+                  f"event=topup_flow_failure_alert status=failed "
+                  f"error_type={type(exc).__name__}",
+                  file=sys.stderr,
+              )
+      else:
+          print(
+              "event=topup_flow_failure_alert status=skipped reason=missing_configuration",
+              file=sys.stderr,
+          )
