@@ -45,6 +45,9 @@ from .sql import (
     MONTHLY_UNRESOLVED_REVERSALS_STATEMENT,
     PUBLISH_MONTH_SNAPSHOT_STATEMENT,
     REPLACE_RAW_STATEMENTS,
+    REPLACE_SOURCE_LOAD_STATEMENTS,
+    INSERT_LEDGER_VERSION_STATEMENT,
+    INSERT_MONTHLY_IMPACTS_STATEMENT,
     STAGE_CONFLICTS_STATEMENT,
     UPSERT_MONTHLY_REFRESH_STATEMENT,
 )
@@ -328,6 +331,11 @@ def persist_linkaja_normalized_csv(
         "in_cluster_fee_per_transaction": IN_CLUSTER_FEE_PER_TRANSACTION,
         "reversal_in_cluster_fee_per_transaction":
             REVERSAL_IN_CLUSTER_FEE_PER_TRANSACTION,
+        "source_sha256": str(manifest.get("source_sha256", "")),
+        "source_file": str(manifest.get("source_file", "")),
+        "source_rows": source_rows,
+        "source_start_date": min(manifest.get("report_dates", [None])),
+        "source_end_date": max(manifest.get("report_dates", [None])),
     }
 
     with psycopg.connect(dsn) as connection:
@@ -361,6 +369,10 @@ def persist_linkaja_normalized_csv(
             cursor.execute(STAGE_CONFLICTS_STATEMENT)
             _raise_stage_conflicts(cursor.fetchall())
 
+            for statement in REPLACE_SOURCE_LOAD_STATEMENTS:
+                cursor.execute(statement, params)
+            cursor.execute(INSERT_LEDGER_VERSION_STATEMENT)
+
             for statement in CREATE_REFRESH_SCOPE_STATEMENTS:
                 cursor.execute(statement)
             cursor.execute(EXPAND_IMPACTED_IDS_STATEMENT)
@@ -370,6 +382,7 @@ def persist_linkaja_normalized_csv(
                 cursor.execute(statement)
             cursor.execute(EXPAND_IMPACTED_IDS_STATEMENT)
             cursor.execute(CAPTURE_AFFECTED_DATES_STATEMENT)
+            cursor.execute(INSERT_MONTHLY_IMPACTS_STATEMENT, params)
 
             cursor.execute(AFFECTED_DATES_STATEMENT, params)
             affected_dates = [row[0] for row in cursor.fetchall()]

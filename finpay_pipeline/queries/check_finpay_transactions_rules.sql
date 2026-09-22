@@ -17,11 +17,13 @@ WITH normalized AS (
         transaction_id,
         base_id,
         transaction_id_type,
+        transaction_date::date AS transaction_day,
         COALESCE(kredit, 0)::numeric AS kredit,
         COALESCE(debet, 0)::numeric AS debet,
         raw_transaction_label,
         processed_transaction_label,
         LOWER(BTRIM(COALESCE(processed_transaction_label, ''))) AS label,
+        LOWER(BTRIM(COALESCE(raw_transaction_label, ''))) AS raw_label,
         LOWER(COALESCE(remarks, '')) AS remarks_lc,
         REGEXP_REPLACE(
             COALESCE(transaction_id, ''),
@@ -80,7 +82,14 @@ grouped AS (
         COALESCE(SUM(kredit) FILTER (WHERE label = 'reversal - ngrs fee'), 0) AS reversal_ngrs_fee_kredit,
         COUNT(*) FILTER (WHERE label = 'reversal - recharge out cluster') AS reversal_recharge_out_cluster_rows,
         COUNT(*) FILTER (WHERE label = 'reversal - recharge out cluster fee') AS reversal_recharge_out_cluster_fee_rows,
-        COALESCE(SUM(kredit) FILTER (WHERE label = 'reversal - recharge out cluster fee'), 0) AS reversal_recharge_out_cluster_fee_kredit
+        COALESCE(SUM(kredit) FILTER (WHERE label = 'reversal - recharge out cluster fee'), 0) AS reversal_recharge_out_cluster_fee_kredit,
+        BOOL_OR(
+            label = 'sellthru'
+            AND raw_label = 'recharge'
+            AND BTRIM(remarks_lc) = 'transaksi sellthru'
+        ) AS standalone_sellthru,
+        BOOL_OR(label = 'sellthru' AND transaction_day >= DATE '2026-09-01') AS st_current_rows,
+        BOOL_OR(label = 'sellthru' AND transaction_day < DATE '2026-09-01') AS st_legacy_rows
     FROM normalized
     GROUP BY cluster_id, report_date, base_id
 ),
@@ -301,6 +310,7 @@ violations AS (
         )
     FROM grouped
     WHERE sellthru_rows > 0
+      AND NOT standalone_sellthru
       AND sellthrufee_debet <> 100
 
     UNION ALL
@@ -316,7 +326,45 @@ violations AS (
         CONCAT('SELLTHRU requires SELLTHRUSALESFEE; labels=', ARRAY_TO_STRING(labels, ', '))
     FROM grouped
     WHERE sellthru_rows > 0
+      AND NOT standalone_sellthru
+      AND st_legacy_rows
       AND sellthrusalesfee_rows = 0
+
+    UNION ALL
+
+    SELECT
+        'sellthru_salesfee_retired',
+        'group',
+        cluster_id,
+        report_date,
+        base_id,
+        NULL::text,
+        NULL::text,
+        CONCAT(
+            'SELLTHRUSALESFEE is retired from 2026-09-01; labels=',
+            ARRAY_TO_STRING(labels, ', ')
+        )
+    FROM grouped
+    WHERE sellthru_rows > 0
+      AND NOT standalone_sellthru
+      AND st_current_rows
+      AND sellthrusalesfee_rows > 0
+
+    UNION ALL
+
+    SELECT
+        'sellthru_cutover_mixed_family',
+        'group',
+        cluster_id,
+        report_date,
+        base_id,
+        NULL::text,
+        NULL::text,
+        'SELLTHRU family crosses the 2026-09-01 rule cutoff'
+    FROM grouped
+    WHERE sellthru_rows > 0
+      AND st_current_rows
+      AND st_legacy_rows
 
     UNION ALL
 

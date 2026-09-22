@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import re
@@ -123,6 +124,7 @@ class LinkAjaLoadManifest:
     report_dates: list[str]
     scenario_counts: dict[str, int]
     load_id: str
+    source_sha256: str = ""
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +134,7 @@ class LinkAjaLoadManifest:
             "report_dates": self.report_dates,
             "scenario_counts": self.scenario_counts,
             "load_id": self.load_id,
+            "source_sha256": self.source_sha256,
         }
 
 
@@ -338,6 +341,11 @@ def normalize_linkaja_csv(
     if not str(load_id).strip():
         raise ValueError("LinkAja load_id must not be blank")
 
+    source_digest = hashlib.sha256()
+    with path.open("rb") as binary_source:
+        for chunk in iter(lambda: binary_source.read(1024 * 1024), b""):
+            source_digest.update(chunk)
+
     cluster_from_filename = cluster_id_from_filename(filename_hint or source_path)
     cluster_id = cluster_from_filename
     source_rows = 0
@@ -451,6 +459,7 @@ def normalize_linkaja_csv(
         report_dates=sorted(report_dates),
         scenario_counts=dict(sorted(scenario_counts.items())),
         load_id=str(load_id).strip(),
+        source_sha256=source_digest.hexdigest(),
     )
 
 

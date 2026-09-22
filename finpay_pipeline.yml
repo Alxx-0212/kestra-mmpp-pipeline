@@ -1,6 +1,10 @@
 id: finpay_daily_pipeline_v5
 namespace: finance.finpay
 
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
 # ── MANUAL RUN WITH FILE UPLOAD ─────────────────────────────────────────────────
 # cluster_id is auto-extracted from the filename (finpay-<cluster_id>(...).csv)
 inputs:
@@ -15,6 +19,18 @@ inputs:
     displayName: "Dry run?"
     description: "true → validate + relabel + summarize + flag only. false → full production run."
     defaults: false
+
+  - id: source_filename
+    type: STRING
+    displayName: "Original source filename"
+    description: "Optional original filename when the API FILE path is a Kestra upload handle."
+    defaults: ""
+
+  - id: write_gsheet
+    type: BOOLEAN
+    displayName: "Write Google Sheets?"
+    description: "Disable only for isolated database replay when Google OAuth is unavailable."
+    defaults: true
 
 tasks:
   # ── PERFORMANCE NOTE ─────────────────────────────────────────────────────────
@@ -32,6 +48,7 @@ tasks:
     timeout: PT2M
     env:
       CSV_PATH: "{{ inputs.csv_file }}"
+      SOURCE_FILENAME: "{{ inputs.source_filename }}"
     script: |
       import re, os, sys
       from datetime import datetime, timedelta
@@ -43,7 +60,7 @@ tasks:
           r"finpay-(\d+)[(_](\d{2}-\d{2}-\d{4})to\d{2}-\d{2}-\d{4}[)_]?\.(csv|xlsx)$"
       )
 
-      filename = os.path.basename(file_path)
+      filename = os.environ.get("SOURCE_FILENAME", "").strip() or os.path.basename(file_path)
       m = PATTERN.match(filename)
       if not m:
           print(f"ERROR: Filename doesn't match expected pattern: {filename}", file=sys.stderr)
@@ -59,32 +76,32 @@ tasks:
 
       CLUSTERS = {
           "421306": {
-              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
+              "target_spreadsheet":       "Salinan dari Monitoring Finpay & LinkAja",
               "target_worksheet":         "MRT",
               "default_starting_balance": 0,
           },
           "421307": {
-              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
+              "target_spreadsheet":       "Salinan dari Monitoring Finpay & LinkAja",
               "target_worksheet":         "TDR",
               "default_starting_balance": 0,
           },
           "411311": {
-              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
+              "target_spreadsheet":       "Salinan dari Monitoring Finpay & LinkAja",
               "target_worksheet":         "PKY",
               "default_starting_balance": 0,
           },
           "421315": {
-              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
+              "target_spreadsheet":       "Salinan dari Monitoring Finpay & LinkAja",
               "target_worksheet":         "BGI",
               "default_starting_balance": 0,
           },
           "421318": {
-              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
+              "target_spreadsheet":       "Salinan dari Monitoring Finpay & LinkAja",
               "target_worksheet":         "MRW",
               "default_starting_balance": 0,
           },
           "421320": {
-              "target_spreadsheet":       "Salinan dari MONITORING FINPAY",
+              "target_spreadsheet":       "Salinan dari Monitoring Finpay & LinkAja",
               "target_worksheet":         "TNT",
               "default_starting_balance": 0,
           },
@@ -222,9 +239,12 @@ tasks:
     timeout: PT5M
     inputFiles:
       integrity_checked.parquet: "{{ outputs.validate_integrity.outputFiles['integrity_checked.parquet'] }}"
+      source_file: "{{ inputs.csv_file }}"
     env:
       CLUSTER_ID: "{{ outputs.parse_and_resolve.vars.cluster_id }}"
       ISO_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
+      LOAD_ID: "{{ execution.id }}"
+      SOURCE_FILE_NAME: "{{ outputs.parse_and_resolve.vars.filename }}"
       FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
       FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
       FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
@@ -233,7 +253,11 @@ tasks:
     script: |
       import os, sys, pandas as pd
       sys.path.insert(0, "/app")
-      from pipeline import postgres_dsn_from_env, write_finpay_dataframe_to_postgres
+      from pipeline import (
+          finpay_source_sha256,
+          postgres_dsn_from_env,
+          write_finpay_dataframe_to_postgres,
+      )
       from kestra import Kestra
 
       df = pd.read_parquet("integrity_checked.parquet")
@@ -243,6 +267,9 @@ tasks:
           cluster_id=os.environ["CLUSTER_ID"],
           report_date=os.environ["ISO_DATE"],
           dsn=postgres_dsn_from_env(),
+          load_id=os.environ["LOAD_ID"],
+          source_file=os.environ["SOURCE_FILE_NAME"],
+          source_sha256=finpay_source_sha256("source_file"),
       )
 
       print(f"✅ Persisted raw transactions to Postgres. Rows: {rows}")
@@ -394,7 +421,7 @@ tasks:
       # ── TASK 10 ─ Upload unusual transactions immediately ───────────────────
       - id: upload_unusual_to_sheets
         type: io.kestra.plugin.scripts.python.Script
-        runIf: "{{ inputs.dry_run == false }}"
+        runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
         containerImage: finpay-pipeline:3.11
         pythonVersion: "3.11"
         timeout: PT10M
@@ -457,10 +484,11 @@ tasks:
       # ── TASK 9 ─ Alert Telegram only when unusual rows exist ────────────────
       - id: notify_unusual_telegram
         type: io.kestra.plugin.core.http.Request
-        runIf: "{{ inputs.dry_run == false and outputs.flag_unusual_transactions.vars.unusual_rows > 0 }}"
+        runIf: "{{ inputs.dry_run == false and inputs.write_gsheet and outputs.flag_unusual_transactions.vars.unusual_rows > 0 }}"
         uri: "https://api.telegram.org/bot{{ secret('TELEGRAM_BOT_TOKEN') }}/sendMessage"
         method: POST
         contentType: multipart/form-data
+        timeout: PT1M
         retry:
           type: exponential
           interval: PT15S
@@ -538,7 +566,10 @@ tasks:
                     script: |
                       import os, sys, pandas as pd
                       sys.path.insert(0, "/app")
-                      from pipeline import prepare_transaction_detail_export
+                      from pipeline import (
+                          prepare_reversal_summary_transactions,
+                          prepare_transaction_detail_export,
+                      )
                       from kestra import Kestra
 
                       cluster_id = os.environ["CLUSTER_ID"]
@@ -546,8 +577,9 @@ tasks:
                       dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
 
                       df = pd.read_parquet("deduplicated.parquet")
+                      summary_ready_df, _ = prepare_reversal_summary_transactions(df)
                       qrisduwit_df = prepare_transaction_detail_export(
-                          df,
+                          summary_ready_df,
                           transaction="QRISDUWIT",
                           include_disbursement_date=True,
                       )
@@ -574,6 +606,11 @@ tasks:
 
                       Kestra.outputs({
                           "rows": len(qrisduwit_df),
+                          "source_rows": int((df["Transaction"].astype(str).str.upper() == "QRISDUWIT").sum()),
+                          "excluded_rows": int(
+                              (df["Transaction"].astype(str).str.upper() == "QRISDUWIT").sum()
+                              - len(qrisduwit_df)
+                          ),
                           "missing_disbursement_dates": missing_disbursement_dates,
                       })
 
@@ -616,7 +653,7 @@ tasks:
 
                   - id: upload_qrisduwit_to_sheets
                     type: io.kestra.plugin.scripts.python.Script
-                    runIf: "{{ inputs.dry_run == false }}"
+                    runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
                     containerImage: finpay-pipeline:3.11
                     pythonVersion: "3.11"
                     timeout: PT10M
@@ -767,7 +804,7 @@ tasks:
 
                   - id: upload_reversal_to_sheets
                     type: io.kestra.plugin.scripts.python.Script
-                    runIf: "{{ inputs.dry_run == false }}"
+                    runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
                     containerImage: finpay-pipeline:3.11
                     pythonVersion: "3.11"
                     timeout: PT10M
@@ -988,7 +1025,7 @@ tasks:
                   # ── TASK 7 ─ Upload summary to Google Sheets ────────────────────────
                   - id: upload_to_sheets
                     type: io.kestra.plugin.scripts.python.Script
-                    runIf: "{{ inputs.dry_run == false }}"
+                    runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
                     containerImage: finpay-pipeline:3.11
                     pythonVersion: "3.11"
                     timeout: PT10M
@@ -1003,6 +1040,7 @@ tasks:
                     env:
                       TARGET_SPREADSHEET: "{{ outputs.parse_and_resolve.vars.target_spreadsheet }}"
                       TARGET_WORKSHEET: "{{ outputs.determine_current_date.vars.summary_worksheet }}"
+                      REPORT_DATE: "{{ outputs.parse_and_resolve.vars.iso_date }}"
                       STARTING_BALANCE_DATE: "{{ outputs.parse_and_resolve.vars.starting_balance_date }}"
                       DEFAULT_STARTING_BALANCE: "{{ outputs.parse_and_resolve.vars.default_starting_balance }}"
                       FINPAY_SPREADSHEET_WRITER_EMAILS: "{{ secret('FINPAY_SPREADSHEET_WRITER_EMAILS') }}"
@@ -1037,10 +1075,11 @@ tasks:
                               target_worksheet=os.environ["TARGET_WORKSHEET"],
                               summary_df=summary_df,
                               starting_balance_date=os.environ["STARTING_BALANCE_DATE"],
-                              default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
-                              gspread_client=client,
-                              qrisduwit_df=qrisduwit_df,
-                          )
+                               default_starting_balance=int(os.environ["DEFAULT_STARTING_BALANCE"]),
+                               gspread_client=client,
+                               qrisduwit_df=qrisduwit_df,
+                               report_date=os.environ["REPORT_DATE"],
+                           )
 
                           print(f"✅ Written to sheet rows {insert_row}–{block_end}.")
                           Kestra.outputs({
@@ -1055,29 +1094,26 @@ tasks:
 
                   - id: pause_after_summary_sheet_write
                     type: io.kestra.plugin.core.flow.Sleep
-                    runIf: "{{ inputs.dry_run == false }}"
+                    runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
                     duration: PT10S
 
 errors:
-  # ── TODO: replace with a real notification plugin once your channel is ready ──
-  # e.g. io.kestra.plugin.notifications.slack.SlackIncomingWebhook
-  #      io.kestra.plugin.notifications.mail.SendMail
-  #      io.kestra.plugin.notifications.teams.TeamsIncomingWebhook
-  # ────────────────────────────────────────────────────────────────────────────
   - id: notify_on_failure
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: finpay-pipeline:3.11
-    pythonVersion: "3.11"
-    env:
-      EXECUTION_ID: "{{ execution.id }}"
-      FLOW_ID: "{{ flow.id }}"
-      NAMESPACE: "{{ flow.namespace }}"
-    script: |
-      import os
-      execution_id = os.environ.get("EXECUTION_ID", "unknown")
-      flow_id      = os.environ.get("FLOW_ID",      "unknown")
-      namespace    = os.environ.get("NAMESPACE",    "unknown")
-      print("❌ Pipeline failed!")
-      print(f"   Flow      : {namespace}.{flow_id}")
-      print(f"   Execution : {execution_id}")
-      print(f"   Logs      : /ui/executions/{execution_id}")
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://api.telegram.org/bot{{ secret('TELEGRAM_BOT_TOKEN') }}/sendMessage"
+    method: POST
+    contentType: multipart/form-data
+    timeout: PT1M
+    retry:
+      type: exponential
+      interval: PT15S
+      maxInterval: PT60S
+      maxAttempts: 3
+    formData:
+      chat_id: "{{ secret('TELEGRAM_CHAT_ID') }}"
+      text: |
+        FinPay pipeline failed.
+
+        Flow: {{ flow.namespace }}.{{ flow.id }}
+        Execution: {{ execution.id }}
+        Logs: /ui/executions/{{ execution.id }}

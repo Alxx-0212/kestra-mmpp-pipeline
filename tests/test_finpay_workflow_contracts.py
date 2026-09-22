@@ -6,6 +6,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPOSITORY_ROOT / "finpay_pipeline.yml"
+MONTHLY_WORKFLOW_PATH = REPOSITORY_ROOT / "finpay_monthly_materialization.yml"
 PACKAGE_API_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "__init__.py"
 FINPAY_README_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "README.md"
 
@@ -78,11 +79,15 @@ EXPECTED_CLUSTER_WORKSHEETS = {
     "421318": "MRW",
     "421320": "TNT",
 }
-EXPECTED_SPREADSHEET_NAME = "Salinan dari MONITORING FINPAY"
+EXPECTED_SPREADSHEET_NAME = "Salinan dari Monitoring Finpay & LinkAja"
 
 
 def _workflow_text():
     return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+def _monthly_workflow_text():
+    return MONTHLY_WORKFLOW_PATH.read_text(encoding="utf-8")
 
 
 def _literal_package_exports():
@@ -135,10 +140,11 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         text = _workflow_text()
         self.assertRegex(text, r"(?m)^id: finpay_daily_pipeline_v5$")
         self.assertRegex(text, r"(?m)^namespace: finance\.finpay$")
+        self.assertRegex(text, r"(?ms)^concurrency:\s+limit: 1\s+behavior: QUEUE$")
         inputs = text.split("\ninputs:\n", 1)[1].split("\ntasks:\n", 1)[0]
         self.assertEqual(
             re.findall(r"(?m)^  - id: ([A-Za-z0-9_-]+)$", inputs),
-            ["csv_file", "dry_run"],
+            ["csv_file", "dry_run", "source_filename", "write_gsheet"],
         )
         self.assertNotRegex(text, r"(?m)^triggers:$")
 
@@ -221,6 +227,11 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                 self.assertIn("runIf:", task_block)
                 self.assertIn("inputs.dry_run == false", task_block)
 
+    def test_summary_upload_passes_explicit_report_date(self):
+        task_block = _task_block(_workflow_text(), "upload_to_sheets")
+        self.assertIn("REPORT_DATE:", task_block)
+        self.assertIn('report_date=os.environ["REPORT_DATE"]', task_block)
+
     def test_compatibility_facades_reexport_the_package(self):
         expected = "from finpay_pipeline import *"
         for relative_path in ("pipeline.py", "pipeline_refactored.py"):
@@ -238,7 +249,12 @@ class FinPayWorkflowContractTest(unittest.TestCase):
             "no Kestra trigger or schedule",
             "csv_file",
             "dry_run",
+            "source_filename",
+            "write_gsheet",
             "Asia/Makassar",
+            "2026-09-01",
+            "SELLTHRUSALESFEE",
+            "finpay_monthly_materialization_v1",
             EXPECTED_SPREADSHEET_NAME,
         ):
             with self.subTest(contract=required_contract):
@@ -264,6 +280,34 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                 self.assertIn(f"`{table_name}`", readme)
 
         self.assertIn("Legacy `.xls` is explicitly rejected", normalized_readme)
+
+
+class FinPayMonthlyWorkflowContractTest(unittest.TestCase):
+    def test_monthly_flow_identity_and_inputs(self):
+        text = _monthly_workflow_text()
+        self.assertRegex(text, r"(?m)^id: finpay_monthly_materialization_v1$")
+        self.assertRegex(text, r"(?m)^namespace: finance\.finpay$")
+        for input_id in (
+            "cluster_id",
+            "report_month",
+            "calculation_cutoff",
+            "expected_source_dates",
+            "expected_source_fingerprint",
+            "publish",
+            "write_gsheet",
+        ):
+            self.assertIn(f"- id: {input_id}", text)
+
+    def test_monthly_publication_requires_readiness_and_fingerprint(self):
+        text = _monthly_workflow_text()
+        self.assertIn("expected_source_fingerprint is required", text)
+        self.assertIn("publish_finpay_monthly_snapshot", text)
+        self.assertIn("source_fingerprint", text)
+
+    def test_monthly_workflow_imports_are_in_the_public_api(self):
+        workflow_imports = _workflow_imports(_monthly_workflow_text())
+        package_exports = _literal_package_exports()
+        self.assertEqual(workflow_imports - package_exports, set())
 
 
 if __name__ == "__main__":

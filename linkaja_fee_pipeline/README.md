@@ -12,6 +12,9 @@ contracts, schema suitability assessment, and delivery sequence are in
 The reproducible July source-bundle result and finance-readiness assessment are
 in [`JULY_2026_WORKFLOW_TEST_SUMMARY.md`](JULY_2026_WORKFLOW_TEST_SUMMARY.md).
 
+The forward-looking daily-evidence and monthly-finalization hardening plan is in
+[`LINKAJA_DAILY_MONTHLY_REVERSAL_PLAN.md`](LINKAJA_DAILY_MONTHLY_REVERSAL_PLAN.md).
+
 The source export is an account ledger, not one row per business transaction.
 One transaction can have one or more ledger rows because LinkAja reports the
 movement of each affected account. All calculations therefore start by

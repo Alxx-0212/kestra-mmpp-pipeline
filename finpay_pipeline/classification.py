@@ -1,4 +1,5 @@
 """Transaction relabeling, fee validation, and unusual-row classification."""
+from datetime import date
 import re
 
 import pandas as pd
@@ -30,6 +31,9 @@ REVERSAL_ST_SALES_HOLD_REMARK = 'sales hold transaksi sellthru'
 REVERSAL_ST_UNSUPPORTED_REASON = 'unsupported reversal ST category'
 PROCESSED_TRANSACTION_LABEL_COLUMN = 'processed_transaction_label'
 STANDALONE_SELLTHRU_REMARK = 'transaksi sellthru'
+ST_RULE_CUTOFF_DATE = date(2026, 9, 1)
+ST_RULE_LEGACY = 'legacy'
+ST_RULE_CURRENT = 'current'
 
 # Transaction group validation rules. A group is keyed by Transaction ID with
 # fee suffixes removed, then the main transaction determines the required rows.
@@ -49,11 +53,7 @@ TRANSACTION_GROUP_RULES = {
                 'column': 'Debet',
                 'equals': 100,
             },
-            'SELLTHRUSALESFEE': {
-                'presence_only': True,
-            },
         },
-        'exempt_remark': STANDALONE_SELLTHRU_REMARK,
     },
     REVERSAL_NGRS_CATEGORY: {
         'required': {
@@ -281,6 +281,57 @@ def _base_id_from_transaction_id(transaction_id: pd.Series) -> pd.Series:
         transaction_id.astype(str)
         .str.replace(r'(SLSFEE|SALESFEE|FEE)$', '', regex=True)
     )
+
+
+def _st_rule_era_for_group(group: pd.DataFrame) -> tuple[str | None, str | None]:
+    """Return the ST policy era for one transaction family.
+
+    Transaction timestamps are the source of truth. A family that crosses the
+    cutover cannot be assigned one deterministic fee policy, so it is rejected
+    rather than silently applying one side of the boundary to all rows.
+    """
+    if 'Transaction Date' not in group.columns:
+        return None, 'missing Transaction Date for ST rule classification'
+
+    parsed = pd.to_datetime(group['Transaction Date'], errors='coerce')
+    if parsed.isna().any():
+        return None, 'invalid Transaction Date for ST rule classification'
+
+    eras = set((value.date() >= ST_RULE_CUTOFF_DATE) for value in parsed)
+    if len(eras) != 1:
+        return None, 'ST transaction family crosses the 2026-09-01 rule cutoff'
+    return (
+        ST_RULE_CURRENT if True in eras else ST_RULE_LEGACY,
+        None,
+    )
+
+
+def _is_standalone_sellthru_source_row(row: pd.Series) -> bool:
+    """Identify the exact raw RECHARGE exception, not a processed ST row."""
+    raw_label = str(row.get('raw_transaction_label', '')).strip().upper()
+    return (
+        raw_label == 'RECHARGE'
+        and _normalize_remark_pattern(row.get('Remarks')) == STANDALONE_SELLTHRU_REMARK
+    )
+
+
+def _st_fee_validation_reasons(
+    group: pd.DataFrame,
+    *,
+    require_sales_fee: bool,
+) -> list[str]:
+    reasons = []
+    fee_rows = group[group['Transaction'] == 'SELLTHRUFEE']
+    if fee_rows.empty:
+        reasons.append('missing SELLTHRUFEE')
+    else:
+        actual = _numeric_sum(fee_rows, 'Debet')
+        if actual != 100:
+            reasons.append(f'SELLTHRUFEE Debet={actual} (expected 100)')
+
+    if require_sales_fee and group[group['Transaction'] == 'SELLTHRUSALESFEE'].empty:
+        reasons.append('missing SELLTHRUSALESFEE')
+    return reasons
 
 
 def relabel_out_cluster_transactions(df: pd.DataFrame) -> pd.DataFrame:
@@ -561,22 +612,128 @@ def _collect_unknown_transaction_or_remark_unusual_transactions(
         )
 
     unusual_mask = unknown_mask | remark_mismatch_mask
-    unusual_df = source.loc[unusual_mask].copy()
-    excluded_indices = set(unusual_df.index)
-    if unusual_df.empty:
-        unusual_df['base_id'] = pd.Series(dtype='object')
-        unusual_df['unusual_reason'] = pd.Series(dtype='object')
-        return unusual_df, excluded_indices
-
-    unusual_df['unusual_reason'] = [
-        (
+    row_reasons = {
+        index: (
             _unknown_transaction_reason(source.at[index, 'Transaction'])
             if bool(unknown_mask.at[index])
             else _unknown_remark_reason(source.at[index, 'Transaction'])
         )
+        for index in source.index[unusual_mask]
+    }
+    if not row_reasons:
+        unusual_df = source.iloc[0:0].copy()
+        unusual_df['base_id'] = pd.Series(dtype='object')
+        unusual_df['unusual_reason'] = pd.Series(dtype='object')
+        return unusual_df, set()
+
+    unusual_base_ids = set(source.loc[list(row_reasons), 'base_id'])
+    excluded_indices = set(
+        source.index[source['base_id'].isin(unusual_base_ids)]
+    )
+    unusual_df = source.loc[sorted(excluded_indices)].copy()
+    first_reason_by_base_id = {}
+    for index, reason in row_reasons.items():
+        first_reason_by_base_id.setdefault(source.at[index, 'base_id'], reason)
+    unusual_df['unusual_reason'] = [
+        row_reasons.get(
+            index,
+            f'{first_reason_by_base_id[source.at[index, "base_id"]]}; '
+            'transaction family excluded',
+        )
         for index in unusual_df.index
     ]
     unusual_df = unusual_df.sort_values(['base_id', 'No']).reset_index(drop=True)
+    return unusual_df, excluded_indices
+
+
+def _collect_st_family_unusual_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[int]]:
+    """Apply the date-versioned ST family contract once per base transaction."""
+    source = df.copy()
+    source['base_id'] = _base_id_from_transaction_id(source['Transaction ID'])
+    invalid_parts = []
+    excluded_indices = set()
+
+    for base_id, group in source.groupby('base_id', sort=False):
+        transaction = group['Transaction'].fillna('').astype(str).str.strip()
+        reversal_mask = transaction.apply(_is_reversal_transaction_label)
+        non_reversal_group = group[~reversal_mask]
+        if non_reversal_group.empty:
+            continue
+
+        labels = set(non_reversal_group['Transaction'])
+        if 'SELLTHRU' not in labels:
+            continue
+
+        main_rows = non_reversal_group[
+            ~non_reversal_group['Transaction'].str.upper().str.endswith('FEE')
+        ]
+        standalone_rows = main_rows[
+            main_rows.apply(_is_standalone_sellthru_source_row, axis=1)
+        ]
+        if not standalone_rows.empty:
+            unexpected_rows = non_reversal_group[
+                ~non_reversal_group['Transaction'].eq('SELLTHRU')
+            ]
+            if len(main_rows) != len(standalone_rows) or not unexpected_rows.empty:
+                reasons = [
+                    'standalone SELLTHRU must not have fee or companion rows; '
+                    'excluded from summary'
+                ]
+                unusual_rows = group.copy()
+                unusual_rows['base_id'] = base_id
+                unusual_rows['unusual_reason'] = reasons[0]
+                invalid_parts.append(unusual_rows)
+                excluded_indices.update(group.index)
+            continue
+
+        era, era_reason = _st_rule_era_for_group(non_reversal_group)
+        if era_reason:
+            unusual_rows = group.copy()
+            unusual_rows['base_id'] = base_id
+            unusual_rows['unusual_reason'] = f'{era_reason}; excluded from summary'
+            invalid_parts.append(unusual_rows)
+            excluded_indices.update(group.index)
+            continue
+
+        sales_fee_rows = non_reversal_group[
+            non_reversal_group['Transaction'] == 'SELLTHRUSALESFEE'
+        ]
+        reasons = []
+        exclude_from_summary = False
+        if era == ST_RULE_CURRENT and not sales_fee_rows.empty:
+            reasons.append(
+                'SELLTHRUSALESFEE retired from 2026-09-01; excluded from summary'
+            )
+            exclude_from_summary = True
+        reasons.extend(
+            _st_fee_validation_reasons(
+                non_reversal_group,
+                require_sales_fee=era == ST_RULE_LEGACY,
+            )
+        )
+        if not reasons:
+            continue
+
+        summary_status = (
+            'excluded from summary' if exclude_from_summary else 'included in summary'
+        )
+        unusual_rows = group.copy()
+        unusual_rows['base_id'] = base_id
+        unusual_rows['unusual_reason'] = '; '.join(reasons) + f'; {summary_status}'
+        invalid_parts.append(unusual_rows)
+        if exclude_from_summary:
+            excluded_indices.update(group.index)
+
+    if invalid_parts:
+        unusual_df = pd.concat(invalid_parts, ignore_index=True, sort=False)
+        unusual_df = unusual_df.sort_values(['base_id', 'No']).reset_index(drop=True)
+    else:
+        unusual_df = source.iloc[0:0].copy()
+        unusual_df['base_id'] = pd.Series(dtype='object')
+        unusual_df['unusual_reason'] = pd.Series(dtype='object')
+
     return unusual_df, excluded_indices
 
 
@@ -744,7 +901,13 @@ def preprocess_transaction_labels(df: pd.DataFrame) -> pd.DataFrame:
     Apply all transaction relabeling before unusual detection and downstream
     calculation/detail paths.
     """
-    result = relabel_reversal_transactions(df)
+    result = df.copy()
+    if 'raw_transaction_label' not in result.columns:
+        result['raw_transaction_label'] = result['Transaction']
+    result['Transaction'] = (
+        result['Transaction'].fillna('').astype(str).str.strip().str.upper()
+    )
+    result = relabel_reversal_transactions(result)
     result = relabel_standalone_sellthru_transactions(result)
     result = relabel_out_cluster_transactions(result)
     result = relabel_pembelian_recharge_out_cluster_transactions(result)
@@ -858,57 +1021,54 @@ def _collect_reversal_unusual_transactions(
     return unusual_df, excluded_indices, categorized_counts
 
 
-def prepare_reversal_summary_transactions(
+def _collect_validation_unusual_transactions(
     df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Prepare reversal labels for summary and return unusual summary rows.
-
-    Invalid NGRS, Recharge Out Cluster, and Recharge-type fee-only groups stay
-    in the summary but are flagged. ST, ambiguous, or unclassified groups are
-    flagged and excluded.
-    """
-    result = ensure_reversal_labels_prepared(df)
+) -> tuple[pd.DataFrame, set[int], dict[str, int]]:
+    """Evaluate all non-duplicate rows through one shared disposition path."""
     unknown_unusual_df, unknown_excluded_indices = (
-        _collect_unknown_transaction_or_remark_unusual_transactions(result)
+        _collect_unknown_transaction_or_remark_unusual_transactions(df)
     )
     known_result = (
-        result.drop(index=sorted(unknown_excluded_indices))
+        df.drop(index=sorted(unknown_excluded_indices))
         if unknown_excluded_indices
-        else result
+        else df
     )
-    fee_cap_unusual_df, fee_cap_excluded_indices = (
-        _collect_fee_cap_excess_transactions(known_result)
+    st_unusual_df, st_excluded_indices = _collect_st_family_unusual_transactions(
+        known_result
     )
-    validation_result = (
-        known_result.drop(index=sorted(fee_cap_excluded_indices))
-        if fee_cap_excluded_indices
+    st_result = (
+        known_result.drop(index=sorted(st_excluded_indices))
+        if st_excluded_indices
         else known_result
     )
-    unusual_df, excluded_indices, categorized_counts = (
+    fee_cap_unusual_df, fee_cap_excluded_indices = (
+        _collect_fee_cap_excess_transactions(st_result)
+    )
+    validation_result = (
+        st_result.drop(index=sorted(fee_cap_excluded_indices))
+        if fee_cap_excluded_indices
+        else st_result
+    )
+    reversal_unusual_df, reversal_excluded_indices, categorized_counts = (
         _collect_reversal_unusual_transactions(validation_result)
     )
     fee_only_unusual_df, fee_only_excluded_indices = (
         _collect_fee_only_unusual_transactions(validation_result)
     )
     all_excluded_indices = (
-        set(fee_cap_excluded_indices)
-        | set(unknown_excluded_indices)
-        | set(excluded_indices)
+        set(unknown_excluded_indices)
+        | set(st_excluded_indices)
+        | set(fee_cap_excluded_indices)
+        | set(reversal_excluded_indices)
         | set(fee_only_excluded_indices)
     )
-
-    if all_excluded_indices:
-        summary_ready = result.drop(index=sorted(all_excluded_indices)).reset_index(drop=True)
-    else:
-        summary_ready = result.reset_index(drop=True)
-
     unusual_parts = [
         part for part in (
             fee_cap_unusual_df,
             unknown_unusual_df,
-            unusual_df,
-            fee_only_unusual_df,
+            st_unusual_df,
+            _flag_fee_rule_unusual_transactions(validation_result),
+            reversal_unusual_df,
         )
         if not part.empty
     ]
@@ -920,15 +1080,31 @@ def prepare_reversal_summary_transactions(
         ]
         if sort_cols:
             unusual_df = unusual_df.sort_values(sort_cols).reset_index(drop=True)
-        else:
-            unusual_df = unusual_df.reset_index(drop=True)
+    else:
+        unusual_df = df.iloc[0:0].copy()
+        unusual_df['base_id'] = pd.Series(dtype='object')
+        unusual_df['unusual_reason'] = pd.Series(dtype='object')
+
+    return unusual_df, all_excluded_indices, categorized_counts
+
+
+def prepare_reversal_summary_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Prepare summary rows and unusual rows through one shared evaluator."""
+    result = ensure_reversal_labels_prepared(df)
+    unusual_df, all_excluded_indices, categorized_counts = (
+        _collect_validation_unusual_transactions(result)
+    )
+    summary_ready = (
+        result.drop(index=sorted(all_excluded_indices)).reset_index(drop=True)
+        if all_excluded_indices
+        else result.reset_index(drop=True)
+    )
 
     print(f'Reversal rows categorized for summary: {categorized_counts}')
     print(f'Summary unusual rows flagged: {len(unusual_df)}')
-    print(f'Fee cap rows excluded from summary: {len(fee_cap_excluded_indices)}')
-    print(f'Unknown rows excluded from summary: {len(unknown_excluded_indices)}')
-    print(f'Reversal rows excluded from summary: {len(excluded_indices)}')
-    print(f'Fee-only rows excluded from summary: {len(fee_only_excluded_indices)}')
+    print(f'Summary rows excluded from summary: {len(all_excluded_indices)}')
     return summary_ready, unusual_df
 
 
@@ -961,6 +1137,9 @@ def _flag_fee_rule_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
         if main_rows.empty:
             continue
         txn_type = main_rows['Transaction'].iloc[0]
+        if txn_type == 'SELLTHRU':
+            # ST is date-versioned and validated by the family evaluator below.
+            continue
         if txn_type not in TRANSACTION_GROUP_RULES:
             continue
         reasons = _validate_transaction_group_rules(non_reversal_group, txn_type)
@@ -990,33 +1169,15 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     positives. Downstream calculation tasks still perform their own dedup step.
     """
     deduplicated_df, duplicate_unusual_df = deduplicate_rows_by_minute_with_report(df)
-    unknown_unusual_df, unknown_excluded_indices = (
-        _collect_unknown_transaction_or_remark_unusual_transactions(deduplicated_df)
+    validation_unusual_df, _, _ = _collect_validation_unusual_transactions(
+        deduplicated_df
     )
-    known_df = (
-        deduplicated_df.drop(index=sorted(unknown_excluded_indices))
-        if unknown_excluded_indices
-        else deduplicated_df
-    )
-    fee_cap_unusual_df, fee_cap_excluded_indices = (
-        _collect_fee_cap_excess_transactions(known_df)
-    )
-    validation_df = (
-        known_df.drop(index=sorted(fee_cap_excluded_indices))
-        if fee_cap_excluded_indices
-        else known_df
-    )
-    fee_unusual_df = _flag_fee_rule_unusual_transactions(validation_df)
-    reversal_unusual_df, _, _ = _collect_reversal_unusual_transactions(validation_df)
 
     unusual_parts = [
         part
         for part in (
-            fee_cap_unusual_df,
-            unknown_unusual_df,
-            fee_unusual_df,
+            validation_unusual_df,
             duplicate_unusual_df,
-            reversal_unusual_df,
         )
         if not part.empty
     ]
@@ -1031,12 +1192,9 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
         else:
             result = result.reset_index(drop=True)
     else:
-        result = fee_unusual_df
+        result = validation_unusual_df
 
     print(f'Combined unusual rows      : {len(result)}')
-    print(f'Fee cap unusual rows       : {len(fee_cap_unusual_df)}')
-    print(f'Unknown transaction/remarks: {len(unknown_unusual_df)}')
+    print(f'Validation unusual rows    : {len(validation_unusual_df)}')
     print(f'Duplicate unusual rows     : {len(duplicate_unusual_df)}')
-    print(f'Fee-rule unusual rows      : {len(fee_unusual_df)}')
-    print(f'Reversal unusual rows      : {len(reversal_unusual_df)}')
     return result

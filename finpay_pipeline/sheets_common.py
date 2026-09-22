@@ -3,12 +3,86 @@ import os
 
 import gspread
 import pandas as pd
+import requests
+from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.service_account import Credentials
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 DEFAULT_ROW_BUFFER = 200
 DEFAULT_BORDER_COLOR = {"red": 0.850, "green": 0.870, "blue": 0.890}
 DEFAULT_ZEBRA_STRIPE_COLOR = {"red": 0.900, "green": 0.945, "blue": 1.000}
+GOOGLE_DISCOVERY_URL = "https://sheets.googleapis.com/$discovery/rest?version=v4"
+
+
+def _google_timeout() -> tuple[float, float]:
+    connect = float(os.environ.get("FINPAY_GOOGLE_CONNECT_TIMEOUT", "10"))
+    read = float(os.environ.get("FINPAY_GOOGLE_READ_TIMEOUT", "45"))
+    if connect <= 0 or read <= 0:
+        raise ValueError("Google timeout values must be positive")
+    return connect, read
+
+
+def _google_retry_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"}),
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+class _GoogleAuthorizedSession(AuthorizedSession):
+    """AuthorizedSession with a default timeout for OAuth and API calls."""
+
+    def __init__(self, credentials: Credentials):
+        super().__init__(credentials)
+        self._default_timeout = _google_timeout()
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.mount("https://", adapter)
+        self.mount("http://", adapter)
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", self._default_timeout)
+        return super().request(method, url, **kwargs)
+
+
+def google_api_preflight() -> dict:
+    """Fail fast when the Google API network path is unavailable."""
+    connect_timeout, read_timeout = _google_timeout()
+    try:
+        response = _google_retry_session().get(
+            GOOGLE_DISCOVERY_URL,
+            timeout=(connect_timeout, read_timeout),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "Google API preflight failed; check outbound HTTPS/proxy access "
+            f"to {GOOGLE_DISCOVERY_URL}: {exc}"
+        ) from exc
+    print(f"Google API preflight passed: HTTP {response.status_code}")
+    return {"url": GOOGLE_DISCOVERY_URL, "status": response.status_code}
 DEFAULT_WHITE_COLOR = {"red": 1, "green": 1, "blue": 1}
 
 
@@ -111,8 +185,13 @@ def make_gspread_client(sa_key_path: str):
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
+    google_api_preflight()
     creds = Credentials.from_service_account_file(sa_key_path, scopes=SCOPES)
-    return gspread.authorize(creds)
+    session = _GoogleAuthorizedSession(creds)
+    client = gspread.Client(auth=None, session=session)
+    client.auth = creds
+    client.http_client.set_timeout(_google_timeout())
+    return client
 
 
 def open_or_create_finpay_spreadsheet(gspread_client, title: str):

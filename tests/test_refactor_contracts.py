@@ -8,6 +8,8 @@ from finpay_pipeline import (
     classification,
     detail_exports,
     loading,
+    monthly,
+    sheets_common,
     summary_sheets,
     unusual_sheets,
 )
@@ -92,6 +94,57 @@ def _non_reversal_rows(transactions):
             "Nomor RS": "",
             "Remarks": known_remarks.get(transaction, ""),
         })
+    return pd.DataFrame(rows)
+
+
+def _sellthru_family_rows(
+    transaction_date="2026-09-02 10:00:00",
+    *,
+    fee_amount=100,
+    include_sales_fee=False,
+    standalone=False,
+):
+    rows = [{
+        "No": 1,
+        "Transaction Date": pd.Timestamp(transaction_date),
+        "Transaction ID": "STFAMILY",
+        "Saldo Awal": 1000,
+        "Kredit": 1000,
+        "Debet": 0,
+        "Saldo Akhir": 2000,
+        "Transaction Type": "CREDIT",
+        "Transaction": "RECHARGE" if standalone else "SELLTHRU",
+        "raw_transaction_label": "RECHARGE" if standalone else "SELLTHRU",
+        "processed_transaction_label": "RECHARGE" if standalone else "SELLTHRU",
+        "Nomor RS": "",
+        "Remarks": "TRANSAKSI SELLTHRU" if standalone else "Sellthru Sales Fee",
+    }]
+    if not standalone:
+        rows.append({
+            **rows[0],
+            "No": 2,
+            "Transaction ID": "STFAMILYFEE",
+            "Kredit": 0,
+            "Debet": fee_amount,
+            "Saldo Akhir": 900,
+            "Transaction": "SELLTHRUFEE",
+            "raw_transaction_label": "SELLTHRUFEE",
+            "processed_transaction_label": "SELLTHRUFEE",
+            "Remarks": "Platform fee sellthru rp. 100,-",
+        })
+        if include_sales_fee:
+            rows.append({
+                **rows[0],
+                "No": 3,
+                "Transaction ID": "STFAMILYSALESFEE",
+                "Kredit": 0,
+                "Debet": 10,
+                "Saldo Akhir": 890,
+                "Transaction": "SELLTHRUSALESFEE",
+                "raw_transaction_label": "SELLTHRUSALESFEE",
+                "processed_transaction_label": "SELLTHRUSALESFEE",
+                "Remarks": "Sales hold transaksi sellthru sejumlah 10 rupiah, dari 411311",
+            })
     return pd.DataFrame(rows)
 
 
@@ -278,6 +331,183 @@ class StandaloneSellthruClassificationContractTest(unittest.TestCase):
             "unknown remarks pattern for transaction: RECHARGE; excluded from summary",
         )
         self.assertTrue(summary_ready.empty)
+
+    def test_standalone_sellthru_remains_fee_free_after_cutover(self):
+        df = _sellthru_family_rows(standalone=True)
+        df["Transaction"] = "recharge"
+        df["raw_transaction_label"] = "recharge"
+        preprocessed = classification.preprocess_transaction_labels(df)
+
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, summary_unusual = (
+            classification.prepare_reversal_summary_transactions(preprocessed)
+        )
+
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["SELLTHRU"])
+
+    def test_standalone_sellthru_with_companion_is_quarantined(self):
+        standalone = _sellthru_family_rows(standalone=True)
+        companion = _sellthru_family_rows(standalone=False).iloc[[1]].copy()
+        companion["No"] = 2
+        df = pd.concat([standalone, companion], ignore_index=True)
+        preprocessed = classification.preprocess_transaction_labels(df)
+
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, _ = classification.prepare_reversal_summary_transactions(
+            preprocessed,
+        )
+
+        self.assertEqual(len(unusual), 2)
+        self.assertTrue(
+            unusual["unusual_reason"].str.contains(
+                "standalone SELLTHRU must not have fee",
+                regex=False,
+            ).all()
+        )
+        self.assertTrue(summary_ready.empty)
+
+    def test_direct_sellthru_does_not_receive_recharge_exception(self):
+        df = _sellthru_family_rows(standalone=True)
+        df["Transaction"] = "SELLTHRU"
+        df["raw_transaction_label"] = "SELLTHRU"
+        df["processed_transaction_label"] = "SELLTHRU"
+        preprocessed = classification.preprocess_transaction_labels(df)
+
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, _ = classification.prepare_reversal_summary_transactions(
+            preprocessed,
+        )
+
+        self.assertEqual(len(unusual), 1)
+        self.assertIn("missing SELLTHRUFEE", unusual.iloc[0]["unusual_reason"])
+        self.assertEqual(len(summary_ready), 1)
+
+
+class SellthruEffectiveDateContractTest(unittest.TestCase):
+    def _evaluate(self, df):
+        preprocessed = classification.preprocess_transaction_labels(df)
+        return (
+            classification.flag_unusual_transactions(preprocessed),
+            *classification.prepare_reversal_summary_transactions(preprocessed),
+        )
+
+    def test_legacy_sellthru_requires_sales_fee(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-08-31 23:59:59",
+            include_sales_fee=True,
+        )
+
+        unusual, summary_ready, summary_unusual = self._evaluate(df)
+
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(len(summary_ready), 3)
+
+    def test_current_sellthru_requires_only_rp100_fee(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-09-01 00:00:00",
+            include_sales_fee=False,
+        )
+
+        unusual, summary_ready, summary_unusual = self._evaluate(df)
+
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["SELLTHRU", "SELLTHRUFEE"])
+
+    def test_current_sellthru_sales_fee_quarantines_whole_family(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-09-02 10:00:00",
+            include_sales_fee=True,
+        )
+
+        unusual, summary_ready, summary_unusual = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 3)
+        self.assertTrue(summary_ready.empty)
+        self.assertEqual(len(summary_unusual), 3)
+        self.assertTrue(
+            summary_unusual["unusual_reason"].str.contains(
+                "SELLTHRUSALESFEE retired",
+                regex=False,
+            ).all()
+        )
+
+    def test_current_invalid_fee_is_flagged_but_remains_in_summary(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-09-02 10:00:00",
+            fee_amount=80,
+        )
+
+        unusual, summary_ready, summary_unusual = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 2)
+        self.assertEqual(len(summary_ready), 2)
+        self.assertEqual(len(summary_unusual), 2)
+        self.assertTrue(
+            summary_unusual["unusual_reason"].str.contains(
+                "SELLTHRUFEE Debet=80",
+                regex=False,
+            ).all()
+        )
+
+    def test_unknown_remarks_quarantine_the_complete_family(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-09-02 10:00:00",
+            fee_amount=100,
+        )
+        df.loc[df["Transaction"] == "SELLTHRUFEE", "Remarks"] = "unexpected fee"
+
+        unusual, summary_ready, summary_unusual = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 2)
+        self.assertTrue(summary_ready.empty)
+        self.assertEqual(len(summary_unusual), 2)
+
+    def test_mixed_cutover_family_is_quarantined(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-08-31 23:59:59",
+            include_sales_fee=True,
+        )
+        df.loc[df["Transaction"] == "SELLTHRUFEE", "Transaction Date"] = pd.Timestamp(
+            "2026-09-01 00:00:00"
+        )
+
+        unusual, summary_ready, summary_unusual = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 3)
+        self.assertTrue(summary_ready.empty)
+        self.assertEqual(len(summary_unusual), 3)
+
+
+class SellthruSheetLayoutContractTest(unittest.TestCase):
+    def test_sheet_keeps_hold_row_before_cutover(self):
+        summary = pd.DataFrame({
+            "Transaction": ["SELLTHRU"],
+            "Transaction_Date": ["2026-08-31"],
+        })
+
+        self.assertTrue(
+            summary_sheets._uses_legacy_st_sales_fee_layout(
+                summary,
+                report_date="2026-08-31",
+            )
+        )
+
+    def test_sheet_removes_hold_row_after_cutover(self):
+        summary = pd.DataFrame({
+            "Transaction": ["SELLTHRU", "SELLTHRUFEE"],
+            "Transaction_Date": ["2026-09-01", "2026-09-01"],
+        })
+
+        self.assertFalse(
+            summary_sheets._uses_legacy_st_sales_fee_layout(
+                summary,
+                report_date="2026-09-01",
+            )
+        )
 
 
 class SharedSpreadsheetOpenContractTest(unittest.TestCase):
@@ -883,6 +1113,315 @@ class QrisduwitInvoiceRowsContractTest(unittest.TestCase):
         self.assertIn('INDIRECT("F"&ROW()+2&":F")', formula)
         self.assertIn('INDIRECT("D"&ROW()+2&":D")', formula)
         self.assertNotRegex(formula, r"[A-Z]+\\d+:[A-Z]+")
+
+
+class FinPayMonthlyTransactionContractTest(unittest.TestCase):
+    @staticmethod
+    def _events(rows):
+        defaults = {
+            "cluster_id": "411311",
+            "report_date": "2026-08-01",
+            "base_id": "TXN1",
+            "transaction_id_type": "MAIN",
+            "transaction_type": "CREDIT",
+            "saldo_awal": 1000,
+            "saldo_akhir": 1100,
+            "nomor_rs": "",
+            "load_id": "load-1",
+            "source_row_number": 1,
+        }
+        return pd.DataFrame([{**defaults, **row} for row in rows])
+
+    def _preview(self, rows, expected_dates=None):
+        if expected_dates is not None:
+            expected_dates = [
+                f"2026-08-{day:02d}" for day in range(1, 32)
+            ]
+        return monthly.build_finpay_monthly_preview_from_dataframe(
+            self._events(rows),
+            cluster_id="411311",
+            report_month="2026-08",
+            calculation_cutoff="2026-09-01T00:00:00",
+            expected_source_dates=expected_dates,
+            loaded_source_dates=expected_dates,
+            source_fingerprint="fingerprint-1",
+        )
+
+    def test_complete_exact_id_reversal_cancels_original_once(self):
+        result = self._preview([
+            {
+                "transaction_date": pd.Timestamp("2026-08-01 10:00:00"),
+                "transaction_id": "TXN1",
+                "raw_transaction_label": "RECHARGE",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 100,
+                "debet": 0,
+            },
+            {
+                "transaction_date": pd.Timestamp("2026-08-03 10:00:00"),
+                "transaction_id": "TXN1",
+                "raw_transaction_label": "REVERSAL",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 0,
+                "debet": 100,
+            },
+        ], ["2026-08-01", "2026-08-03"])
+
+        self.assertEqual(result["status"], monthly.MONTHLY_STATUS_READY)
+        self.assertEqual(result["unresolved_reversal_count"], 0)
+        self.assertEqual(result["category_rows"][0]["gross_amount"], 100.0)
+        self.assertEqual(result["category_rows"][0]["reversed_amount"], 100.0)
+        self.assertEqual(result["category_rows"][0]["net_payable"], 0.0)
+        self.assertFalse(result["transaction_rows"][0]["active_at_cutoff"])
+
+    def test_missing_original_blocks_month(self):
+        result = self._preview([
+            {
+                "transaction_date": pd.Timestamp("2026-08-03 10:00:00"),
+                "transaction_id": "MISSING",
+                "raw_transaction_label": "REVERSAL",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 0,
+                "debet": 100,
+            },
+        ], ["2026-08-03"])
+
+        self.assertEqual(result["status"], monthly.MONTHLY_STATUS_INCOMPLETE_REVERSALS)
+        self.assertEqual(result["unresolved_reversal_count"], 1)
+        self.assertFalse(result["release_ready"])
+
+    def test_ambiguous_originals_block_month(self):
+        result = self._preview([
+            {
+                "transaction_date": pd.Timestamp("2026-08-01 10:00:00"),
+                "transaction_id": "DUPLICATE",
+                "raw_transaction_label": "RECHARGE",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 100,
+                "debet": 0,
+            },
+            {
+                "transaction_date": pd.Timestamp("2026-08-02 10:00:00"),
+                "transaction_id": "DUPLICATE",
+                "raw_transaction_label": "RECHARGE",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 100,
+                "debet": 0,
+            },
+            {
+                "transaction_date": pd.Timestamp("2026-08-03 10:00:00"),
+                "transaction_id": "DUPLICATE",
+                "raw_transaction_label": "REVERSAL",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 0,
+                "debet": 100,
+            },
+        ], ["2026-08-01", "2026-08-02", "2026-08-03"])
+
+        self.assertEqual(result["status"], monthly.MONTHLY_STATUS_INCOMPLETE_REVERSALS)
+        self.assertEqual(result["unresolved_reversal_count"], 1)
+
+    def test_missing_source_manifest_blocks_final_readiness(self):
+        result = self._preview([
+            {
+                "transaction_date": pd.Timestamp("2026-08-01 10:00:00"),
+                "transaction_id": "TXN1",
+                "raw_transaction_label": "RECHARGE",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 100,
+                "debet": 0,
+            },
+        ])
+
+        self.assertEqual(result["status"], monthly.MONTHLY_STATUS_INCOMPLETE_SOURCE)
+        self.assertFalse(result["release_ready"])
+
+    def test_qris_missing_disbursement_blocks_month(self):
+        result = self._preview([
+            {
+                "transaction_date": pd.Timestamp("2026-08-01 10:00:00"),
+                "transaction_id": "QRIS1",
+                "raw_transaction_label": "QRISDUWIT",
+                "remarks": "Disburse Qris Duwit atas transaksi pembayaran QRIS",
+                "kredit": 100,
+                "debet": 0,
+            },
+        ], ["2026-08-01"])
+
+        self.assertEqual(result["qris_missing_disbursement_count"], 1)
+        self.assertEqual(result["status"], monthly.MONTHLY_STATUS_INCOMPLETE_REVERSALS)
+
+    def test_publish_rejects_incomplete_preview_before_database_write(self):
+        result = self._preview([
+            {
+                "transaction_date": pd.Timestamp("2026-08-01 10:00:00"),
+                "transaction_id": "TXN1",
+                "raw_transaction_label": "RECHARGE",
+                "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+                "kredit": 100,
+                "debet": 0,
+            },
+        ])
+
+        with self.assertRaisesRegex(ValueError, "not ready"):
+            monthly.publish_finpay_monthly_snapshot(
+                "unused-dsn",
+                result,
+                publication_id="publication-1",
+                expected_source_fingerprint="fingerprint-1",
+            )
+
+    def test_ineligible_reversal_cannot_cancel_original(self):
+        events = pd.DataFrame([
+            {
+                "event_id": "original",
+                "cluster_id": "411311",
+                "transaction_id": "TXN1",
+                "event_role": "ORIGINAL",
+                "event_timestamp": pd.Timestamp("2026-08-01 10:00:00"),
+                "signed_amount": 100.0,
+                "eligible": True,
+            },
+            {
+                "event_id": "reversal",
+                "cluster_id": "411311",
+                "transaction_id": "TXN1",
+                "event_role": "REVERSAL",
+                "event_timestamp": pd.Timestamp("2026-08-02 10:00:00"),
+                "signed_amount": -100.0,
+                "eligible": False,
+            },
+        ])
+
+        resolved = monthly._resolve_reversals(events)
+
+        original = resolved.loc[resolved["event_id"] == "original"].iloc[0]
+        reversal = resolved.loc[resolved["event_id"] == "reversal"].iloc[0]
+        self.assertTrue(original["active_at_cutoff"])
+        self.assertEqual(original["reversal_count"], 0)
+        self.assertEqual(reversal["reversal_resolution_status"], "INELIGIBLE_REVERSAL")
+
+    def test_multiple_reversals_block_original(self):
+        events = pd.DataFrame([
+            {
+                "event_id": "original",
+                "cluster_id": "411311",
+                "transaction_id": "TXN1",
+                "event_role": "ORIGINAL",
+                "event_timestamp": pd.Timestamp("2026-08-01 10:00:00"),
+                "signed_amount": 100.0,
+                "eligible": True,
+            },
+            {
+                "event_id": "reversal-1",
+                "cluster_id": "411311",
+                "transaction_id": "TXN1",
+                "event_role": "REVERSAL",
+                "event_timestamp": pd.Timestamp("2026-08-02 10:00:00"),
+                "signed_amount": -100.0,
+                "eligible": True,
+            },
+            {
+                "event_id": "reversal-2",
+                "cluster_id": "411311",
+                "transaction_id": "TXN1",
+                "event_role": "REVERSAL",
+                "event_timestamp": pd.Timestamp("2026-08-03 10:00:00"),
+                "signed_amount": -100.0,
+                "eligible": True,
+            },
+        ])
+
+        resolved = monthly._resolve_reversals(events)
+
+        original = resolved.loc[resolved["event_id"] == "original"].iloc[0]
+        self.assertEqual(original["reversal_resolution_status"], "MULTIPLE_REVERSALS")
+        self.assertTrue(original["is_unusual"])
+        self.assertEqual(original["reversal_count"], 2)
+
+
+class FinPayGoogleSheetHardeningContractTest(unittest.TestCase):
+    def test_gspread_client_runs_preflight_and_sets_timeout(self):
+        credentials = object()
+        client = Mock()
+        client.http_client.set_timeout = Mock()
+        with patch(
+            "finpay_pipeline.sheets_common.google_api_preflight",
+            return_value={"status": 200},
+        ) as preflight, patch(
+            "finpay_pipeline.sheets_common.Credentials.from_service_account_file",
+            return_value=credentials,
+        ), patch(
+            "finpay_pipeline.sheets_common._GoogleAuthorizedSession",
+            return_value=Mock(),
+        ), patch(
+            "finpay_pipeline.sheets_common.gspread.Client",
+            return_value=client,
+        ):
+            result = sheets_common.make_gspread_client("/tmp/service-account.json")
+
+        preflight.assert_called_once_with()
+        client.http_client.set_timeout.assert_called_once()
+        self.assertIs(result, client)
+
+    def test_monthly_sheet_uses_monitoring_sections_and_protection(self):
+        spreadsheet = Mock()
+        worksheet = Mock()
+        worksheet.id = 123
+        worksheet.row_count = 1000
+        spreadsheet.worksheet.return_value = worksheet
+        spreadsheet.fetch_sheet_metadata.return_value = {
+            "sheets": [{
+                "properties": {"sheetId": worksheet.id},
+                "merges": [],
+                "protectedRanges": [],
+                "bandedRanges": [],
+            }]
+        }
+        with patch(
+            "finpay_pipeline.monthly.open_or_create_finpay_spreadsheet",
+            return_value=spreadsheet,
+        ):
+            result = monthly.write_finpay_monthly_to_gsheet(
+                Mock(),
+                spreadsheet_title="FINPAY REPORT",
+                worksheet_title="FINPAY MONTHLY - 411311",
+                result={
+                "cluster_id": "411311",
+                "report_month": "2026-08-01",
+                "status": "FINAL",
+                "published": True,
+                "calculation_cutoff": "2026-09-18T00:00:00",
+                "publication_id": "pub-1",
+                "source_fingerprint": "fingerprint",
+                "release_ready": True,
+                "source_day_count": 31,
+                "missing_source_day_count": 0,
+                "unresolved_reversal_count": 0,
+                "blocking_exception_count": 0,
+                "unresolved_exposure": 0,
+                "qris_missing_disbursement_count": 0,
+                "missing_source_dates": [],
+                "category_rows": [{
+                    "settlement_category": "NGRS_PRINCIPAL",
+                    "gross_transaction_count": 1,
+                    "reversed_transaction_count": 0,
+                    "active_transaction_count": 1,
+                    "gross_amount": 100,
+                    "reversed_amount": 0,
+                    "net_payable": 100,
+                    "calculation_status": "FINAL",
+                }],
+                },
+            )
+
+        self.assertEqual(result["category_rows"], 1)
+        worksheet.clear.assert_called_once()
+        worksheet.update.assert_called_once()
+        requests = spreadsheet.batch_update.call_args.args[0]["requests"]
+        self.assertTrue(any("mergeCells" in request for request in requests))
+        self.assertTrue(any("repeatCell" in request for request in requests))
+        self.assertTrue(any("addProtectedRange" in request for request in requests))
 
 
 if __name__ == "__main__":
