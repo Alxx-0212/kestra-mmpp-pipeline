@@ -32,9 +32,9 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
 
         self.assertEqual(
             [migration.version for migration in migrations],
-            [1, 2, 3, 4, 5, 6, 7, 8],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         )
-        self.assertEqual(latest_linkaja_schema_version(), 8)
+        self.assertEqual(latest_linkaja_schema_version(), 10)
         self.assertTrue(all(len(migration.checksum) == 64 for migration in migrations))
 
     def test_final_transaction_schema_keeps_facts_not_report_amounts(self):
@@ -243,16 +243,12 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
             MONTHLY_UNRESOLVED_REVERSALS_STATEMENT.lower().split()
         )
 
-        self.assertIn("reversal.original_transaction_id", normalized)
-        self.assertIn(
-            "original.transaction_id = reversal.original_transaction_id",
-            normalized,
-        )
+        self.assertIn("join linkaja_reversal_edges_current_v", normalized)
+        self.assertIn("edge.resolution_status <> 'complete'", normalized)
         self.assertIn(
             "reversal.finalized_at_local < %(calculation_cutoff)s",
             normalized,
         )
-        self.assertIn("and not exists", normalized)
         self.assertNotIn("company_credit =", normalized)
         self.assertNotIn("ledger_debit_total =", normalized)
 
