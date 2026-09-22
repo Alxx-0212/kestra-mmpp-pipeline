@@ -7,7 +7,9 @@ the same public function names.
 from .loading import load_file, load_and_validate_schema
 from .integrity import validate_debit_credit_integrity
 from .database import (
+    ensure_finpay_transaction_model,
     finpay_db_schema_definition,
+    finpay_source_sha256,
     postgres_dsn_from_env,
     write_finpay_dataframe_to_postgres,
 )
@@ -24,6 +26,14 @@ from .dedup import (
     drop_duplicate_rows_by_minute,
 )
 from .summary import summarize_by_transaction
+from .monthly import (
+    build_finpay_monthly_preview,
+    build_finpay_monthly_preview_from_dataframe,
+    mark_finpay_google_publication_status,
+    publish_finpay_monthly_snapshot,
+    record_finpay_monthly_preview,
+    write_finpay_monthly_to_gsheet,
+)
 from .sheets_common import make_gspread_client
 from .summary_sheets import (
     append_daily_to_gsheet,
@@ -43,10 +53,15 @@ __all__ = [
     "append_daily_to_gsheet",
     "append_transaction_detail_to_gsheet",
     "append_unusual_to_gsheet",
+    "build_finpay_monthly_preview",
+    "build_finpay_monthly_preview_from_dataframe",
+    "mark_finpay_google_publication_status",
     "deduplicate_rows_by_minute_with_report",
     "drop_duplicate_rows_by_minute",
+    "ensure_finpay_transaction_model",
     "extract_disbursement_date_from_remarks",
     "finpay_db_schema_definition",
+    "finpay_source_sha256",
     "flag_unusual_transactions",
     "load_and_validate_schema",
     "load_file",
@@ -56,6 +71,9 @@ __all__ = [
     "prepare_reversal_summary_transactions",
     "prepare_transaction_detail_export",
     "preprocess_transaction_labels",
+    "publish_finpay_monthly_snapshot",
+    "record_finpay_monthly_preview",
+    "write_finpay_monthly_to_gsheet",
     "process_daily_upload",
     "process_transaction_detail_upload",
     "process_unusual_upload",

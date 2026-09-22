@@ -11,6 +11,7 @@ from .classification import (
     REVERSAL_PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_RECHARGE_OUT_CLUSTER_CATEGORY,
     REVERSAL_RECHARGE_OUT_CLUSTER_FEE_CATEGORY,
+    ST_RULE_CUTOFF_DATE,
 )
 from .sheets_common import (
     _add_protected_range_request,
@@ -92,6 +93,36 @@ LINKAJA_REFERENCE_CLUSTER_PALETTES = [
         "body": {"red": 0.910, "green": 0.973, "blue": 0.984},
     },
 ]
+
+
+def _uses_legacy_st_sales_fee_layout(
+    summary_df: pd.DataFrame,
+    report_date: str | None = None,
+) -> bool:
+    """Keep the historical SLSFEE sheet rows for pre-cutover data."""
+    target_date = report_date
+    if target_date is None and "Transaction_Date" in summary_df.columns:
+        target_date = summary_df["Transaction_Date"].max()
+    report_date_value = pd.to_datetime(target_date, errors="coerce")
+    include_legacy = (
+        not pd.isna(report_date_value)
+        and report_date_value.date() < ST_RULE_CUTOFF_DATE
+    )
+    if "Transaction" not in summary_df.columns:
+        return include_legacy
+
+    sales_fee_rows = summary_df[
+        summary_df["Transaction"].astype(str).eq("SELLTHRUSALESFEE")
+    ]
+    if sales_fee_rows.empty or "Transaction_Date" not in sales_fee_rows.columns:
+        return include_legacy
+    sales_fee_dates = pd.to_datetime(
+        sales_fee_rows["Transaction_Date"],
+        errors="coerce",
+    ).dropna()
+    return include_legacy or any(
+        value.date() < ST_RULE_CUTOFF_DATE for value in sales_fee_dates
+    )
 
 
 def _linkaja_reference_sheet_is_empty(values: list[list[str]]) -> bool:
@@ -662,13 +693,18 @@ def append_daily_to_gsheet(
     target_worksheet: str,
     summary_df: pd.DataFrame,
     qrisduwit_df: pd.DataFrame | None = None,
+    report_date: str | None = None,
 ) -> tuple[int | None, int | None]:
     """
     Returns (insert_row, block_end) on success.
     Replaces the existing daily block for the same date on reruns.
     """
-    target_date_str = summary_df["Transaction_Date"].max()
+    target_date_str = report_date or summary_df["Transaction_Date"].max()
     formatted_date  = datetime.strptime(target_date_str, "%Y-%m-%d").strftime("%d/%m/%Y")
+    include_legacy_st_sales_fee = _uses_legacy_st_sales_fee_layout(
+        summary_df,
+        report_date=report_date,
+    )
 
     def _a1(row, col):
         col_letter = ""
@@ -1191,7 +1227,6 @@ def append_daily_to_gsheet(
         },
         {"label": "ST",                         "key": "SELLTHRU"},
         {"label": "BIAYA FEE ST",               "key": "SELLTHRUFEE"},
-        {"label": SELLTHRU_SALES_FEE_INVOICE_LABEL, "key": "SELLTHRUSALESFEE"},
         {
             "label": "Jumlah Pembelian Recharge Out Cluster",
             "debet": pembelian_count,
@@ -1213,6 +1248,14 @@ def append_daily_to_gsheet(
             "balance": "empty",
         },
     ]
+    if include_legacy_st_sales_fee:
+        detail_rows.insert(
+            16,
+            {
+                "label": SELLTHRU_SALES_FEE_INVOICE_LABEL,
+                "key": "SELLTHRUSALESFEE",
+            },
+        )
 
     def _summary_row(
         section: str,
@@ -1315,11 +1358,14 @@ def append_daily_to_gsheet(
     sellthru_report_rows = [
         ("ST", *_split_net_formula(_detail_net_formula("SELLTHRU"))),
         ("BIAYA FEE ST", *_split_net_formula(_detail_net_formula("SELLTHRUFEE"))),
-        (
-            SELLTHRU_SALES_FEE_INVOICE_LABEL,
-            *_split_net_formula(_detail_net_formula("SELLTHRUSALESFEE")),
-        ),
     ]
+    if include_legacy_st_sales_fee:
+        sellthru_report_rows.append(
+            (
+                SELLTHRU_SALES_FEE_INVOICE_LABEL,
+                *_split_net_formula(_detail_net_formula("SELLTHRUSALESFEE")),
+            )
+        )
 
     accounting_report_rows = [
         ("PPOB", *_split_net_formula(_detail_net_formula("FeeTransaksi"))),
@@ -1378,6 +1424,13 @@ def append_daily_to_gsheet(
             invoice_rows.append(["", "", "", ""])
 
     footer_start = r
+    st_footer_formula = (
+        _detail_net_formula("SELLTHRU")
+        + _detail_net_formula("SELLTHRUFEE").replace("=", "+")
+    )
+    if include_legacy_st_sales_fee:
+        st_footer_formula += _detail_net_formula("SELLTHRUSALESFEE").replace("=", "+")
+
     footer_formulas = [
         # NGRS = net(RECHARGE - RECHARGEFEE + pembelian recharge out-cluster)
         (
@@ -1408,12 +1461,8 @@ def append_daily_to_gsheet(
         ),
         # PPOB  = net(FeeTransaksi)
         _detail_net_formula("FeeTransaksi"),
-        # ST = net(SELLTHRU family only)
-        (
-            _detail_net_formula("SELLTHRU")
-            + _detail_net_formula("SELLTHRUFEE").replace("=", "+")
-            + _detail_net_formula("SELLTHRUSALESFEE").replace("=", "+")
-        ),
+        # ST = net(SELLTHRU family, with the legacy SLSFEE only before cutoff)
+        st_footer_formula,
         # DISBURSEMENT
         _detail_net_formula("DISBURSEMENT"),
         # QRISDUWIT
@@ -2051,6 +2100,7 @@ def process_daily_upload(
     default_starting_balance: int,
     gspread_client,
     qrisduwit_df: pd.DataFrame | None = None,
+    report_date: str | None = None,
 ) -> tuple[int | None, int | None]:
     sh = open_or_create_finpay_spreadsheet(gspread_client, target_spreadsheet)
 
@@ -2074,4 +2124,5 @@ def process_daily_upload(
         target_worksheet,
         summary_df,
         qrisduwit_df=qrisduwit_df,
+        report_date=report_date,
     )

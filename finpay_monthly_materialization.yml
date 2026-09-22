@@ -1,0 +1,248 @@
+id: finpay_monthly_materialization_v1
+namespace: finance.finpay
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: cluster_id
+    type: STRING
+    displayName: "FinPay cluster ID"
+    required: true
+
+  - id: report_month
+    type: STRING
+    displayName: "Report month"
+    description: "Month to calculate in YYYY-MM format."
+    required: true
+
+  - id: calculation_cutoff
+    type: STRING
+    displayName: "Calculation cutoff"
+    description: "Exclusive Asia/Makassar cutoff in ISO local time."
+    required: true
+
+  - id: expected_source_dates
+    type: STRING
+    displayName: "Expected source dates"
+    description: "Comma-separated YYYY-MM-DD dates. Required for final publication."
+    defaults: ""
+    required: true
+
+  - id: publish
+    type: BOOLEAN
+    displayName: "Publish final monthly snapshot?"
+    defaults: false
+    required: true
+
+  - id: expected_source_fingerprint
+    type: STRING
+    displayName: "Expected preview fingerprint"
+    description: "Required for publish=true and must match the fresh preview."
+    defaults: ""
+    required: true
+
+  - id: approved_by
+    type: STRING
+    displayName: "Approved by"
+    defaults: ""
+    required: true
+
+  - id: write_gsheet
+    type: BOOLEAN
+    displayName: "Write Google Sheets?"
+    description: "Disable only when Google OAuth is unavailable; PostgreSQL publication still runs."
+    defaults: true
+    required: true
+
+tasks:
+  - id: calculate_and_optionally_publish_month
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: mmpp-finance-network
+    pythonVersion: "3.11"
+    timeout: PT30M
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT60S
+      maxAttempts: 3
+    outputFiles:
+      - finpay_monthly_result.json
+      - finpay_monthly_transactions.csv
+      - finpay_monthly_categories.csv
+      - finpay_monthly_exceptions.json
+    env:
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      REPORT_MONTH: "{{ inputs.report_month }}"
+      CALCULATION_CUTOFF: "{{ inputs.calculation_cutoff }}"
+      EXPECTED_SOURCE_DATES: "{{ inputs.expected_source_dates }}"
+      EXPECTED_SOURCE_FINGERPRINT: "{{ inputs.expected_source_fingerprint }}"
+      PUBLISH: "{{ inputs.publish }}"
+      APPROVED_BY: "{{ inputs.approved_by }}"
+      PUBLICATION_ID: "{{ execution.id }}"
+      WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+      TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
+      TARGET_WORKSHEET: "FINPAY MONTHLY - {{ inputs.cluster_id }}"
+      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+    script: |
+      import csv
+      import json
+      import os
+      import sys
+
+      sys.path.insert(0, "/app")
+      from kestra import Kestra
+      from pipeline import (
+          build_finpay_monthly_preview,
+          make_gspread_client,
+          mark_finpay_google_publication_status,
+          publish_finpay_monthly_snapshot,
+          postgres_dsn_from_env,
+          record_finpay_monthly_preview,
+          write_finpay_monthly_to_gsheet,
+      )
+
+      expected_dates = [
+          value.strip()
+          for value in os.environ.get("EXPECTED_SOURCE_DATES", "").split(",")
+          if value.strip()
+      ]
+      publish = os.environ.get("PUBLISH", "false").lower() == "true"
+      dsn = postgres_dsn_from_env()
+
+      try:
+          result = build_finpay_monthly_preview(
+              dsn,
+              cluster_id=os.environ["CLUSTER_ID"],
+              report_month=os.environ["REPORT_MONTH"],
+              calculation_cutoff=os.environ["CALCULATION_CUTOFF"],
+              expected_source_dates=expected_dates or None,
+          )
+          result = record_finpay_monthly_preview(
+              dsn,
+              result,
+              preview_id=os.environ["PUBLICATION_ID"],
+          )
+          if publish:
+              fingerprint = os.environ.get("EXPECTED_SOURCE_FINGERPRINT", "").strip()
+              if not fingerprint:
+                  raise ValueError("expected_source_fingerprint is required when publish=true")
+              result = publish_finpay_monthly_snapshot(
+                  dsn,
+                  result,
+                  publication_id=os.environ["PUBLICATION_ID"],
+                  approved_by=os.environ.get("APPROVED_BY") or None,
+                  expected_source_fingerprint=fingerprint,
+              )
+
+              if os.environ.get("WRITE_GSHEET", "true").lower() == "true":
+                  sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+                  if not sa_key_json or sa_key_json.strip() == "{}":
+                      mark_finpay_google_publication_status(
+                          dsn, result["publication_id"], "FAILED", "GCP_SA_KEY is empty"
+                      )
+                      raise ValueError("GCP_SA_KEY secret is empty or not set")
+                  import tempfile
+                  sa_key_path = None
+                  try:
+                      with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+                          handle.write(sa_key_json)
+                          sa_key_path = handle.name
+                      client = make_gspread_client(sa_key_path)
+                      result["gsheet"] = write_finpay_monthly_to_gsheet(
+                          client,
+                          spreadsheet_title=os.environ["TARGET_SPREADSHEET"],
+                          worksheet_title=os.environ["TARGET_WORKSHEET"],
+                          result=result,
+                      )
+                      mark_finpay_google_publication_status(
+                          dsn, result["publication_id"], "COMPLETE"
+                      )
+                  except Exception as exc:
+                      mark_finpay_google_publication_status(
+                          dsn, result["publication_id"], "FAILED", str(exc)[:2000]
+                      )
+                      raise
+                  finally:
+                      if sa_key_path and os.path.exists(sa_key_path):
+                          os.unlink(sa_key_path)
+              else:
+                  result["gsheet"] = {"status": "skipped", "reason": "write_gsheet=false"}
+                  mark_finpay_google_publication_status(
+                      dsn, result["publication_id"], "SKIPPED"
+                  )
+      except Exception as exc:
+          print(f"FinPay monthly materialization failed: {exc}", file=sys.stderr)
+          raise
+
+      with open("finpay_monthly_result.json", "w", encoding="utf-8") as handle:
+          json.dump(result, handle, indent=2, default=str)
+      with open("finpay_monthly_transactions.csv", "w", newline="", encoding="utf-8") as handle:
+          rows = result.get("transaction_rows", [])
+          if rows:
+              writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))
+              writer.writeheader()
+              writer.writerows(rows)
+      with open("finpay_monthly_categories.csv", "w", newline="", encoding="utf-8") as handle:
+          rows = result.get("category_rows", [])
+          if rows:
+              writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))
+              writer.writeheader()
+              writer.writerows(rows)
+      with open("finpay_monthly_exceptions.json", "w", encoding="utf-8") as handle:
+          json.dump({
+              "status": result["status"],
+              "missing_source_dates": result["missing_source_dates"],
+              "unresolved_reversal_count": result["unresolved_reversal_count"],
+              "multiple_reversal_count": result["multiple_reversal_count"],
+              "duplicate_source_row_count": result["duplicate_source_row_count"],
+              "expected_period_missing_dates": result["expected_period_missing_dates"],
+              "unresolved_exposure": result["unresolved_exposure"],
+              "qris_missing_disbursement_count": result["qris_missing_disbursement_count"],
+              "blocking_exception_count": result["blocking_exception_count"],
+              "restatement_required": result.get("restatement_required", False),
+              "unusual_rows": result["unusual_rows"],
+          }, handle, indent=2, default=str)
+
+      print(f"Monthly status          : {result['status']}")
+      print(f"Cluster                 : {result['cluster_id']}")
+      print(f"Report month            : {result['report_month']}")
+      print(f"Calculation cutoff      : {result['calculation_cutoff']}")
+      print(f"Source fingerprint      : {result['source_fingerprint']}")
+      print(f"Calculation fingerprint : {result['calculation_fingerprint']}")
+      print(f"Preview ID              : {result.get('preview_id', '')}")
+      print(f"Unresolved reversals    : {result['unresolved_reversal_count']}")
+      print(f"Multiple reversals      : {result['multiple_reversal_count']}")
+      print(f"Duplicate source rows   : {result['duplicate_source_row_count']}")
+      print(f"Expected period complete: {result['expected_period_complete']}")
+      print(f"Restatement required    : {result.get('restatement_required', False)}")
+      print(f"Blocking exceptions     : {result['blocking_exception_count']}")
+      print(f"Published               : {result['published']}")
+      Kestra.outputs({
+          "status": result["status"],
+          "cluster_id": result["cluster_id"],
+          "report_month": result["report_month"],
+          "calculation_cutoff": result["calculation_cutoff"],
+          "source_fingerprint": result["source_fingerprint"],
+          "calculation_fingerprint": result["calculation_fingerprint"],
+          "preview_id": result.get("preview_id", ""),
+          "source_day_count": result["source_day_count"],
+          "missing_source_day_count": result["missing_source_day_count"],
+          "unresolved_reversal_count": result["unresolved_reversal_count"],
+          "multiple_reversal_count": result["multiple_reversal_count"],
+          "duplicate_source_row_count": result["duplicate_source_row_count"],
+          "expected_period_complete": result["expected_period_complete"],
+          "restatement_required": result.get("restatement_required", False),
+          "blocking_exception_count": result["blocking_exception_count"],
+          "release_ready": result["release_ready"],
+          "published": result["published"],
+      })

@@ -1,6 +1,9 @@
 """Postgres persistence helpers for FinPay workflow dataframes."""
+import hashlib
+import json
 import os
 import re
+from pathlib import Path
 
 import pandas as pd
 import psycopg
@@ -21,6 +24,10 @@ FINPAY_DB_TABLES = {
     "finpay_reversal_transactions",
     "finpay_qrisduwit_transactions",
 }
+
+FINPAY_TRANSACTION_MODEL_MIGRATION = (
+    Path(__file__).resolve().parent / "migrations" / "001_finpay_transaction_model.sql"
+)
 
 FINPAY_DB_CORE_COLUMNS = [
     ("cluster_id", "TEXT NOT NULL"),
@@ -143,6 +150,24 @@ def postgres_dsn_from_env(prefix: str = "FINPAY_DB_") -> str:
         f"host={host} port={port} dbname={dbname} user={user} "
         f"password={password}"
     )
+
+
+def ensure_finpay_transaction_model(dsn: str) -> None:
+    """Apply the additive, versioned transaction-model DDL."""
+    migration_sql = FINPAY_TRANSACTION_MODEL_MIGRATION.read_text(encoding="utf-8")
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(migration_sql)
+        conn.commit()
+
+
+def finpay_source_sha256(source_path: str | os.PathLike[str]) -> str:
+    """Return the SHA-256 fingerprint of an uploaded source file."""
+    digest = hashlib.sha256()
+    with open(source_path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _normalize_finpay_db_column_name(column: object) -> str:
@@ -404,12 +429,164 @@ def _db_insert_rows(
     return rows
 
 
+def _finpay_source_row_hash(row: pd.Series) -> str:
+    payload = {}
+    for column, value in row.items():
+        if pd.isna(value):
+            payload[str(column)] = None
+        elif isinstance(value, pd.Timestamp):
+            payload[str(column)] = value.isoformat()
+        else:
+            payload[str(column)] = str(value)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _append_finpay_source_generation(
+    cur,
+    df: pd.DataFrame,
+    *,
+    load_id: str,
+    cluster_id: str,
+    report_date_value,
+    source_file: str,
+    source_sha256: str,
+) -> None:
+    """Record one source generation and its append-only ledger rows."""
+    transaction_dates = pd.to_datetime(
+        df.get("Transaction Date", pd.Series(dtype="datetime64[ns]")),
+        errors="coerce",
+    ).dropna()
+    source_start_date = transaction_dates.min().date() if not transaction_dates.empty else None
+    source_end_date = transaction_dates.max().date() if not transaction_dates.empty else None
+
+    cur.execute(
+        """
+        SELECT load_id
+        FROM finpay_source_loads
+        WHERE cluster_id = %s
+          AND report_date = %s
+          AND is_current
+          AND load_id <> %s
+        ORDER BY loaded_at DESC, load_id DESC
+        LIMIT 1
+        """,
+        (cluster_id, report_date_value, load_id),
+    )
+    previous = cur.fetchone()
+    supersedes_load_id = previous[0] if previous else None
+    cur.execute(
+        """
+        UPDATE finpay_source_loads
+        SET is_current = FALSE
+        WHERE cluster_id = %s
+          AND report_date = %s
+          AND load_id <> %s
+        """,
+        (cluster_id, report_date_value, load_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO finpay_source_loads (
+            load_id, cluster_id, source_file, source_sha256, report_date,
+            source_start_date, source_end_date, row_count, is_current,
+            supersedes_load_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+        ON CONFLICT (load_id) DO UPDATE SET
+            cluster_id = EXCLUDED.cluster_id,
+            source_file = EXCLUDED.source_file,
+            source_sha256 = EXCLUDED.source_sha256,
+            report_date = EXCLUDED.report_date,
+            source_start_date = EXCLUDED.source_start_date,
+            source_end_date = EXCLUDED.source_end_date,
+            row_count = EXCLUDED.row_count,
+            loaded_at = CURRENT_TIMESTAMP,
+            is_current = TRUE,
+            supersedes_load_id = EXCLUDED.supersedes_load_id
+        """,
+        (
+            load_id,
+            cluster_id,
+            source_file,
+            source_sha256,
+            report_date_value,
+            source_start_date,
+            source_end_date,
+            len(df),
+            supersedes_load_id,
+        ),
+    )
+    cur.execute("DELETE FROM finpay_ledger_events WHERE load_id = %s", (load_id,))
+
+    rows = []
+    enriched = _db_enriched_dataframe(df).reset_index(drop=True)
+    for row_number, (_, row) in enumerate(enriched.iterrows(), start=1):
+        transaction_date = pd.to_datetime(row.get("Transaction Date"), errors="coerce")
+        if pd.isna(transaction_date):
+            continue
+        transaction_id = str(row.get("Transaction ID", "")).strip()
+        if not transaction_id:
+            continue
+        rows.append((
+            load_id,
+            row_number,
+            _finpay_source_row_hash(row),
+            cluster_id,
+            report_date_value,
+            transaction_date.to_pydatetime(),
+            transaction_id,
+            str(row.get("base_id", "")).strip() or None,
+            str(row.get("transaction_id_type", "MAIN")).strip() or "MAIN",
+            str(row.get("Transaction", "")).strip() or None,
+            str(row.get("Transaction Type", "")).strip() or None,
+            str(row.get("Remarks", "")).strip() or None,
+            float(row.get("Kredit", 0) or 0),
+            float(row.get("Debet", 0) or 0),
+            None if pd.isna(row.get("Saldo Awal")) else float(row.get("Saldo Awal")),
+            None if pd.isna(row.get("Saldo Akhir")) else float(row.get("Saldo Akhir")),
+            None if pd.isna(row.get("Nomor RS")) else str(row.get("Nomor RS")),
+        ))
+    if rows:
+        cur.executemany(
+            """
+            INSERT INTO finpay_ledger_events (
+                load_id, source_row_number, source_row_hash, cluster_id,
+                report_date, transaction_date, transaction_id, base_id,
+                transaction_id_type, raw_transaction_label, transaction_type,
+                remarks, kredit, debet, saldo_awal, saldo_akhir, nomor_rs
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s)
+            ON CONFLICT (load_id, source_row_number) DO UPDATE SET
+                source_row_hash = EXCLUDED.source_row_hash,
+                transaction_date = EXCLUDED.transaction_date,
+                transaction_id = EXCLUDED.transaction_id,
+                base_id = EXCLUDED.base_id,
+                transaction_id_type = EXCLUDED.transaction_id_type,
+                raw_transaction_label = EXCLUDED.raw_transaction_label,
+                transaction_type = EXCLUDED.transaction_type,
+                remarks = EXCLUDED.remarks,
+                kredit = EXCLUDED.kredit,
+                debet = EXCLUDED.debet,
+                saldo_awal = EXCLUDED.saldo_awal,
+                saldo_akhir = EXCLUDED.saldo_akhir,
+                nomor_rs = EXCLUDED.nomor_rs
+            """,
+            rows,
+        )
+
+
 def write_finpay_dataframe_to_postgres(
     df: pd.DataFrame,
     table_name: str,
     cluster_id: str,
     report_date: str,
     dsn: str,
+    *,
+    load_id: str | None = None,
+    source_file: str | None = None,
+    source_sha256: str | None = None,
 ) -> int:
     """
     Replace one cluster/date batch in a FinPay table with the supplied DataFrame.
@@ -436,6 +613,11 @@ def write_finpay_dataframe_to_postgres(
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
+            if table_name == "finpay_raw_transactions" and load_id:
+                migration_sql = FINPAY_TRANSACTION_MODEL_MIGRATION.read_text(
+                    encoding="utf-8"
+                )
+                cur.execute(migration_sql)
             cur.execute(_finpay_db_create_table_request(table_name, schema))
             _reconcile_finpay_db_table_schema(cur, table_name, schema)
             cur.execute(_finpay_db_index_request(table_name))
@@ -459,6 +641,18 @@ def write_finpay_dataframe_to_postgres(
                         values=placeholders,
                     ),
                     rows,
+                )
+            if table_name == "finpay_raw_transactions" and load_id:
+                _append_finpay_source_generation(
+                    cur,
+                    df,
+                    load_id=load_id,
+                    cluster_id=cluster_id,
+                    report_date_value=report_date_value,
+                    source_file=source_file or "unknown",
+                    source_sha256=source_sha256 or hashlib.sha256(
+                        repr(df.to_dict(orient="records")).encode()
+                    ).hexdigest(),
                 )
         conn.commit()
 

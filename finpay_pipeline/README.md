@@ -18,6 +18,15 @@ id: finpay_daily_pipeline_v5
 namespace: finance.finpay
 ```
 
+The reversal-aware monthly settlement design and implementation status are
+documented in
+[`FINPAY_REVERSAL_MONTHLY_IMPLEMENTATION_PLAN.md`](FINPAY_REVERSAL_MONTHLY_IMPLEMENTATION_PLAN.md).
+
+The manual monthly flow is `finpay_monthly_materialization.yml` with ID
+`finance.finpay.finpay_monthly_materialization_v1`. It produces a preview by
+default. Final publication requires an explicit cutoff, expected source dates,
+the preview source fingerprint, and a `READY_FOR_APPROVAL` result.
+
 Kestra tasks run the Docker image `finpay-pipeline:3.11` and import Python with:
 
 ```python
@@ -38,6 +47,8 @@ workflow; this flow begins at the immutable uploaded file boundary.
 |---|---|---|---|
 | `csv_file` | `FILE` | required | One FinPay `.csv` or `.xlsx` export matching the filename contract below. |
 | `dry_run` | `BOOLEAN` | `false` | When `true`, execute validation and calculation but skip PostgreSQL, Google Sheets, Telegram, and the final sleep. |
+| `source_filename` | `STRING` | empty | Original basename supplied by API clients when Kestra stores the FILE input under a temporary `.upl` path. |
+| `write_gsheet` | `BOOLEAN` | `true` | When `false`, skip Google Sheets and Telegram side effects while retaining PostgreSQL/source-ledger persistence for isolated replay. |
 
 The filename parser uses this exact shape:
 
@@ -57,12 +68,12 @@ Current cluster routing is embedded in `workflows/finpay_pipeline.yml`:
 
 | Cluster ID | Base worksheet | Spreadsheet | Default starting balance |
 |---|---|---|---:|
-| `411311` | `PKY` | `Salinan dari MONITORING FINPAY` | `0` |
-| `421306` | `MRT` | `Salinan dari MONITORING FINPAY` | `0` |
-| `421307` | `TDR` | `Salinan dari MONITORING FINPAY` | `0` |
-| `421315` | `BGI` | `Salinan dari MONITORING FINPAY` | `0` |
-| `421318` | `MRW` | `Salinan dari MONITORING FINPAY` | `0` |
-| `421320` | `TNT` | `Salinan dari MONITORING FINPAY` | `0` |
+| `411311` | `PKY` | `Salinan dari Monitoring Finpay & LinkAja` | `0` |
+| `421306` | `MRT` | `Salinan dari Monitoring Finpay & LinkAja` | `0` |
+| `421307` | `TDR` | `Salinan dari Monitoring Finpay & LinkAja` | `0` |
+| `421315` | `BGI` | `Salinan dari Monitoring Finpay & LinkAja` | `0` |
+| `421318` | `MRW` | `Salinan dari Monitoring Finpay & LinkAja` | `0` |
+| `421320` | `TNT` | `Salinan dari Monitoring Finpay & LinkAja` | `0` |
 
 Runtime metadata uses `Asia/Makassar`. The report date used by calculations,
 database replacement, and sheet replacement comes from the filename, not the
@@ -95,7 +106,8 @@ execution date.
 | `finpay_pipeline.classification` | Preprocess transaction labels, relabel out-cluster, standalone ST, and reversal rows, validate known remark structures and fee groups, build unusual rows, decide summary exclusion. |
 | `finpay_pipeline.dedup` | Drop duplicate calculation rows and create duplicate-row reports. |
 | `finpay_pipeline.summary` | Aggregate summary-ready rows by processed transaction label. |
-| `finpay_pipeline.database` | Define/reconcile Postgres schemas, serialize rows, and replace table batches by `cluster_id + report_date`. |
+| `finpay_pipeline.database` | Maintain daily compatibility tables plus explicit append-only source loads and ledger evidence. |
+| `finpay_pipeline.monthly` | Build cutoff-aware transaction previews and publish guarded monthly snapshots. |
 | `finpay_pipeline.sheets_common` | Build gspread clients, create/open spreadsheets, manage protection, row capacity, A1 ranges, value formatting, and shared formatting helpers. |
 | `finpay_pipeline.summary_sheets` | Write the main daily summary sheet, compact invoice panel, and the prerequisite shared `LinkAja` reference-sheet layout used by invoice formulas. |
 | `finpay_pipeline.detail_exports` | Build and write QRISDUWIT and Reversal detail worksheets. |
@@ -115,6 +127,7 @@ uploaded file
 -> load_and_validate -> validated.parquet
 -> validate_integrity -> integrity_checked.parquet
 -> persist_raw_transactions_to_db -> finpay_raw_transactions
+   + append source load + finpay_ledger_events evidence
 -> preprocess_transaction_labels -> preprocessed.parquet
 -> flag_unusual_transactions -> unusual.parquet
 -> persist_unusual_to_db -> finpay_unusual_transactions
@@ -132,6 +145,10 @@ uploaded file
 -> summarize -> summary.parquet
 -> upload_to_sheets (summary.parquet + qrisduwit.parquet)
 ```
+
+The separate `finpay_monthly_materialization_v1` flow reads the append-only
+evidence, builds a provisional or final cutoff-bound result, and writes monthly
+artifacts and snapshots. It does not rewrite the daily Sheet.
 
 Important ordering:
 
@@ -165,6 +182,10 @@ directly:
 | `deduplicated.parquet` | Calculation rows after minute-level duplicate removal. |
 | `qrisduwit.parquet` | QRISDUWIT detail rows, including extracted disbursement date. |
 | `reversal.parquet` | Reversal detail rows. |
+
+Monthly artifacts are `finpay_monthly_result.json`,
+`finpay_monthly_transactions.csv`, `finpay_monthly_categories.csv`, and
+`finpay_monthly_exceptions.json`.
 | `summary_ready.parquet` | Deduplicated rows retained for summary calculation. |
 | `summary.parquet` | Totals grouped by processed transaction label. |
 
@@ -240,6 +261,10 @@ Standalone Sellthru relabeling:
   `transaksi sellthru` becomes `SELLTHRU` and is included in the ST summary.
 - This is a characterized standalone main-row case, so it does not require
   `SELLTHRUFEE` or `SELLTHRUSALESFEE` companions.
+- The exception is identified from the raw `RECHARGE` label and the complete
+  normalized remark; a direct `SELLTHRU` row does not receive this exemption.
+- If the standalone family contains any fee or other companion row, the whole
+  family is flagged unusual and excluded from the summary.
 - `raw_transaction_label` remains `RECHARGE`; only `Transaction` and
   `processed_transaction_label` become `SELLTHRU`. Source `Remarks` remains
   unchanged.
@@ -259,8 +284,13 @@ Reversal relabeling:
 Fee validation:
 
 - `RECHARGE` expects `RECHARGEFEE` debet total of `20`.
-- `SELLTHRU` expects `SELLTHRUFEE` debet total of `100` and at least one
-  `SELLTHRUSALESFEE` row.
+- Before `2026-09-01` (Asia/Makassar), normal `SELLTHRU` expects
+  `SELLTHRUFEE` debet total of `100` and at least one `SELLTHRUSALESFEE` row.
+- From `2026-09-01` onward, normal `SELLTHRU` expects only
+  `SELLTHRUFEE` debet total of `100`; `SELLTHRUSALESFEE` is retired.
+- A missing or incorrect ST fee is flagged unusual but remains included in the
+  summary for finance review. An incoming post-cutoff SLSFEE quarantines the
+  entire ST family and excludes it from the summary.
 - `Reversal - NGRS` expects `Reversal - NGRS FEE` kredit total of `20`.
 - `Reversal - Recharge Out Cluster` expects its fee row kredit total of `20`.
 
@@ -285,8 +315,9 @@ Unknown transaction and remark behavior:
 - Every known processed transaction label must also match one characterized
   remark structure. A mismatch is flagged with an
   `unknown remarks pattern for transaction` reason.
-- Both cases are excluded from `summary_ready.parquet`; they cannot affect the
-  persisted calculation rows or summary sheet.
+- Both cases quarantine the complete transaction family and are excluded from
+  `summary_ready.parquet`; they cannot affect the persisted calculation rows or
+  summary sheet.
 - Remark matching is case-insensitive and replaces changing numeric values and
   `DD-MM-YYYY` dates with placeholders. Static words, punctuation, and order
   must still match. This permits different amounts, phone/cluster numbers, and
@@ -310,6 +341,11 @@ cluster `411311` exports (74,532 rows):
 | `SELLTHRUFEE` | `platform fee sellthru rp. <value>,-` or the observed `fee transaksi sellthru ... fee tsel ... fee finnet ...` structure |
 | `SELLTHRUSALESFEE` | `sales hold transaksi sellthru sejumlah <value> rupiah, dari <value>` |
 
+The daily summary sheet keeps the historical `BIAYA FEE BAR A ST (HOLD)` detail
+row and formula before the cutoff. From September 2026 it omits that row and
+the MANDIRI ST formula uses only `SELLTHRU + SELLTHRUFEE`. Historical reruns
+remain governed by the legacy rule.
+
 Do not silently map another new label or remark structure into an existing
 category; characterize it from source data and add tests first.
 
@@ -327,7 +363,8 @@ columns except `No`, with transaction date compared at minute precision.
 
 ## Postgres Rules
 
-There are five pipeline-owned tables:
+There are five daily compatibility tables and six additive monthly-model
+relations:
 
 | Table | Source | Scope |
 |---|---|---|
@@ -336,9 +373,21 @@ There are five pipeline-owned tables:
 | `finpay_unusual_transactions` | `unusual.parquet` | Unusual rows from the pre-summary unusual detection phase and `unusual_reason`, including rows still included in summary. |
 | `finpay_reversal_transactions` | `reversal.parquet` | Reversal detail output from the deduplicated dataframe. |
 | `finpay_qrisduwit_transactions` | `qrisduwit.parquet` | QRISDUWIT detail output with `disbursement_date`. |
+| `finpay_source_loads` | Daily raw persistence | Append-only source generations and current-load replacement metadata. |
+| `finpay_ledger_events` | Daily raw persistence | Append-only source rows with load ID and content hash. |
+| `finpay_transaction_events_current_v` | Migration view | Current transaction-group events by exact cluster and ID. |
+| `finpay_reversal_status_current_v` | Migration view | Guarded exact-ID reversal states and active flags. |
+| `finpay_monthly_transactions` | Monthly publication | Frozen cluster-month transaction facts. |
+| `finpay_monthly_publications` | Monthly publication | Cutoff, fingerprint, release status, and approval audit. |
 
 All DB writes replace the current `cluster_id + report_date` batch before
 insert. This is the primary rerun/idempotency mechanism.
+
+The additive transaction model is different by design: source loads and ledger
+events are retained across reruns, while a corrected upload marks the previous
+generation for that cluster/report date non-current. Monthly snapshots are
+replaced only for the explicit cluster-month publication and retain their
+source fingerprint.
 
 Schema rules:
 
@@ -346,9 +395,9 @@ Schema rules:
 - Source `No` is not persisted.
 - Processed tables do not persist a `transaction` column because it duplicates
   `processed_transaction_label`.
-- `raw_transaction_label` and `processed_transaction_label` values are
-  lowercased only at the DB write boundary; in-memory workflow labels keep
-  their original case.
+- `raw_transaction_label` preserves source spelling; in-memory `Transaction`
+  labels are normalized to uppercase before classification, and
+  `processed_transaction_label` is lowercased only at the DB write boundary.
 - Every table includes `base_id`.
 - Every table except `finpay_qrisduwit_transactions` includes
   `transaction_id_type`.
@@ -363,7 +412,7 @@ Schema rules:
 ## Google Sheets Outputs
 
 Target spreadsheet name from the active workflow cluster config:
-`Salinan dari MONITORING FINPAY`.
+`Salinan dari Monitoring Finpay & LinkAja`.
 
 Each configured cluster has four stable FinPay sheets:
 
@@ -568,18 +617,21 @@ The workflow uses `Sequential` blocks around sheet writes. DB writes and sheet
 writes are near each other, but do not assume Google Sheets tasks are safe to
 parallelize. The current design prioritizes reliability over runtime.
 
-That sequencing applies only inside one execution. Until a tested external lock
-or Kestra concurrency policy exists, queue or reject overlapping executions for
-the same spreadsheet, worksheet, and report date.
+That sequencing applies only inside one execution. The daily flow declares a
+flow-level concurrency limit of one with queued executions, so overlapping
+manual runs cannot write the shared worksheet at the same time.
 
 Telegram unusual notification uses an HTTP request task with exponential retry.
 Google Sheets upload tasks also use exponential retry.
 
 For both categories the current retry policy starts at 15 seconds, caps at 60
 seconds, and allows three attempts. PostgreSQL tasks do not declare an explicit
-Kestra retry policy. Treat retry, notification, and same-date concurrency
-controls as release contracts before increasing execution frequency or
-automating file ingestion.
+Kestra retry policy. The flow-level error task sends a failure alert through the
+configured Telegram bot and includes the execution identifier and UI log path.
+Treat retry, notification, and same-date concurrency controls as release
+contracts before increasing execution frequency or automating file ingestion.
+Notification delivery is best effort because the error handler itself can fail
+if Telegram is unavailable.
 
 ## Testing Checklist
 

@@ -167,6 +167,96 @@ REPLACE_RAW_STATEMENTS = [
 ]
 
 
+REPLACE_SOURCE_LOAD_STATEMENTS = [
+    """
+    UPDATE linkaja_source_loads
+    SET is_current = FALSE,
+        valid_to = CURRENT_TIMESTAMP
+    WHERE cluster_id = %(cluster_id)s
+      AND is_current
+      AND COALESCE(source_end_date, source_start_date) >= %(source_start_date)s
+      AND COALESCE(source_start_date, source_end_date) <= %(source_end_date)s
+    """,
+    """
+    INSERT INTO linkaja_source_loads (
+        load_id, cluster_id, source_file, source_sha256,
+        source_start_date, source_end_date, row_count, valid_from,
+        is_current, supersedes_load_id
+    )
+    SELECT
+        %(load_id)s,
+        %(cluster_id)s,
+        %(source_file)s,
+        %(source_sha256)s,
+        %(source_start_date)s,
+        %(source_end_date)s,
+        %(source_rows)s,
+        CURRENT_TIMESTAMP,
+        TRUE,
+        (
+        SELECT load_id
+        FROM linkaja_source_loads
+        WHERE cluster_id = %(cluster_id)s
+          AND NOT is_current
+        ORDER BY valid_to DESC NULLS LAST, load_id DESC
+        LIMIT 1
+        )
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM linkaja_source_loads AS existing
+        WHERE existing.load_id = %(load_id)s
+    )
+    """,
+]
+
+
+INSERT_LEDGER_VERSION_STATEMENT = """
+INSERT INTO linkaja_ledger_versions (
+    cluster_id, source_file, source_row_number, load_id, ingested_at,
+    source_no, top_organization, parent_organization, organization,
+    transaction_id, original_transaction_id, partner_reference_number,
+    invoice_id, finalized_date, finalized_time, initiate_date, initiate_time,
+    transaction_type, transaction_scenario, transaction_status,
+    transaction_statement, account, counter_party, debit, credit, balance,
+    fee, source_row_hash
+)
+SELECT
+    stage.cluster_id, stage.source_file, stage.source_row_number, stage.load_id,
+    CURRENT_TIMESTAMP, stage.source_no, stage.top_organization,
+    stage.parent_organization, stage.organization, stage.transaction_id,
+    stage.original_transaction_id, stage.partner_reference_number,
+    stage.invoice_id, stage.finalized_date, stage.finalized_time,
+    stage.initiate_date, stage.initiate_time, stage.transaction_type,
+    stage.transaction_scenario, stage.transaction_status,
+    stage.transaction_statement, stage.account, stage.counter_party,
+    stage.debit, stage.credit, stage.balance, stage.fee,
+    md5(
+        CONCAT_WS('|', stage.cluster_id, stage.transaction_id,
+                  stage.finalized_date, stage.finalized_time,
+                  stage.transaction_scenario, stage.debit, stage.credit,
+                  stage.fee)
+    )
+FROM linkaja_raw_stage AS stage
+"""
+
+
+INSERT_MONTHLY_IMPACTS_STATEMENT = """
+INSERT INTO linkaja_monthly_impacts (
+    cluster_id, report_month, transaction_id, new_load_id, impact_reason
+)
+SELECT DISTINCT
+    impacted.cluster_id,
+    DATE_TRUNC('month', affected.report_date)::DATE,
+    impacted.transaction_id,
+    %(load_id)s,
+    'SOURCE_LOAD_REPLACED'
+FROM linkaja_impacted_ids AS impacted
+JOIN linkaja_affected_dates AS affected
+  ON affected.cluster_id = impacted.cluster_id
+ON CONFLICT DO NOTHING
+"""
+
+
 AFFECTED_DATES_STATEMENT = """
 SELECT report_date
 FROM linkaja_affected_dates
@@ -514,22 +604,15 @@ SELECT
     END AS balance_before,
     reversal.source_files,
     reversal.updated_load_id,
-    'UNRESOLVED_REVERSAL' AS unusual_reason_code
+    edge.resolution_status AS unusual_reason_code
 FROM linkaja_transaction_base_v AS reversal
+JOIN linkaja_reversal_edges_current_v AS edge
+  ON edge.cluster_id = reversal.cluster_id
+ AND edge.reversal_transaction_id = reversal.transaction_id
 WHERE reversal.cluster_id = %(cluster_id)s
-  AND reversal.original_transaction_id IS NOT NULL
+  AND edge.resolution_status <> 'COMPLETE'
   AND reversal.finalized_at_local >= %(month_start)s
   AND reversal.finalized_at_local < %(calculation_cutoff)s
-  AND NOT EXISTS (
-      SELECT 1
-      FROM linkaja_raw_transactions AS original
-      WHERE original.cluster_id = reversal.cluster_id
-        AND original.transaction_id = reversal.original_transaction_id
-        AND LOWER(BTRIM(COALESCE(original.transaction_status, ''))) =
-              'completed'
-        AND original.finalized_date + original.finalized_time <
-              %(calculation_cutoff)s
-  )
 ORDER BY reversal.finalized_at_local, reversal.transaction_id
 """
 
