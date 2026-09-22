@@ -47,6 +47,10 @@ promotes staged rows into the ledger, while `❌ Tolak & hapus` discards only
 that refresh's staged rows; a CMS mismatch is shown as a warning before these
 actions. For an all-region refresh, approval moves only verified regions and
 leaves incomplete or mismatched regions in staging for a later review.
+When a mismatch is detected, the review alert also includes a read-only Excel
+analysis workbook with daily coverage and staging rows. Finance does not enter
+correction values in Telegram; corrections are handled by the restricted
+Kestra operator flow.
 
 ## Validation
 

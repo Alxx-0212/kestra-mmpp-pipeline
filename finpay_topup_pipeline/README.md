@@ -52,6 +52,7 @@ context exists. Each task has one responsibility:
 | `extract_topup` | Download each cluster from its own checkpoint in three-day chunks, fall back to one-day chunks after a failed request, and retry only missing chunks. | Records per-cluster `DOWNLOADED`/`FAILED` evidence; marks the refresh `FAILED` only when a required chunk cannot complete. |
 | `ingest_topup` | Parse, validate, checkpoint-filter, batch-dedupe, and exclude ledger hashes. | Replaces only this refresh's staging rows; never commits ledger rows. |
 | `refresh_saldo` | Read CMS BUCKET TOP UP and compare it with committed plus this refresh's staging rows. | Writes cluster verification evidence and `PENDING_REVIEW`/`VERIFY_FAILED`. |
+| `export_staging_review` | When a cluster has a numeric mismatch, create a read-only daily-gap workbook for only those mismatched clusters. | No database writes; the workbook is delivered with the review alert. |
 | `reextract_topup` / `restage_topup` / `reverify_saldo` | Recover a technical verification failure with a fresh source snapshot. | Replaces only the selected refresh staging and rewrites its evidence. |
 | `finalize_refresh` | Preserve reviewable partial verification and purge only a technical failure with no verified cluster. | `VERIFY_SKIPPED` promotes rows; partial verification retains staging for review. |
 | `notify_verification_failure` | Send a one-way alert for handled CMS verification failure. | No database writes. |
@@ -122,6 +123,18 @@ the effective checkpoint backward. Give an inserted adjustment a distinct
 `effective_at` when its position among `transaction_date ASC` rows matters;
 equal timestamps intentionally have no secondary ordering key.
 
+### Operator correction flow
+
+`finpay_topup_correction_v1` is a manual-only Kestra flow with no Telegram
+trigger. Restrict its execute permission to the Top-Up operator role and set
+the `FINPAY_TOPUP_OPERATOR_ALLOWLIST` Kestra secret to the approved operator
+names. It supports `RESTAGE` for one pending cluster/date range,
+`PROPOSE_ADJUSTMENT` for an audited `PROPOSED` adjustment, and
+`APPROVE_ADJUSTMENT` for the operator-controlled approval followed by CMS
+re-verification. Every operation requires a reason and a `refresh:<id>` source
+reference. The flow never commits ledger rows; unresolved mismatches remain in
+staging and produce a new analysis workbook.
+
 `refresh_saldo` then verifies against the DigiPOS CMS BUCKET TOP UP using a
 running saldo computed over committed rows UNION ALL staged rows for that
 refresh (`saldo._compute_running_saldo(..., include_refresh_id=...)`):
@@ -139,10 +152,11 @@ refresh (`saldo._compute_running_saldo(..., include_refresh_id=...)`):
    A new refresh is blocked when its cluster/user scope overlaps any nonterminal
    refresh (`REQUESTED`, `STAGED`, `PENDING_REVIEW`, or active verification),
    not only a refresh already awaiting review.
-- **technical verification failure** — after one automatic restage-and-reverify,
-  `purge_staged_rows` deletes the cycle's staged rows, the refresh becomes
-  `VERIFY_FAILED`, and a failure alert is sent. The committed ledger and trusted
-  checkpoints remain untouched.
+ - **technical verification failure** — after one automatic restage-and-reverify,
+  a cycle with no verified cluster is purged and becomes `VERIFY_FAILED`. If at
+  least one cluster verifies, its rows remain reviewable while failed clusters
+  stay in staging and the refresh becomes `PENDING_REVIEW`. The committed ledger
+  and trusted checkpoints remain untouched until approval.
 - **verification skipped** (`verify_bucket_topup=false`) — staged rows are
   committed without advancing any checkpoint so manual unverified loads stay
   visible as legacy `VERIFY_SKIPPED` runs.

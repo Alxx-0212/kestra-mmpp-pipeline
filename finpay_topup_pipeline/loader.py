@@ -96,7 +96,8 @@ STAGE_INSERT_SQL = (
     f"INSERT INTO {TABLE_TXN_STAGING} "
     f"(refresh_id, cluster_id, transaction_date, sender, receiver, "
     f"transaction_type, amount, currency, remarks, source_file, row_hash) "
-    f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+    f"ON CONFLICT (refresh_id, row_hash) DO NOTHING"
 )
 
 
@@ -129,7 +130,15 @@ def _validated_pending_rows(cluster_id, csv_files, checkpoint_as_of_date=None):
     return pending, seen
 
 
-def load_inbox_staged(conn, inbox_dir, refresh_id, cluster_ids=None, checkpoint_dates=None):
+def load_inbox_staged(
+    conn,
+    inbox_dir,
+    refresh_id,
+    cluster_ids=None,
+    checkpoint_dates=None,
+    replace_scope=None,
+    commit=True,
+):
     """Stage inbox CSV rows for one refresh cycle without committing to the ledger.
 
     Any rows previously staged for this refresh_id are replaced so a retry
@@ -155,7 +164,21 @@ def load_inbox_staged(conn, inbox_dir, refresh_id, cluster_ids=None, checkpoint_
             raise ValueError(f"missing checkpoint dates for clusters: {sorted(missing)}")
     totals = {}
     with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {TABLE_TXN_STAGING} WHERE refresh_id = %s", (refresh_id,))
+        if replace_scope is None:
+            cur.execute(f"DELETE FROM {TABLE_TXN_STAGING} WHERE refresh_id = %s", (refresh_id,))
+        else:
+            if not allowed_clusters:
+                raise ValueError("replace_scope requires selected clusters")
+            replace_start, replace_end = (_as_date(value) for value in replace_scope)
+            if replace_start > replace_end:
+                raise ValueError("replace scope start must be on or before end")
+            cur.execute(
+                f"DELETE FROM {TABLE_TXN_STAGING} "
+                "WHERE refresh_id = %s AND cluster_id = ANY(%s) "
+                "AND (transaction_date AT TIME ZONE 'Asia/Makassar')::date >= %s "
+                "AND (transaction_date AT TIME ZONE 'Asia/Makassar')::date <= %s",
+                (refresh_id, sorted(allowed_clusters), replace_start, replace_end),
+            )
     for cluster_dir in sorted(p for p in inbox.iterdir() if p.is_dir()):
         cluster_id = cluster_dir.name
         if allowed_clusters is not None and cluster_id not in allowed_clusters:
@@ -192,13 +215,15 @@ def load_inbox_staged(conn, inbox_dir, refresh_id, cluster_ids=None, checkpoint_
                         source_file,
                         h,
                     ))
-                    staged += 1
+                    if cur.rowcount:
+                        staged += 1
         totals[cluster_id] = {
             "seen": seen,
             "staged": staged,
             "already_committed": already_committed,
         }
-    conn.commit()
+    if commit:
+        conn.commit()
     return totals
 
 

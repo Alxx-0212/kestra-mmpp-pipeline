@@ -9,12 +9,14 @@ import os
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from html import escape
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 SEND_MESSAGE_TIMEOUT = 30
+SEND_DOCUMENT_TIMEOUT = 60
 TELEGRAM_MESSAGE_LIMIT = 4096
 MONTHS = ("", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des")
 LOCAL_TZ = ZoneInfo("Asia/Makassar")
@@ -72,6 +74,41 @@ def send_telegram_alert(text, token=None, chat_id=None, reply_markup=None, parse
         reply_markup=reply_markup,
         parse_mode=parse_mode,
     )
+
+
+def send_telegram_document(
+    path,
+    token=None,
+    chat_id=None,
+    filename=None,
+    caption=None,
+    timeout=SEND_DOCUMENT_TIMEOUT,
+    api_base=TELEGRAM_API_BASE,
+):
+    """Send one local workbook without changing any database state."""
+    if not token or not chat_id:
+        return False
+    document_path = Path(path)
+    if not document_path.is_file():
+        raise ValueError("document file is missing")
+    with document_path.open("rb") as document:
+        data = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption[:1024]
+        response = requests.post(
+            f"{api_base.rstrip('/')}/bot{token}/sendDocument",
+            data=data,
+            files={
+                "document": (
+                    filename or document_path.name,
+                    document,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    return True
 
 
 def _html(value):
@@ -230,6 +267,7 @@ def format_cycle_alert(
     attempt=None,
     staged=None,
     checkpoint_dates=None,
+    staging_export_filename=None,
 ):
     """Human-readable one-way alert for a stage-then-verify cycle outcome."""
     status = verification.get("status", "UNKNOWN")
@@ -271,6 +309,8 @@ def format_cycle_alert(
                 "<b>Perhatian: ada wilayah yang belum terverifikasi. Hanya wilayah "
                 "Terverifikasi yang masuk ledger utama.</b>"
             )
+        if staging_export_filename:
+            lines.append(_field("Lampiran", staging_export_filename))
         lines.append("<b>Data belum masuk ledger utama.</b>")
     elif status == "VERIFY_FAILED":
         if purged is not None:
@@ -316,6 +356,8 @@ def format_cycle_alert(
                 "<b>Perhatian: ada wilayah yang belum terverifikasi. Hanya wilayah "
                 "Terverifikasi yang masuk ledger utama.</b>"
             )
+        if staging_export_filename:
+            lines.append(_field("Lampiran", staging_export_filename))
         lines.append("<b>Data belum masuk ledger utama.</b>")
     elif status == "VERIFY_FAILED":
         if purged is not None:

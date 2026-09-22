@@ -23,6 +23,7 @@ def propose_adjustment(
     receiver=None,
     remarks=None,
     source_reference=None,
+    commit=True,
 ):
     """Create an auditable adjustment; it is excluded until explicitly approved."""
     if transaction_type not in {"Kredit", "Debit"}:
@@ -67,11 +68,12 @@ def propose_adjustment(
             ),
         )
         row = cur.fetchone()
-    conn.commit()
+    if commit:
+        conn.commit()
     return {"adjustment_id": row[0], "status": row[1], "adjustment_hash": adjustment_hash} if row else None
 
 
-def approve_adjustment(conn, adjustment_id, approved_by):
+def approve_adjustment(conn, adjustment_id, approved_by, *, commit=True):
     if not approved_by:
         raise ValueError("approver is required")
     with conn.cursor() as cur:
@@ -81,11 +83,12 @@ def approve_adjustment(conn, adjustment_id, approved_by):
             (approved_by, adjustment_id),
         )
         row = cur.fetchone()
-    conn.commit()
+    if commit:
+        conn.commit()
     return row
 
 
-def void_adjustment(conn, adjustment_id, voided_by):
+def void_adjustment(conn, adjustment_id, voided_by, *, commit=True):
     if not voided_by:
         raise ValueError("voiding operator is required")
     with conn.cursor() as cur:
@@ -95,7 +98,8 @@ def void_adjustment(conn, adjustment_id, voided_by):
             (voided_by, adjustment_id),
         )
         row = cur.fetchone()
-    conn.commit()
+    if commit:
+        conn.commit()
     return row
 
 

@@ -5,6 +5,7 @@ from finpay_topup_pipeline.notify import (
     format_cycle_alert,
     format_flow_failure_alert,
     review_keyboard,
+    send_telegram_document,
     send_telegram_message,
 )
 
@@ -106,9 +107,7 @@ class TestFormatCycleAlert(unittest.TestCase):
             {"text": "✅ Setujui & masukkan", "callback_data": "r:a:42"},
             {"text": "❌ Tolak & hapus", "callback_data": "r:r:42"},
         ])
-        self.assertEqual(keyboard["inline_keyboard"][1], [
-            {"text": "ℹ️ Lihat detail", "callback_data": "r:d:42"},
-        ])
+        self.assertEqual(len(keyboard["inline_keyboard"]), 1)
 
     def test_match_fallbacks_do_not_fabricate_transaction_rows(self):
         for match_type, expected in (

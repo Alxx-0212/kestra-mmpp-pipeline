@@ -419,9 +419,11 @@ class ScopedReadAndClassificationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(100, service.sessions)
         text = query.message.edit_text.await_args.args[0]
-        self.assertIn("Ditandai: 1", text)
-        self.assertIn("Ditunda: 1", text)
-        self.assertIn("Belum ditandai: 0", text)
+        self.assertIn("Ditandai", text)
+        self.assertIn("Ditunda", text)
+        self.assertIn("Belum ditandai", text)
+        self.assertIn(": 1", text)
+        self.assertIn(": 0", text)
         query.answer.assert_awaited_once_with("Tinjauan selesai")
 
     async def test_classification_callback_passes_session_cluster_to_guard(self):

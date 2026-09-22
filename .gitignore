@@ -7,6 +7,8 @@ __pycache__/
 data/
 .idea/
 .kilo/
+.codex/
+.agents/
 main.ipynb
 docs/context7/
 docs/__pycache__/

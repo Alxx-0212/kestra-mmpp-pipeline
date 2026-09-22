@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -6,7 +6,12 @@ from zoneinfo import ZoneInfo
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 
-from .config import TABLE_MANUAL_ADJUSTMENT
+from .config import (
+    TABLE_MANUAL_ADJUSTMENT,
+    TABLE_REFRESH,
+    TABLE_REFRESH_CLUSTER,
+    TABLE_TXN_STAGING,
+)
 from .saldo import _checkpoint_source_sql
 
 
@@ -28,6 +33,45 @@ HEADERS = (
     "Outlet",
     "Source",
 )
+STAGING_HEADERS = (
+    "Refresh ID",
+    "Staging ID",
+    "Transaction Date",
+    "Sender",
+    "Receiver",
+    "Transaction Type",
+    "SETOR",
+    "TOPUP",
+    "SALDO",
+    "Currency",
+    "Remarks",
+    "Source File",
+    "Row Hash",
+    "Source Status",
+)
+DAILY_HEADERS = (
+    "Cluster",
+    "Date",
+    "Rows",
+    "SETOR",
+    "TOPUP",
+    "Net",
+    "First Transaction",
+    "Last Transaction",
+    "Coverage",
+)
+SUMMARY_HEADERS = (
+    "Cluster",
+    "Verification",
+    "Checkpoint Boundary",
+    "Download Period",
+    "Opening SALDO",
+    "Calculated SALDO",
+    "CMS BUCKET",
+    "Difference",
+    "Staging Rows",
+    "Days Without Rows",
+)
 CLUSTER_SHEETS = {
     "411311": "Palangkaraya",
     "421306": "Morotai",
@@ -43,6 +87,8 @@ def _as_date(value):
 
 
 def _local_date(value):
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
     return value.astimezone(LOCAL_TZ).date() if value.tzinfo is not None else value.date()
 
 
@@ -171,6 +217,229 @@ def build_finance_workbook(conn, start_date, end_date, cluster_ids):
         "filename": f"finpay-topup-{scope}-{start_date.isoformat()}-to-{end_date.isoformat()}.xlsx",
         "row_count": total_rows,
         "cluster_counts": counts,
+        "start": start_date.isoformat(),
+        "end": end_date.isoformat(),
+    }
+
+
+def build_staging_workbook(conn, refresh_id, cluster_ids=None):
+    """Build a read-only analysis workbook for mismatched pending staging."""
+    refresh_id = int(refresh_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT r.status, r.requested_start, r.requested_end, c.cluster_id, c.status, "
+            f"c.checkpoint_as_of_date, c.computed_saldo, c.bucket_topup_value, "
+            f"c.verification_diff, c.bucket_snapshot_at, c.calculation_cutoff_at "
+            f"FROM {TABLE_REFRESH} r "
+            f"JOIN {TABLE_REFRESH_CLUSTER} c ON c.refresh_id = r.refresh_id "
+            "WHERE r.refresh_id = %s ORDER BY c.cluster_id",
+            (refresh_id,),
+        )
+        refresh_rows = cur.fetchall()
+    if not refresh_rows:
+        raise ValueError("refresh was not found")
+    if refresh_rows[0][0] != "PENDING_REVIEW":
+        raise ValueError("staging export requires a pending review refresh")
+
+    start_date = _as_date(refresh_rows[0][1])
+    end_date = _as_date(refresh_rows[0][2])
+    contexts = {
+        str(row[3]): {
+            "status": row[4],
+            "checkpoint": _as_date(row[5]) if row[5] else None,
+            "computed": row[6],
+            "bucket": row[7],
+            "difference": row[8],
+            "snapshot_at": row[9],
+            "cutoff_at": row[10],
+        }
+        for row in refresh_rows
+    }
+    mismatch_ids = [cluster_id for cluster_id, value in contexts.items() if value["status"] == "MISMATCH"]
+    if cluster_ids is None:
+        cluster_ids = mismatch_ids
+    else:
+        cluster_ids = list(dict.fromkeys(str(cluster_id) for cluster_id in cluster_ids))
+        if any(cluster_id not in mismatch_ids for cluster_id in cluster_ids):
+            raise ValueError("staging export is available only for mismatched clusters")
+    if not cluster_ids:
+        raise ValueError("no mismatched cluster requires a staging export")
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    workbook.properties.title = f"FinPay staging analysis refresh {refresh_id}"
+    workbook.properties.subject = "Pending Top-Up staging review"
+    workbook.properties.creator = "FinPay Top-Up"
+    summary_rows = []
+    daily_rows = []
+    total_rows = 0
+    gap_days = {}
+
+    control = workbook.create_sheet("Ringkasan")
+    control.append(("Refresh ID", refresh_id))
+    control.append(("Status", "PENDING_REVIEW"))
+    control.append(("Periode permintaan", f"{start_date.isoformat()} - {end_date.isoformat()}"))
+    control.append(("Catatan", "Data di bawah hanya staging dan belum masuk ledger utama."))
+    control.append(())
+    control.append(SUMMARY_HEADERS)
+
+    daily = workbook.create_sheet("Harian")
+    daily.append(DAILY_HEADERS)
+
+    for cluster_id in cluster_ids:
+        context = contexts[cluster_id]
+        checkpoint = context["checkpoint"]
+        if checkpoint is None:
+            raise ValueError(f"checkpoint is missing for cluster {cluster_id}")
+        if (end_date - checkpoint).days >= MAX_EXPORT_DAYS:
+            raise ValueError(f"staging period exceeds {MAX_EXPORT_DAYS} days")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT opening_balance FROM ({_checkpoint_source_sql()}) checkpoints "
+                "WHERE cluster_id=%s AND as_of_date<=%s "
+                "ORDER BY as_of_date DESC, priority DESC, override_id DESC LIMIT 1",
+                (cluster_id, checkpoint),
+            )
+            opening = cur.fetchone()
+            if opening is None:
+                raise ValueError(f"checkpoint balance is missing for cluster {cluster_id}")
+            cur.execute(
+                f"SELECT txn_id, transaction_date, sender, receiver, transaction_type, amount, "
+                f"currency, remarks, source_file, row_hash, loaded_at "
+                f"FROM {TABLE_TXN_STAGING} WHERE refresh_id=%s AND cluster_id=%s "
+                "ORDER BY transaction_date ASC, txn_id ASC",
+                (refresh_id, cluster_id),
+            )
+            source_rows = cur.fetchall()
+
+        saldo = Decimal(str(opening[0]))
+        export_rows = []
+        daily_by_date = {}
+        for row in source_rows:
+            transaction_day = _local_date(row[1])
+            amount = Decimal(str(row[5]))
+            if row[4] == "Kredit":
+                saldo += amount
+            elif row[4] == "Debit":
+                saldo -= amount
+            if transaction_day < checkpoint or transaction_day > end_date:
+                continue
+            item = daily_by_date.setdefault(
+                transaction_day,
+                {"rows": 0, "kredit": Decimal("0"), "debit": Decimal("0"), "first": row[1], "last": row[1]},
+            )
+            item["rows"] += 1
+            item["kredit"] += amount if row[4] == "Kredit" else Decimal("0")
+            item["debit"] += amount if row[4] == "Debit" else Decimal("0")
+            item["first"] = min(item["first"], row[1])
+            item["last"] = max(item["last"], row[1])
+            export_rows.append((
+                refresh_id,
+                row[0],
+                _excel_datetime(row[1]),
+                row[2],
+                row[3],
+                row[4],
+                amount if row[4] == "Kredit" else None,
+                amount if row[4] == "Debit" else None,
+                saldo,
+                row[6] or "IDR",
+                row[7],
+                row[8],
+                row[9],
+                "STAGING - belum masuk ledger",
+            ))
+
+        total_rows += len(export_rows)
+        if total_rows > MAX_EXPORT_ROWS:
+            raise ValueError(f"export exceeds {MAX_EXPORT_ROWS:,} rows")
+        missing_days = []
+        day = checkpoint
+        while day <= end_date:
+            item = daily_by_date.get(day)
+            if item is None:
+                missing_days.append(day.isoformat())
+                daily.append((CLUSTER_SHEETS[cluster_id], day, 0, None, None, None, None, None, "Tidak ada baris dikembalikan"))
+            else:
+                daily.append((
+                    CLUSTER_SHEETS[cluster_id],
+                    day,
+                    item["rows"],
+                    item["kredit"],
+                    item["debit"],
+                    item["kredit"] - item["debit"],
+                    _excel_datetime(item["first"]),
+                    _excel_datetime(item["last"]),
+                    "Ada data",
+                ))
+            day += timedelta(days=1)
+        gap_days[cluster_id] = missing_days
+        summary_rows.append((
+            CLUSTER_SHEETS[cluster_id],
+            context["status"],
+            checkpoint,
+            f"{checkpoint.isoformat()} - {end_date.isoformat()}",
+            Decimal(str(opening[0])),
+            context["computed"],
+            context["bucket"],
+            context["difference"],
+            len(export_rows),
+            ", ".join(missing_days) or "Tidak ada",
+        ))
+        sheet = workbook.create_sheet(CLUSTER_SHEETS[cluster_id])
+        sheet.append(STAGING_HEADERS)
+        for row in export_rows:
+            sheet.append(row)
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = f"A1:N{max(sheet.max_row, 1)}"
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+        for cell in sheet["C"][1:]:
+            cell.number_format = "dd-mm-yyyy hh:mm:ss"
+        for column in ("G", "H", "I"):
+            for cell in sheet[column][1:]:
+                cell.number_format = RUPIAH_FORMAT
+        widths = (12, 12, 20, 18, 18, 18, 16, 16, 18, 12, 32, 36, 68, 26)
+        for index, width in enumerate(widths, 1):
+            sheet.column_dimensions[chr(64 + index)].width = width
+
+    for row in summary_rows:
+        control.append(row)
+    for cell in control[6]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    control.freeze_panes = "A7"
+    control.auto_filter.ref = f"A6:J{max(control.max_row, 6)}"
+    for column, width in zip("ABCDEFGHIJ", (18, 16, 20, 28, 18, 18, 18, 18, 16, 38)):
+        control.column_dimensions[column].width = width
+
+    for cell in daily[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    daily.freeze_panes = "A2"
+    daily.auto_filter.ref = f"A1:I{max(daily.max_row, 1)}"
+    for cell in daily["B"][1:]:
+        cell.number_format = "dd-mm-yyyy"
+    for column in ("D", "E", "F"):
+        for cell in daily[column][1:]:
+            cell.number_format = RUPIAH_FORMAT
+    for column, width in zip("ABCDEFGHI", (18, 14, 10, 16, 16, 16, 20, 20, 28)):
+        daily.column_dimensions[column].width = width
+
+    output = BytesIO()
+    workbook.save(output)
+    content = output.getvalue()
+    if len(content) > MAX_TELEGRAM_FILE_BYTES:
+        raise ValueError("generated workbook exceeds Telegram's 50 MB document limit")
+    return {
+        "content": content,
+        "filename": f"finpay-topup-staging-refresh-{refresh_id}-mismatch.xlsx",
+        "refresh_id": refresh_id,
+        "cluster_ids": cluster_ids,
+        "row_count": total_rows,
+        "cluster_counts": {row[0]: row[8] for row in summary_rows},
+        "gap_days": gap_days,
         "start": start_date.isoformat(),
         "end": end_date.isoformat(),
     }

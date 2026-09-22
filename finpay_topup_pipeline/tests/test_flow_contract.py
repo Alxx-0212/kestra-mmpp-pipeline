@@ -6,6 +6,7 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FLOW_PATH = REPOSITORY_ROOT / "finpay_topup_pipeline" / "workflows" / "finpay_topup_pipeline.yml"
+CORRECTION_FLOW_PATH = REPOSITORY_ROOT / "finpay_topup_pipeline" / "workflows" / "finpay_topup_correction.yml"
 
 
 class FinpayTopupFlowContractTest(unittest.TestCase):
@@ -60,8 +61,9 @@ class FinpayTopupFlowContractTest(unittest.TestCase):
                 "refresh_saldo",
                 "reextract_topup",
                 "restage_topup",
-                "reverify_saldo",
-                "finalize_refresh",
+                 "reverify_saldo",
+                 "export_staging_review",
+                 "finalize_refresh",
                 "notify_verification_failure",
                 "notify_review",
                 "summary_topup",
@@ -105,6 +107,11 @@ class FinpayTopupFlowContractTest(unittest.TestCase):
         self.assertIn('status = "PENDING_REVIEW"', finalize)
         self.assertIn("format_cycle_alert", self._task("notify_review")["script"])
         self.assertIn("review_keyboard", self._task("notify_review")["script"])
+        self.assertIn("send_telegram_document", self._task("notify_review")["script"])
+        self.assertIn("STAGING_EXPORT_PATH", self.text)
+        export = self._task("export_staging_review")
+        self.assertIn("mismatch", export["runIf"])
+        self.assertIn("build_staging_workbook", export["script"])
 
     def test_ingest_records_kestra_execution_id(self):
         script = self._task("prepare_refresh")["script"]
@@ -187,6 +194,54 @@ class FinpayTopupFlowContractTest(unittest.TestCase):
         self.assertIn('os.environ.get("WORKING_DIR", "/tmp/kestra-wd")', self._task("ingest_topup")["script"])
         self.assertIn("outputs.refresh_saldo.vars.needs_retry", self._task("reextract_topup")["runIf"])
         self.assertIn("outputs.reextract_topup.vars.succeeded", self._task("restage_topup")["runIf"])
+        self.assertIn("finpay-topup-review/*.xlsx", working["outputFiles"])
+
+
+class FinpayTopupCorrectionFlowContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text = CORRECTION_FLOW_PATH.read_text(encoding="utf-8")
+        cls.flow = yaml.safe_load(cls.text)
+
+    @staticmethod
+    def _flatten(tasks):
+        for task in tasks or []:
+            yield task
+            yield from FinpayTopupCorrectionFlowContractTest._flatten(task.get("tasks"))
+
+    @classmethod
+    def _task(cls, task_id):
+        return next(task for task in cls._flatten(cls.flow.get("tasks")) if task["id"] == task_id)
+
+    def test_correction_flow_is_manual_and_operator_guarded(self):
+        self.assertEqual(self.flow["id"], "finpay_topup_correction_v1")
+        self.assertEqual(self.flow["namespace"], "finance.finpay")
+        self.assertFalse(self.flow.get("triggers"))
+        inputs = {item["id"] for item in self.flow["inputs"]}
+        self.assertTrue({"refresh_id", "cluster_id", "operation", "operator", "reason"} <= inputs)
+        self.assertIn("FINPAY_TOPUP_OPERATOR_ALLOWLIST", self.text)
+        self.assertIn("operator is not allowed", self.text)
+
+    def test_correction_flow_only_verifies_after_an_applied_correction(self):
+        apply_script = self._task("apply_correction")["script"]
+        verify = self._task("verify_corrected_cluster")
+        export = self._task("export_correction_review")
+        self.assertIn("apply_operator_correction", apply_script)
+        self.assertIn("ready_for_verification", verify["runIf"])
+        self.assertIn("build_staging_workbook", self._task("export_correction_review")["script"])
+        self.assertIn("mismatch", export["runIf"])
+        self.assertIn("review_keyboard", self._task("notify_correction_review")["script"])
+
+    def test_every_correction_script_compiles_as_python(self):
+        scripts = [
+            (task["id"], task["script"])
+            for task in self._flatten(self.flow.get("tasks"))
+            if "script" in task
+        ]
+        for task_id, script in scripts:
+            with self.subTest(task=task_id):
+                rendered = re.sub(r"\{\{.*?\}\}", "x", script, flags=re.DOTALL)
+                compile(rendered, f"<{task_id}>", "exec")
 
 
 if __name__ == "__main__":

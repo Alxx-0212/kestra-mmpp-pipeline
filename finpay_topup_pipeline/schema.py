@@ -10,6 +10,7 @@ from .config import (
     TABLE_CLUSTER_OUTLET,
     TABLE_MANUAL_ADJUSTMENT,
     TABLE_CHECKPOINT_OVERRIDE,
+    TABLE_CORRECTION_AUDIT,
 )
 from .legacy_outlet import LEGACY_OUTLETS_BY_CLUSTER, outlet_code
 
@@ -123,6 +124,24 @@ CREATE TABLE IF NOT EXISTS {TABLE_CHECKPOINT_OVERRIDE} (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     approved_by TEXT,
     approved_at TIMESTAMPTZ
+);
+"""
+
+DDL_CORRECTION_AUDIT = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_CORRECTION_AUDIT} (
+    correction_id BIGSERIAL PRIMARY KEY,
+    refresh_id BIGINT NOT NULL REFERENCES {TABLE_REFRESH}(refresh_id) ON DELETE CASCADE,
+    cluster_id TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('RESTAGE', 'PROPOSE_ADJUSTMENT', 'APPROVE_ADJUSTMENT')),
+    source_start DATE,
+    source_end DATE,
+    adjustment_id BIGINT REFERENCES {TABLE_MANUAL_ADJUSTMENT}(adjustment_id),
+    reason TEXT NOT NULL,
+    source_reference TEXT,
+    actor TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('COMPLETED', 'FAILED')),
+    details TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 
@@ -250,6 +269,8 @@ CREATE INDEX IF NOT EXISTS finpay_manual_adjustment_scope_idx
 CREATE INDEX IF NOT EXISTS finpay_checkpoint_override_scope_idx
     ON {TABLE_CHECKPOINT_OVERRIDE} (cluster_id, as_of_date, approved_at DESC)
     WHERE status = 'APPROVED';
+CREATE INDEX IF NOT EXISTS finpay_correction_audit_scope_idx
+    ON {TABLE_CORRECTION_AUDIT} (refresh_id, cluster_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS finpay_topup_refresh_status_idx
     ON {TABLE_REFRESH} (status, requested_at);
 CREATE INDEX IF NOT EXISTS finpay_topup_refresh_cluster_status_idx
@@ -275,6 +296,7 @@ def ensure_schema(conn):
         cur.execute(DDL_BUCKET_SNAPSHOT)
         cur.execute(DDL_MANUAL_ADJUSTMENT)
         cur.execute(DDL_CHECKPOINT_OVERRIDE)
+        cur.execute(DDL_CORRECTION_AUDIT)
         cur.execute(DDL_INDEXES)
         outlet_rows = [
             (outlet_code(cluster_id, label), label)

@@ -13,6 +13,7 @@ from finpay_topup_pipeline.audit import (
     update_refresh_status,
     upsert_cluster_status,
 )
+from finpay_topup_pipeline.correction import restage_refresh_cluster
 from finpay_topup_pipeline.bucket import BucketTopupSnapshot
 from finpay_topup_pipeline.classification import (
     active_outlets,
@@ -31,6 +32,7 @@ from finpay_topup_pipeline.config import (
     TABLE_REFRESH,
     TABLE_REFRESH_CLUSTER,
     TABLE_BUCKET_SNAPSHOT,
+    TABLE_CORRECTION_AUDIT,
 )
 from finpay_topup_pipeline.loader import (
     commit_staged_rows,
@@ -304,6 +306,75 @@ class StagingIntegrationTest(unittest.TestCase):
         self.assertEqual(staged_row_count(self.conn, refresh_id), 0)
         with self.conn.cursor() as cur:
             self.assertEqual(cur.execute(f"SELECT COUNT(*) FROM {TABLE_TXN}").fetchone()[0], 5)
+
+    def test_restage_records_operator_audit_and_replaces_only_target_cluster(self):
+        self._seed_opening("411311", "2026-08-10", 100000)
+        self._seed_opening("421318", "2026-08-10", 200000)
+        refresh_id = start_refresh(
+            self.conn,
+            "2026-08-11",
+            "2026-08-12",
+            ["411311_A", "421318_A"],
+            requested_by="plan-test",
+            trigger_source="unittest",
+            checkpoint_dates={"411311": "2026-08-10", "421318": "2026-08-10"},
+        )
+        _write_inbox(
+            self._tmp.name,
+            "411311",
+            ["1,2026-08-11 09:00:00,,,Kredit,500,IDR,old\n"],
+        )
+        _write_inbox(
+            self._tmp.name,
+            "421318",
+            ["1,2026-08-11 09:00:00,,,Kredit,700,IDR,untouched\n"],
+        )
+        load_inbox_staged(
+            self.conn,
+            self._tmp.name,
+            refresh_id,
+            cluster_ids=["411311", "421318"],
+            checkpoint_dates={"411311": "2026-08-10", "421318": "2026-08-10"},
+        )
+        update_refresh_status(self.conn, refresh_id, "PENDING_REVIEW")
+        _write_inbox(
+            self._tmp.name,
+            "411311",
+            [
+                "1,2026-08-11 09:00:00,,,Kredit,900,IDR,replaced\n",
+                "2,2026-08-11 10:00:00,,,Debit,100,IDR,replaced\n",
+            ],
+        )
+
+        result = restage_refresh_cluster(
+            self.conn,
+            refresh_id,
+            "411311",
+            self._tmp.name,
+            "2026-08-11",
+            "2026-08-11",
+            "Finance found an incomplete source day",
+            f"refresh:{refresh_id} ticket:FIN-44",
+            "topup-operator",
+        )
+
+        self.assertEqual(result["status"], "STAGED")
+        self.assertEqual(result["cluster_id"], "411311")
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"SELECT source_reference, operation, actor FROM {TABLE_CORRECTION_AUDIT} "
+                "WHERE correction_id = %s",
+                (result["correction_id"],),
+            )
+            audit = cur.fetchone()
+            cur.execute(
+                f"SELECT cluster_id, COUNT(*) FROM {TABLE_TXN_STAGING} WHERE refresh_id = %s "
+                "GROUP BY cluster_id ORDER BY cluster_id",
+                (refresh_id,),
+            )
+            staged = cur.fetchall()
+        self.assertEqual(audit, (f"refresh:{refresh_id} ticket:FIN-44", "RESTAGE", "topup-operator"))
+        self.assertEqual(staged, [("411311", 2), ("421318", 1)])
 
     def test_current_day_approval_advances_same_day_opening_boundary(self):
         self._seed_opening("411311", "2026-08-10", 100000)

@@ -7,6 +7,7 @@ from .config import (
     TABLE_BALANCE,
     TABLE_REFRESH,
     TABLE_REFRESH_CLUSTER,
+    TABLE_CORRECTION_AUDIT,
 )
 from .schema import ensure_schema
 from .io_csv import parse_amount, parse_transaction_date, parse_topup_csv
@@ -36,3 +37,8 @@ from .reconcile import reconcile_xlsx
 from .extract import run_extract
 from .audit import PendingRefreshConflict, start_refresh, update_refresh_status, upsert_cluster_status
 from .review import approve_refresh, reject_refresh
+from .correction import (
+    approve_manual_adjustment_for_refresh,
+    propose_manual_adjustment_for_refresh,
+    restage_refresh_cluster,
+)

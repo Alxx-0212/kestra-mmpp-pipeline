@@ -59,6 +59,7 @@ tasks:
     description: "Keep the extracted CSV inbox available to every sequential data task."
     outputFiles:
       - "finpay-topup-inbox/**/*.csv"
+      - "finpay-topup-review/*.xlsx"
     tasks:
       - id: prepare_refresh
         type: io.kestra.plugin.scripts.python.Script
@@ -528,6 +529,8 @@ tasks:
           Kestra.outputs({
               "verification_json": json.dumps(verification, default=str, sort_keys=True),
               "needs_retry": needs_retry,
+              "verification_status": verification["status"],
+              "mismatch": verification["status"] == "MISMATCH",
           })
 
       - id: reextract_topup
@@ -776,7 +779,82 @@ tasks:
           from kestra import Kestra
           Kestra.outputs({
               "verification_json": json.dumps(verification, default=str, sort_keys=True),
+              "verification_status": verification["status"],
+              "mismatch": verification["status"] == "MISMATCH",
           })
+
+      - id: export_staging_review
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Create a read-only daily-gap workbook only for mismatched clusters."
+        runIf: "{{ outputs.reverify_saldo.vars.mismatch ?? outputs.refresh_saldo.vars.mismatch ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT5M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          VERIFICATION_JSON: "{{ outputs.reverify_saldo.vars.verification_json ?? outputs.refresh_saldo.vars.verification_json ?? '{}' }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.excel_export import build_staging_workbook
+
+          import psycopg
+
+          refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
+          verification = json.loads(os.environ.get("VERIFICATION_JSON", "{}"))
+          mismatch_ids = [
+              str(cluster_id)
+              for cluster_id, evidence in (verification.get("clusters") or {}).items()
+              if evidence.get("status") == "MISMATCH"
+          ]
+          working_dir = os.environ.get("WORKING_DIR", "/tmp/kestra-wd")
+          export_dir = os.path.join(working_dir, "finpay-topup-review")
+          result = {"generated": False, "refresh_id": refresh_id, "cluster_ids": mismatch_ids}
+          if mismatch_ids:
+              try:
+                  conn = psycopg.connect(dsn_from_env())
+                  try:
+                      report = build_staging_workbook(conn, refresh_id, mismatch_ids)
+                  finally:
+                      conn.close()
+                  os.makedirs(export_dir, exist_ok=True)
+                  path = os.path.join(export_dir, report["filename"])
+                  with open(path, "wb") as workbook:
+                      workbook.write(report["content"])
+                  result.update({
+                      "generated": True,
+                      "path": os.path.relpath(path, working_dir),
+                      "filename": report["filename"],
+                      "row_count": report["row_count"],
+                      "gap_days": report["gap_days"],
+                  })
+                  print(
+                      f"event=topup_staging_export refresh_id={refresh_id} status=generated "
+                      f"clusters={','.join(mismatch_ids)} rows={report['row_count']}"
+                  )
+              except Exception as exc:
+                  result["error_type"] = type(exc).__name__
+                  print(
+                      f"event=topup_staging_export refresh_id={refresh_id} status=failed "
+                      f"error_type={type(exc).__name__}",
+                      file=sys.stderr,
+                  )
+          else:
+              print(f"event=topup_staging_export refresh_id={refresh_id} status=skipped")
+
+          from kestra import Kestra
+          Kestra.outputs(result)
 
       - id: finalize_refresh
         type: io.kestra.plugin.scripts.python.Script
@@ -926,13 +1004,20 @@ tasks:
           VERIFICATION_JSON: "{{ outputs.reverify_saldo.vars.verification_json ?? outputs.refresh_saldo.vars.verification_json ?? '{}' }}"
           CHECKPOINT_DATES: "{{ outputs.prepare_refresh.vars.checkpoint_dates ?? '{}' }}"
           STAGED_ROWS: "{{ outputs.restage_topup.vars.total_staged ?? outputs.ingest_topup.vars.total_staged ?? 0 }}"
+          STAGING_EXPORT_PATH: "{{ outputs.export_staging_review.vars.path ?? '' }}"
+          STAGING_EXPORT_FILENAME: "{{ outputs.export_staging_review.vars.filename ?? '' }}"
         script: |
           import json
           import os
           import sys
 
           sys.path.insert(0, "/app")
-          from finpay_topup_pipeline.notify import format_cycle_alert, review_keyboard, send_telegram_alert
+          from finpay_topup_pipeline.notify import (
+              format_cycle_alert,
+              review_keyboard,
+              send_telegram_alert,
+              send_telegram_document,
+          )
 
           refresh_id = int("{{ outputs.prepare_refresh.vars.refresh_id }}")
           start = "{{ outputs.prepare_refresh.vars.start }}"
@@ -942,8 +1027,11 @@ tasks:
           checkpoint_dates = json.loads(os.environ.get("CHECKPOINT_DATES", "{}"))
           staged_raw = os.environ.get("STAGED_ROWS", "0")
           staged = int(staged_raw or 0)
+          export_path = os.environ.get("STAGING_EXPORT_PATH", "").strip()
+          export_filename = os.environ.get("STAGING_EXPORT_FILENAME", "").strip()
           token = os.environ.get("TELEGRAM_REVIEW_BOT_TOKEN", "")
           sent = False
+          document_sent = False
           try:
               sent = send_telegram_alert(
                   format_cycle_alert(
@@ -953,12 +1041,34 @@ tasks:
                       verification,
                       staged=staged,
                       checkpoint_dates=checkpoint_dates,
+                      staging_export_filename=export_filename or None,
                   ),
                   token=token,
                   chat_id=os.environ.get("TELEGRAM_ALERT_CHAT_ID"),
                   reply_markup=review_keyboard(refresh_id),
                   parse_mode="HTML",
               )
+              if export_path:
+                  working_dir = os.environ.get("WORKING_DIR", "/tmp/kestra-wd")
+                  document_path = export_path if os.path.isabs(export_path) else os.path.join(working_dir, export_path)
+                  try:
+                      document_sent = send_telegram_document(
+                          document_path,
+                          token=token,
+                          chat_id=os.environ.get("TELEGRAM_ALERT_CHAT_ID"),
+                          filename=export_filename or None,
+                          caption=f"Excel analisis staging refresh #{refresh_id}",
+                      )
+                      print(
+                          f"event=topup_staging_export_delivery refresh_id={refresh_id} "
+                          f"status={'sent' if document_sent else 'skipped'}"
+                      )
+                  except Exception as exc:
+                      print(
+                          f"event=topup_staging_export_delivery refresh_id={refresh_id} status=failed "
+                          f"error_type={type(exc).__name__}",
+                          file=sys.stderr,
+                      )
               print(
                   f"event=topup_review_alert refresh_id={refresh_id} "
                   f"status={'sent' if sent else 'skipped'} staged_rows={staged}"
@@ -978,7 +1088,7 @@ tasks:
               )
 
           from kestra import Kestra
-          Kestra.outputs({"sent": sent, "refresh_id": refresh_id})
+          Kestra.outputs({"sent": sent, "document_sent": document_sent, "refresh_id": refresh_id})
 
       - id: summary_topup
         type: io.kestra.plugin.scripts.python.Script

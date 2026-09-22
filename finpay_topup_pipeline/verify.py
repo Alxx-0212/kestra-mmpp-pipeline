@@ -92,16 +92,18 @@ def verify_bucket_topup_values(
     results = {}
     external_failures = list(external_failures or [])
     if not snapshots:
-        update_refresh_status(
+        review_version = update_refresh_status(
             conn,
             refresh_id,
             "VERIFY_FAILED",
             "No BUCKET TOP UP snapshots available",
+            publish_review=True,
         )
         return {
             "status": "VERIFY_FAILED",
             "refresh_status": "VERIFY_FAILED",
             "clusters": {},
+            "review_version": review_version,
         }
     for snapshot in snapshots:
         calculated_at = datetime.now(timezone.utc)
@@ -211,18 +213,19 @@ def verify_bucket_topup_values(
     if all_failures:
         overall = "VERIFY_FAILED"
         err = f"Could not calculate BUCKET TOP UP saldo for clusters: {', '.join(all_failures)}"
-        update_refresh_status(conn, refresh_id, overall, err)
+        review_version = update_refresh_status(conn, refresh_id, overall, err, publish_review=True)
     elif mismatches:
         overall = "MISMATCH"
         err = f"BUCKET TOP UP mismatch for clusters: {', '.join(mismatches)}"
-        update_refresh_status(conn, refresh_id, "PENDING_REVIEW", err)
+        review_version = update_refresh_status(conn, refresh_id, "PENDING_REVIEW", err, publish_review=True)
     else:
         overall = "VERIFIED"
-        update_refresh_status(conn, refresh_id, "PENDING_REVIEW", None)
+        review_version = update_refresh_status(conn, refresh_id, "PENDING_REVIEW", None, publish_review=True)
     return {
         "status": overall,
         "refresh_status": "VERIFY_FAILED" if failures else "PENDING_REVIEW",
         "clusters": results,
+        "review_version": review_version,
     }
 
 
@@ -284,5 +287,6 @@ def verify_live_bucket_topup(
             refresh_id,
             "VERIFY_FAILED",
             f"Could not read BUCKET TOP UP for clusters: {', '.join(scrape_failures)}",
+            publish_review=True,
         )
     return result

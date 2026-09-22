@@ -1,0 +1,368 @@
+id: finpay_topup_correction_v1
+namespace: finance.finpay
+description: "Operator-only restage or audited adjustment for one pending Top-Up cluster."
+
+inputs:
+  - id: refresh_id
+    type: INT
+    displayName: "Pending refresh ID"
+    required: true
+  - id: cluster_id
+    type: STRING
+    displayName: "Cluster ID"
+    required: true
+  - id: operation
+    type: STRING
+    displayName: "Correction operation"
+    defaults: "RESTAGE"
+    required: true
+  - id: operator
+    type: STRING
+    displayName: "Operator"
+    required: true
+  - id: reason
+    type: STRING
+    displayName: "Reason"
+    required: true
+  - id: source_reference
+    type: STRING
+    displayName: "Source reference (must include refresh:<id>)"
+    required: true
+  - id: source_start
+    type: DATE
+    displayName: "Restage start date"
+    required: false
+  - id: source_end
+    type: DATE
+    displayName: "Restage end date"
+    required: false
+  - id: effective_at
+    type: STRING
+    displayName: "Adjustment effective timestamp"
+    required: false
+  - id: transaction_type
+    type: STRING
+    displayName: "Adjustment type"
+    required: false
+  - id: amount
+    type: STRING
+    displayName: "Adjustment amount"
+    required: false
+  - id: currency
+    type: STRING
+    displayName: "Adjustment currency"
+    defaults: "IDR"
+    required: true
+  - id: remarks
+    type: STRING
+    displayName: "Adjustment remarks"
+    required: false
+  - id: adjustment_id
+    type: INT
+    displayName: "Proposed adjustment ID"
+    required: false
+
+tasks:
+  - id: correction_working_directory
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: "Keep correction extraction artifacts available for restaging and review export."
+    outputFiles:
+      - "finpay-topup-correction-inbox/**/*.csv"
+      - "finpay-topup-correction-review/*.xlsx"
+    tasks:
+      - id: apply_correction
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT30M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+          OPERATOR_ALLOWLIST: "{{ secret('FINPAY_TOPUP_OPERATOR_ALLOWLIST') }}"
+          CORRECTION_OPERATOR: "{{ inputs.operator }}"
+          CORRECTION_OPERATION: "{{ inputs.operation ?? 'RESTAGE' }}"
+          CORRECTION_CLUSTER_ID: "{{ inputs.cluster_id }}"
+          CORRECTION_REASON: "{{ inputs.reason }}"
+          CORRECTION_SOURCE_REFERENCE: "{{ inputs.source_reference }}"
+          CORRECTION_REMARKS: "{{ inputs.remarks ?? '' }}"
+          CORRECTION_CURRENCY: "{{ inputs.currency ?? 'IDR' }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.correction_runner import apply_operator_correction
+
+          import psycopg
+
+          operator = os.environ.get("CORRECTION_OPERATOR", "").strip()
+          allowed = {
+              value.strip().lower()
+              for value in os.environ.get("OPERATOR_ALLOWLIST", "").split(",")
+              if value.strip()
+          }
+          if not allowed or operator.lower() not in allowed:
+              raise PermissionError("operator is not allowed to run Top-Up corrections")
+
+          operation = os.environ.get("CORRECTION_OPERATION", "RESTAGE").strip().upper()
+          refresh_id = int("{{ inputs.refresh_id }}")
+          cluster_id = os.environ["CORRECTION_CLUSTER_ID"].strip()
+          adjustment_id_raw = "{{ inputs.adjustment_id ?? '' }}".strip()
+          amount_raw = "{{ inputs.amount ?? '' }}".strip()
+          work_dir = os.path.join(
+              os.environ.get("WORKING_DIR", "/tmp/kestra-wd"),
+              "finpay-topup-correction-inbox",
+          )
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              result = apply_operator_correction(
+                  conn,
+                  operation=operation,
+                  refresh_id=refresh_id,
+                  cluster_id=cluster_id,
+                  actor=operator,
+                  reason=os.environ["CORRECTION_REASON"],
+                  source_reference=os.environ["CORRECTION_SOURCE_REFERENCE"],
+                  source_start="{{ inputs.source_start ?? '' }}".strip() or None,
+                  source_end="{{ inputs.source_end ?? '' }}".strip() or None,
+                  effective_at="{{ inputs.effective_at ?? '' }}".strip() or None,
+                  transaction_type="{{ inputs.transaction_type ?? '' }}".strip() or None,
+                  amount=amount_raw or None,
+                  adjustment_id=int(adjustment_id_raw) if adjustment_id_raw else None,
+                  inbox_dir=work_dir,
+                  password=os.environ.get("DIGIPOS_PASSWORD"),
+                  currency=os.environ.get("CORRECTION_CURRENCY", "IDR").strip() or "IDR",
+                  remarks=os.environ.get("CORRECTION_REMARKS", "").strip() or None,
+              )
+          finally:
+              conn.close()
+
+          print(
+              f"event=topup_correction operation={operation} refresh_id={refresh_id} "
+              f"cluster_id={cluster_id} status={result.get('status')} "
+              f"correction_id={result.get('correction_id', '-')}"
+          )
+          from kestra import Kestra
+          Kestra.outputs({
+              "result_json": json.dumps(result, default=str, sort_keys=True),
+              "ready_for_verification": result.get("ready_for_verification", False),
+              "operation": operation,
+          })
+
+      - id: verify_corrected_cluster
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.apply_correction.vars.ready_for_verification ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT10M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+          CORRECTION_CLUSTER_ID: "{{ inputs.cluster_id }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.config import dsn_from_env, TABLE_TXN_STAGING
+          from finpay_topup_pipeline.correction_runner import verify_operator_correction
+
+          import psycopg
+
+          refresh_id = int("{{ inputs.refresh_id }}")
+          cluster_id = os.environ["CORRECTION_CLUSTER_ID"].strip()
+          conn = psycopg.connect(dsn_from_env())
+          try:
+              verification = verify_operator_correction(
+                  conn,
+                  refresh_id,
+                  cluster_id,
+                  os.environ.get("DIGIPOS_PASSWORD"),
+              )
+              with conn.cursor() as cur:
+                  cur.execute(
+                      f"SELECT COUNT(*) FROM {TABLE_TXN_STAGING} "
+                      "WHERE refresh_id=%s AND cluster_id=%s",
+                      (refresh_id, cluster_id),
+                  )
+                  staged_rows = cur.fetchone()[0]
+          finally:
+              conn.close()
+
+          status = verification.get("status", "UNKNOWN")
+          verification["staged_rows"] = staged_rows
+          print(
+              f"event=topup_correction_verification refresh_id={refresh_id} "
+              f"cluster_id={cluster_id} status={status} staged_rows={staged_rows}"
+          )
+          from kestra import Kestra
+          Kestra.outputs({
+              "verification_json": json.dumps(verification, default=str, sort_keys=True),
+              "verification_status": status,
+              "mismatch": status == "MISMATCH",
+              "ready_for_review": True,
+              "staged_rows": staged_rows,
+          })
+
+      - id: export_correction_review
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.verify_corrected_cluster.vars.mismatch ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT5M
+        env:
+          FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+          FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+          FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+          FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+          FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+          VERIFICATION_JSON: "{{ outputs.verify_corrected_cluster.vars.verification_json }}"
+          CORRECTION_CLUSTER_ID: "{{ inputs.cluster_id }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.config import dsn_from_env
+          from finpay_topup_pipeline.excel_export import build_staging_workbook
+
+          import psycopg
+
+          refresh_id = int("{{ inputs.refresh_id }}")
+          cluster_id = os.environ["CORRECTION_CLUSTER_ID"].strip()
+          working_dir = os.environ.get("WORKING_DIR", "/tmp/kestra-wd")
+          export_dir = os.path.join(working_dir, "finpay-topup-correction-review")
+          verification = json.loads(os.environ.get("VERIFICATION_JSON", "{}"))
+          result = {"generated": False, "refresh_id": refresh_id, "cluster_id": cluster_id}
+          try:
+              conn = psycopg.connect(dsn_from_env())
+              try:
+                  report = build_staging_workbook(conn, refresh_id, [cluster_id])
+              finally:
+                  conn.close()
+              os.makedirs(export_dir, exist_ok=True)
+              path = os.path.join(export_dir, report["filename"])
+              with open(path, "wb") as workbook:
+                  workbook.write(report["content"])
+              result.update({
+                  "generated": True,
+                  "path": os.path.relpath(path, working_dir),
+                  "filename": report["filename"],
+                  "row_count": report["row_count"],
+                  "gap_days": report["gap_days"],
+              })
+              print(
+                  f"event=topup_correction_export refresh_id={refresh_id} "
+                  f"cluster_id={cluster_id} status=generated rows={report['row_count']}"
+              )
+          except Exception as exc:
+              result["error_type"] = type(exc).__name__
+              print(
+                  f"event=topup_correction_export refresh_id={refresh_id} "
+                  f"cluster_id={cluster_id} status=failed error_type={type(exc).__name__}",
+                  file=sys.stderr,
+              )
+
+          from kestra import Kestra
+          Kestra.outputs(result)
+
+      - id: notify_correction_review
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.verify_corrected_cluster.vars.ready_for_review ?? false }}"
+        containerImage: finpay-topup-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: mmpp-finance-network
+        pythonVersion: "3.11"
+        timeout: PT5M
+        env:
+          TELEGRAM_REVIEW_BOT_TOKEN: "{{ secret('FINPAY_TELEGRAM_BOT_TOKEN') }}"
+          TELEGRAM_ALERT_CHAT_ID: "{{ secret('TELEGRAM_ALERT_CHAT_ID') }}"
+          VERIFICATION_JSON: "{{ outputs.verify_corrected_cluster.vars.verification_json }}"
+          STAGING_EXPORT_PATH: "{{ outputs.export_correction_review.vars.path ?? '' }}"
+          STAGING_EXPORT_FILENAME: "{{ outputs.export_correction_review.vars.filename ?? '' }}"
+          CORRECTION_CLUSTER_ID: "{{ inputs.cluster_id }}"
+        script: |
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "/app")
+          from finpay_topup_pipeline.notify import (
+              format_cycle_alert,
+              review_keyboard,
+              send_telegram_alert,
+              send_telegram_document,
+          )
+
+          refresh_id = int("{{ inputs.refresh_id }}")
+          cluster_id = os.environ["CORRECTION_CLUSTER_ID"].strip()
+          verification = json.loads(os.environ.get("VERIFICATION_JSON", "{}"))
+          start = verification.get("requested_start") or "{{ inputs.source_start ?? '' }}"
+          end = verification.get("requested_end") or "{{ inputs.source_end ?? '' }}"
+          checkpoint = verification.get("checkpoint_as_of_date")
+          export_path = os.environ.get("STAGING_EXPORT_PATH", "").strip()
+          export_filename = os.environ.get("STAGING_EXPORT_FILENAME", "").strip()
+          token = os.environ.get("TELEGRAM_REVIEW_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_ALERT_CHAT_ID")
+          text = format_cycle_alert(
+              refresh_id,
+              start,
+              end,
+              verification,
+              staged=verification.get("staged_rows"),
+              checkpoint_dates={cluster_id: checkpoint} if checkpoint else None,
+              staging_export_filename=export_filename or None,
+          )
+          sent = send_telegram_alert(
+              text,
+              token=token,
+              chat_id=chat_id,
+              reply_markup=review_keyboard(refresh_id),
+              parse_mode="HTML",
+          )
+          document_sent = False
+          if export_path:
+              working_dir = os.environ.get("WORKING_DIR", "/tmp/kestra-wd")
+              path = export_path if os.path.isabs(export_path) else os.path.join(working_dir, export_path)
+              try:
+                  document_sent = send_telegram_document(
+                      path,
+                      token=token,
+                      chat_id=chat_id,
+                      filename=export_filename or None,
+                      caption=f"Excel analisis staging refresh #{refresh_id}",
+                  )
+              except Exception as exc:
+                  print(
+                      f"event=topup_correction_export_delivery refresh_id={refresh_id} "
+                      f"status=failed error_type={type(exc).__name__}",
+                      file=sys.stderr,
+                  )
+          print(
+              f"event=topup_correction_review refresh_id={refresh_id} cluster_id={cluster_id} "
+              f"alert={'sent' if sent else 'skipped'} document={'sent' if document_sent else 'skipped'}"
+          )
+          from kestra import Kestra
+          Kestra.outputs({"sent": sent, "document_sent": document_sent})
