@@ -27,6 +27,11 @@ to the optional dashboard profile.
 - Network: `mmpp-finance-network`
 - Optional dashboards: `docker compose --profile optional-dashboard up -d superset superset-mcp grist`
 
+Long-running Compose services use `restart: unless-stopped` so Docker restarts
+them after a process exit or host reboot. One-shot setup/deploy tasks deliberately
+use `restart: "no"`. Host reboot recovery requires Docker Engine itself to start
+at boot; see [runtime architecture](docs/architecture.md#container-restart-behavior).
+
 Superset, Superset MCP, and Grist are disabled by default. The Grist guide is
 historical prototype documentation; the optional Superset profile is read-only.
 

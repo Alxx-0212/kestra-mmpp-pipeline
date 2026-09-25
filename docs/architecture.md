@@ -28,6 +28,20 @@ Superset MCP, and Grist are disabled by the `optional-dashboard` Compose profile
 until explicitly enabled. The Grist setup guide is historical prototype
 documentation only and is not an active refresh path.
 
+## Container restart behavior
+
+Persistent services (`postgres`, `kestra`, Telegram bot, ngrok, and the optional
+Redis/Superset/Superset MCP/Grist services) use `restart: unless-stopped`.
+Compose one-shot initialization, provisioning, flow-deployment, and webhook
+registration jobs use `restart: "no"`; they run through `depends_on` when the
+stack is brought up and should not loop after completion.
+
+The policy restarts a container after its process exits and brings it back when
+the Docker daemon starts after a host reboot, unless an operator explicitly
+stopped it. It does not restart a process that remains alive but only fails its
+healthcheck. Host reboot recovery also requires Docker Engine to be enabled at
+boot (for systemd Linux hosts, verify with `systemctl is-enabled docker`).
+
 ## Boundaries
 
 - Keep calculations, schemas, migrations, queries, and operating docs in the owning project.

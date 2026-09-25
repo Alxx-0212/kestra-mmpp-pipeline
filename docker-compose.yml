@@ -13,6 +13,7 @@ services:
   # - grist:       Grist metadata database
   postgres:
     image: postgres:18.4
+    restart: unless-stopped
     networks:
       - mmpp-finance-network
     volumes:
@@ -121,6 +122,7 @@ services:
     # Disabled by default; enable with --profile optional-dashboard.
     profiles: ["optional-dashboard"]
     image: redis:7-alpine
+    restart: unless-stopped
     networks:
       - mmpp-finance-network
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
@@ -134,6 +136,7 @@ services:
 
   kestra:
     image: kestra/kestra:v1.3.26
+    restart: unless-stopped
     networks:
       - mmpp-finance-network
     stop_grace_period: 6m
@@ -250,6 +253,7 @@ services:
       context: .
       dockerfile: services/superset/Dockerfile
     image: mmpp-superset:6.1.0-postgres-mcp
+    restart: unless-stopped
     networks:
       - mmpp-finance-network
     volumes:
@@ -341,6 +345,7 @@ services:
     profiles: ["optional-dashboard"]
     # Enable with: docker compose --profile optional-dashboard up -d superset-mcp
     image: mmpp-superset:6.1.0-postgres-mcp
+    restart: unless-stopped
     networks:
       - mmpp-finance-network
     volumes:
@@ -387,6 +392,7 @@ services:
     profiles: ["optional-dashboard"]
     # Enable with: docker compose --profile optional-dashboard up -d grist
     image: gristlabs/grist:1.7.17
+    restart: unless-stopped
     networks:
       - mmpp-finance-network
     volumes:
