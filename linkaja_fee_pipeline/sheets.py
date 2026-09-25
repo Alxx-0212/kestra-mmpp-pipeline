@@ -1,16 +1,17 @@
-"""Inactive LinkAja Google Sheets compatibility helpers.
-
-No production LinkAja Kestra workflow imports or calls this module. It remains
-temporarily available for external callers and historical renderer tests.
-"""
+"""Google Sheets renderers for daily and monthly LinkAja reporting."""
 
 from __future__ import annotations
 
 import os
 import re
+import requests
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from typing import Any
+
+from google.auth.transport.requests import AuthorizedSession
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .database import (
     DETAIL_HEADERS,
@@ -25,6 +26,7 @@ from .database import (
     MEASURE_SOURCE_FEE_HEADER,
     MEASURE_SOURCE_FEE_MISSING_COUNT_HEADER,
     MEASURE_UNRESOLVED_COUNT_HEADER,
+    UNRESOLVED_REVERSAL_HEADERS,
 )
 from .processing import (
     CLUSTER_ID_HEADER,
@@ -191,7 +193,44 @@ def make_gspread_client(sa_key_path: str):
         "https://www.googleapis.com/auth/drive",
     ]
     credentials = Credentials.from_service_account_file(sa_key_path, scopes=scopes)
-    return gspread.authorize(credentials)
+    timeout = (
+        float(os.environ.get("LINKAJA_GOOGLE_CONNECT_TIMEOUT", "10")),
+        float(os.environ.get("LINKAJA_GOOGLE_READ_TIMEOUT", "45")),
+    )
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"}),
+        raise_on_status=False,
+    )
+    session = AuthorizedSession(credentials)
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    original_request = session.request
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return original_request(method, url, **kwargs)
+
+    session.request = request_with_timeout
+    discovery_url = "https://sheets.googleapis.com/$discovery/rest?version=v4"
+    try:
+        response = requests.get(discovery_url, timeout=timeout)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "LinkAja Google API preflight failed; check outbound HTTPS access "
+            f"to {discovery_url}: {exc}"
+        ) from exc
+    client = gspread.Client(auth=credentials, session=session)
+    client.auth = credentials
+    client.http_client.set_timeout(timeout)
+    return client
 
 
 def uppercase_sheet_value(value: Any) -> Any:
@@ -921,6 +960,179 @@ def process_linkaja_detail_sheet_upload(
         "replaced_rows": replaced_rows,
         "rows": len(rows),
         "report_dates": sorted(set(report_dates), key=date_sort_key),
+    }
+
+
+def write_linkaja_monthly_to_gsheet(
+    gspread_client,
+    target_spreadsheet: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Render one LinkAja monthly preview/publication in a stable worksheet."""
+    cluster_id = str(result.get("cluster_id", "")).strip()
+    report_month = str(result.get("report_month", "")).strip()[:7]
+    if not cluster_id or not report_month:
+        raise ValueError("Monthly Google Sheet output needs cluster_id and report_month")
+
+    spreadsheet = _open_or_create_spreadsheet(gspread_client, target_spreadsheet)
+    worksheet_title = f"LINKAJA MONTHLY {cluster_id} {report_month}"
+    try:
+        worksheet = spreadsheet.worksheet(worksheet_title)
+    except Exception:
+        worksheet = spreadsheet.add_worksheet(title=worksheet_title, rows=500, cols=17)
+
+    unresolved_rows = result.get("unresolved_reversal_rows", [])
+    fee_rows = result.get("fee_rows", [])
+    unresolved_count = int(result.get("unresolved_reversal_count", 0))
+    incomplete_fee_count = int(result.get("incomplete_fee_rows", 0))
+    if not result.get("published"):
+        publication_status = "PREVIEW - NOT FINAL"
+    elif unresolved_count or incomplete_fee_count:
+        publication_status = "PUBLISHED WITH EXCEPTIONS - REVIEW REQUIRED"
+    else:
+        publication_status = "PUBLISHED"
+
+    fee_headers = [
+        "FEE CATEGORY", "GROSS TRANSACTION COUNT", "REVERSED TRANSACTION COUNT",
+        "ACTIVE TRANSACTION COUNT", "GROSS FEE", "REVERSED FEE", "NET FEE",
+        "MONTHLY PAYABLE FEE", "GROSS MISSING FEE COUNT",
+        "REVERSED MISSING FEE COUNT", "ACTIVE MISSING FEE COUNT",
+        "CALCULATION STATUS",
+    ]
+    values = [
+        [f"LINKAJA MONTHLY SETTLEMENT - {cluster_id} - {report_month}"],
+        ["STATUS", publication_status, "BUSINESS CUTOFF", result.get("calculation_cutoff", ""),
+         "PUBLISHED", str(bool(result.get("published")))],
+        ["TRANSACTION FACTS", result.get("transaction_rows", 0),
+         "UNRESOLVED REVERSALS", unresolved_count,
+         "INCOMPLETE FEE CATEGORIES", incomplete_fee_count],
+        [],
+        ["MONTHLY FEE SUMMARY"],
+        fee_headers,
+    ]
+    values.extend([[row.get(header, "") for header in fee_headers] for row in fee_rows])
+    exception_title_row = len(values) + 2
+    values.extend([
+        [],
+        ["UNRESOLVED REVERSALS"],
+        UNRESOLVED_REVERSAL_HEADERS,
+    ])
+    if unresolved_rows:
+        values.extend([
+            [row.get(header, "") for header in UNRESOLVED_REVERSAL_HEADERS]
+            for row in unresolved_rows
+        ])
+    else:
+        values.append(["NONE"] + [""] * (len(UNRESOLVED_REVERSAL_HEADERS) - 1))
+
+    width = max(len(row) for row in values)
+    values = [row + [""] * (width - len(row)) for row in values]
+    unprotect_requests = _delete_all_protected_range_requests(spreadsheet, worksheet)
+    if unprotect_requests:
+        spreadsheet.batch_update({"requests": unprotect_requests})
+    _unmerge_all_cells(spreadsheet, worksheet)
+    worksheet.clear()
+    _ensure_grid_capacity(spreadsheet, worksheet, len(values), width)
+    worksheet.update(
+        values=uppercase_sheet_rows(values),
+        range_name=sheet_range(1, len(values), 1, width),
+        value_input_option="USER_ENTERED",
+    )
+
+    navy = {"red": 0.122, "green": 0.306, "blue": 0.471}
+    fee_header = {"red": 0.765, "green": 0.890, "blue": 0.741}
+    fee_body = {"red": 0.925, "green": 0.973, "blue": 0.910}
+    exception_header = {"red": 0.925, "green": 0.690, "blue": 0.690}
+    exception_body = {"red": 0.992, "green": 0.925, "blue": 0.925}
+    requests = [
+        {
+            "updateSheetProperties": {
+                "properties": {"sheetId": worksheet.id,
+                               "gridProperties": {"frozenRowCount": 6}},
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        {
+            "mergeCells": {
+                "range": _grid_range(worksheet, 1, 1, 1, width),
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(worksheet, 1, 1, 1, width),
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": navy,
+                    "textFormat": {"bold": True, "foregroundColor": WHITE_COLOR, "fontSize": 12},
+                    "horizontalAlignment": "CENTER",
+                }},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(worksheet, 6, 6, 1, len(fee_headers)),
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": fee_header,
+                    "textFormat": {"bold": True},
+                    "horizontalAlignment": "CENTER",
+                    "wrapStrategy": "WRAP",
+                }},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,wrapStrategy)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(worksheet, 7, max(6 + len(fee_rows), 7), 1, len(fee_headers)),
+                "cell": {"userEnteredFormat": {"backgroundColor": fee_body}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(worksheet, exception_title_row, exception_title_row + 1,
+                                     1, len(UNRESOLVED_REVERSAL_HEADERS)),
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": exception_header,
+                    "textFormat": {"bold": True},
+                    "horizontalAlignment": "CENTER",
+                    "wrapStrategy": "WRAP",
+                }},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,wrapStrategy)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": _grid_range(worksheet, exception_title_row + 2, len(values),
+                                     1, len(UNRESOLVED_REVERSAL_HEADERS)),
+                "cell": {"userEnteredFormat": {"backgroundColor": exception_body}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        },
+        {
+            "updateBorders": {
+                "range": _grid_range(worksheet, 1, len(values), 1, width),
+                "top": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
+                "bottom": {"style": "SOLID", "color": BORDER_COLOR},
+                "left": {"style": "SOLID", "color": BORDER_COLOR},
+                "right": {"style": "SOLID", "color": BORDER_COLOR},
+                "innerHorizontal": {"style": "SOLID", "color": BORDER_COLOR},
+                "innerVertical": {"style": "SOLID", "color": BORDER_COLOR},
+            }
+        },
+        _add_protected_sheet_request(gspread_client, worksheet,
+                                     "LinkAja monthly settlement output"),
+    ]
+    for index, width_px in enumerate([220, 150, 155, 145, 130, 130, 130, 155, 150, 155, 150, 220]):
+        requests.append(_column_width_request(worksheet, index, index + 1, width_px))
+    spreadsheet.batch_update({"requests": requests})
+    return {
+        "status": "success",
+        "spreadsheet": target_spreadsheet,
+        "worksheet": worksheet_title,
+        "publication_status": publication_status,
+        "fee_rows": len(fee_rows),
+        "unresolved_rows": len(unresolved_rows),
     }
 
 
@@ -1717,6 +1929,8 @@ def _protection_editor_emails(gspread_client) -> list[str]:
 
 def _service_account_email(gspread_client) -> str | None:
     auth = getattr(gspread_client, "auth", None)
+    if auth is None:
+        auth = getattr(getattr(gspread_client, "http_client", None), "auth", None)
     return (
         getattr(auth, "service_account_email", None)
         or getattr(auth, "signer_email", None)

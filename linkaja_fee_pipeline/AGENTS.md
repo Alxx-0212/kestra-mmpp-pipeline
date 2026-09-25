@@ -21,9 +21,19 @@ persistence, and the published monthly snapshot remain the production path.
 - Aggregate by `cluster_id + transaction_id`; never sum `Balance` or both sides of an internal transfer.
 - Resolve reversals only through exact `Original Transaction ID` in the same cluster and retain finalized reversal timestamps.
 - Daily loads replace affected transaction IDs; monthly publication replaces one `cluster_id + report_month` snapshot.
+- Daily load-generation currentness is scoped to exact logical source identity
+  (`cluster_id + source_file + source date range`), never merely overlapping
+  observed date envelopes. `linkaja_raw_transactions` is the current fact state;
+  `linkaja_ledger_versions` is append-only evidence and is not rewritten to
+  simulate a current-version flag. Historical versions remain retained for
+  audit/backfill analysis.
 - Keep Digipos eligibility, PPOB fees, missing-fee nulls, and `signed_amount` definitions from the README unchanged.
 - Keep unresolved reversals as unusual data; never infer them from amount/date/outlet.
 - Never edit an applied migration. Add the next migration and document rollback.
+- Before a historical backfill, preserve all source loads and process source
+  generations chronologically. A replacement file may update current facts for
+  transaction IDs it contains; absent rows are not inferred deleted without an
+  explicit complete-period replacement contract.
 
 Use [shared validation](../docs/validation.md), [security](../docs/security.md), and [lane rules](../docs/agent-lanes.md) for repository-wide procedures.
 
@@ -100,7 +110,9 @@ Inputs:
 | Input | Type | Required | Default | Meaning |
 |---|---|---:|---|---|
 | `source_file` | FILE | yes | - | One LinkAja CSV export for one cluster. |
+| `source_filename` | STRING | no | empty | Original basename when Kestra stores the upload as a temporary `.upl` path. |
 | `dry_run` | BOOLEAN | no | `false` | Validate and normalize without PostgreSQL persistence. |
+| `write_gsheet` | BOOLEAN | no | `true` | After PostgreSQL succeeds, update the shared `LinkAja` summary and cluster detail worksheet. |
 
 Filename contract:
 
@@ -115,9 +127,55 @@ curl --fail-with-body --silent --show-error \
   --user "$KESTRA_USER:$KESTRA_PASSWORD" \
   -X POST \
   -F "files=@/absolute/path/laporan-411311-july.csv;filename=source_file" \
+  -F "source_filename=laporan-411311-july.csv" \
   -F "dry_run=false" \
+  -F "write_gsheet=true" \
   "$KESTRA_URL/api/v1/$KESTRA_TENANT/executions/finance.linkaja/linkaja_fee_pipeline_v1"
 ```
+
+### Production daily backfill gate
+
+Before a LinkAja backfill, verify a database backup and current source-load/raw
+counts. Run a dry-run canary, then one database+Sheet canary. Process CSVs in
+ascending source/report date, one Kestra execution at a time; stop on any state
+other than `SUCCESS`. After backfill, reconcile each cluster's file/row/date
+coverage against the input inventory and verify append-only ledger versions.
+
+Create and verify a backup before production migration/backfill (use approved
+secret handling, not inline credentials):
+
+```bash
+pg_dump --format=custom --file="$BACKUP_FILE" "$PROD_DATABASE_URL"
+pg_restore --list "$BACKUP_FILE" >/dev/null
+```
+
+Check `USAGE`/`CREATE` on the target schema and required DML privileges for
+`linkaja_raw_transactions`, `linkaja_source_loads`, and
+`linkaja_ledger_versions` using the production pipeline role. Do not substitute
+a DBA account for this check.
+
+Use the target pipeline role for a read-only privilege preflight before
+production:
+
+```sql
+SELECT current_user,
+       has_schema_privilege(current_user, 'public', 'USAGE') AS public_usage,
+       has_schema_privilege(current_user, 'public', 'CREATE') AS public_create;
+
+SELECT has_table_privilege(current_user, 'linkaja_raw_transactions', 'SELECT,INSERT,UPDATE,DELETE'),
+       has_table_privilege(current_user, 'linkaja_source_loads', 'SELECT,INSERT,UPDATE,DELETE'),
+       has_table_privilege(current_user, 'linkaja_ledger_versions', 'SELECT,INSERT,UPDATE,DELETE');
+```
+
+Source-load supersession is scoped to exact logical file identity
+(`cluster_id`, basename, and source date range). A merely overlapping date range
+must not make the rest of a prior file disappear from current evidence.
+Ledger-version currentness is independently scoped to staged transaction IDs;
+prior versions remain available for audit.
+
+The daily backfill does not finalize monthly fees or waive unresolved reversals.
+Keep monthly `publish=false` until source coverage, close cutoffs, and Finance
+waiver approval have been reviewed.
 
 The daily flow validates the CSV, writes normalized artifacts, applies pending
 schema migrations, replaces affected current transaction IDs, refreshes daily
@@ -141,6 +199,7 @@ Current inputs:
 | `report_month` | STRING | yes | - | `YYYY-MM` or `YYYY-MM-01`. |
 | `calculation_cutoff` | STRING | yes | - | Exclusive local Asia/Makassar cutoff, on or after the next month. |
 | `publish` | BOOLEAN | no | `false` | Preview when false; replace one cluster-month snapshot when true. |
+| `write_gsheet` | BOOLEAN | no | `true` | Write/update the month-and-cluster worksheet after calculation. |
 
 Preview a month:
 
@@ -152,6 +211,7 @@ curl --fail-with-body --silent --show-error \
   -F "report_month=2026-07" \
   -F "calculation_cutoff=2026-08-10T00:00:00" \
   -F "publish=false" \
+  -F "write_gsheet=true" \
   "$KESTRA_URL/api/v1/$KESTRA_TENANT/executions/finance.linkaja/linkaja_monthly_materialization_v1"
 ```
 
@@ -180,4 +240,6 @@ curl --fail-with-body --silent --show-error \
 The current monthly flow publishes database analysis artifacts only. The
 hardened plan adds explicit evidence cutoffs, source expectations, unresolved
 waivers, frozen reversal edges, and a `FINAL_WITH_WAIVERS` state before this
-flow is treated as an authoritative Odoo settlement.
+flow is treated as an authoritative Odoo settlement. Monthly Google sheets are
+explicitly marked `PREVIEW - NOT FINAL` when `publish=false`; unresolved rows and
+fee completeness counts remain visible in the worksheet.

@@ -7,6 +7,8 @@ the same public function names.
 from .loading import load_file, load_and_validate_schema
 from .integrity import validate_debit_credit_integrity
 from .database import (
+    ensure_finpay_daily_source_evidence,
+    ensure_finpay_monthly_model,
     ensure_finpay_transaction_model,
     finpay_db_schema_definition,
     finpay_source_sha256,
@@ -59,6 +61,8 @@ __all__ = [
     "deduplicate_rows_by_minute_with_report",
     "drop_duplicate_rows_by_minute",
     "ensure_finpay_transaction_model",
+    "ensure_finpay_daily_source_evidence",
+    "ensure_finpay_monthly_model",
     "extract_disbursement_date_from_remarks",
     "finpay_db_schema_definition",
     "finpay_source_sha256",

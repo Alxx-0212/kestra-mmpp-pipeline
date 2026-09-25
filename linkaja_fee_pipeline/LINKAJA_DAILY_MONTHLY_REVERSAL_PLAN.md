@@ -378,3 +378,29 @@ Rollback disables hardened final publication while keeping daily ingestion and
 live views operational. Versioned evidence remains audit data. Partially
 published months are marked `SUPERSEDED` or `RESTATEMENT_REQUIRED`, not deleted
 silently.
+
+## 11. 2026-09-24 Simulation Result
+
+The local simulation replayed the LinkAja July source bundle, the latest
+LinkAja snapshots through 2026-09-20, then rewrote the August daily summary and
+detail sheets from the newest date-range generations.
+
+```text
+July source files processed: 43 (database only)
+Latest LinkAja source ranges processed: 204 across six clusters
+August-overlapping daily Sheet range writes: 120 SUCCESS
+August monthly snapshots: 6
+Monthly Google status: COMPLETE for all six clusters
+August unresolved reversal targets in close windows: 878
+```
+
+The monthly sheets are named `LINKAJA MONTHLY <cluster> 2026-08` and marked
+`PUBLISHED WITH EXCEPTIONS - REVIEW REQUIRED`. No unresolved reversal waivers
+were entered, so these results are simulation publications for review, not an
+Odoo-final close.
+
+The shared spreadsheet target was `Salinan dari Monitoring Finpay & LinkAja`.
+The daily summary uses the existing `LinkAja` tab and cluster-specific detail
+tabs. Google-only tasks ran on host networking because the host could reach
+Google APIs while the database bridge network timed out. PostgreSQL work stayed
+on `mmpp-finance-network`.

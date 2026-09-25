@@ -32,6 +32,12 @@ inputs:
     description: "Disable only for isolated database replay when Google OAuth is unavailable."
     defaults: true
 
+  - id: send_telegram
+    type: BOOLEAN
+    displayName: "Send unusual Telegram alert?"
+    description: "Disable only for a Google/database simulation that should not notify production chats."
+    defaults: true
+
 tasks:
   # ── PERFORMANCE NOTE ─────────────────────────────────────────────────────────
   # parse_and_resolve (task 1) and load_and_validate (task 2) are fully independent
@@ -253,11 +259,11 @@ tasks:
     script: |
       import os, sys, pandas as pd
       sys.path.insert(0, "/app")
-       from pipeline import (
-           finpay_source_sha256,
-           postgres_dsn_from_env,
-           write_finpay_dataframe_to_postgres,
-       )
+      from finpay_pipeline import (
+          finpay_source_sha256,
+          postgres_dsn_from_env,
+          write_finpay_dataframe_to_postgres,
+      )
       from kestra import Kestra
 
       df = pd.read_parquet("integrity_checked.parquet")
@@ -423,6 +429,9 @@ tasks:
         type: io.kestra.plugin.scripts.python.Script
         runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
         containerImage: finpay-pipeline:3.11
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: host
         pythonVersion: "3.11"
         timeout: PT10M
         retry:
@@ -484,7 +493,7 @@ tasks:
       # ── TASK 9 ─ Alert Telegram only when unusual rows exist ────────────────
       - id: notify_unusual_telegram
         type: io.kestra.plugin.core.http.Request
-        runIf: "{{ inputs.dry_run == false and inputs.write_gsheet and outputs.flag_unusual_transactions.vars.unusual_rows > 0 }}"
+        runIf: "{{ inputs.dry_run == false and inputs.write_gsheet and inputs.send_telegram and outputs.flag_unusual_transactions.vars.unusual_rows > 0 }}"
         uri: "https://api.telegram.org/bot{{ secret('TELEGRAM_BOT_TOKEN') }}/sendMessage"
         method: POST
         contentType: multipart/form-data
@@ -566,7 +575,7 @@ tasks:
                     script: |
                       import os, sys, pandas as pd
                       sys.path.insert(0, "/app")
-                      from pipeline import (
+                      from finpay_pipeline import (
                           prepare_reversal_summary_transactions,
                           prepare_transaction_detail_export,
                       )
@@ -655,6 +664,9 @@ tasks:
                     type: io.kestra.plugin.scripts.python.Script
                     runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
                     containerImage: finpay-pipeline:3.11
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: host
                     pythonVersion: "3.11"
                     timeout: PT10M
                     retry:
@@ -806,6 +818,9 @@ tasks:
                     type: io.kestra.plugin.scripts.python.Script
                     runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
                     containerImage: finpay-pipeline:3.11
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: host
                     pythonVersion: "3.11"
                     timeout: PT10M
                     retry:
@@ -1027,6 +1042,9 @@ tasks:
                     type: io.kestra.plugin.scripts.python.Script
                     runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
                     containerImage: finpay-pipeline:3.11
+                    taskRunner:
+                      type: io.kestra.plugin.scripts.runner.docker.Docker
+                      networkMode: host
                     pythonVersion: "3.11"
                     timeout: PT10M
                     retry:

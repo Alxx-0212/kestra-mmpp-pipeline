@@ -31,7 +31,7 @@ handoff and let the integrating agent coordinate the FinPay-side formula change.
 
 ## Public contracts
 
-- Preserve flow ID and namespace, inputs, task IDs, task imports, image name,
+- Preserve flow ID and namespace, inputs, task IDs, package imports, image name,
   secret names, output names, Parquet filenames, and dry-run side effects in
   `finpay_pipeline.yml` unless the change is handled as a workflow migration.
 - Preserve exports in `finpay_pipeline/__init__.py`, `pipeline.py`, and
@@ -42,8 +42,10 @@ handoff and let the integrating agent coordinate the FinPay-side formula change.
 
 ## Required invariants
 
-- Keep the `from pipeline import ...` Kestra contract stable unless every task
-  import and `finpay_pipeline/__init__.py` are updated together.
+- Keep Kestra imports on the `finpay_pipeline` public package API. The runtime
+  image copies the package directory and does not provide root-level
+  `pipeline.py` compatibility facades; update task imports and
+  `finpay_pipeline/__init__.py` exports together.
 - Preserve rerun idempotency for `cluster_id + report_date` in PostgreSQL and
   Google Sheets.
 - Keep `dry_run=true` free of PostgreSQL, Google Sheets, and notification side
@@ -77,6 +79,13 @@ handoff and let the integrating agent coordinate the FinPay-side formula change.
 - Keep `finpay_source_loads` and `finpay_ledger_events` append-only across daily
   reruns. A corrected upload supersedes a source generation; it must not delete
   the prior generation.
+- Daily raw persistence applies only `migrations/001_finpay_daily_source_evidence.sql`.
+  Do not add monthly snapshots, preview tables, expectations, or reversal views
+  to the daily initializer. Monthly workflow initialization applies the daily
+  evidence DDL plus `migrations/002_finpay_monthly_model.sql`.
+- Keep `001_finpay_transaction_model_legacy_compat.sql` unchanged as a
+  compatibility/rollback initializer. New daily workflow code must use the
+  daily-only helper; monthly code must use the monthly-model helper.
 - Monthly FinPay publication must use an explicit exclusive Asia/Makassar
   cutoff, guarded exact-ID reversal resolution, source fingerprint, and release
   gate. Preview must not mutate frozen monthly snapshots; final publication must
@@ -151,7 +160,8 @@ Inputs:
 | `csv_file` | FILE | yes | - | FinPay CSV/XLSX upload. |
 | `dry_run` | BOOLEAN | no | `false` | Validate/classify without normal PostgreSQL, Sheets, or notification side effects. |
 | `source_filename` | STRING | no | empty | Original basename when Kestra stores the FILE under a temporary `.upl` path. |
-| `write_gsheet` | BOOLEAN | no | `true` | Enable/disable Google Sheets and unusual Telegram side effects while retaining DB persistence. |
+| `write_gsheet` | BOOLEAN | no | `true` | Enable/disable Google Sheets side effects while retaining DB persistence. |
+| `send_telegram` | BOOLEAN | no | `true` | Disable Telegram alerts for isolated simulations while retaining Sheet writes. |
 
 Filename contract:
 
@@ -174,6 +184,54 @@ curl --fail-with-body --silent --show-error \
 
 Use `write_gsheet=false` only for an isolated database replay. Submit the next
 chronological file after the previous execution reaches `SUCCESS`.
+
+### Production daily backfill gate
+
+Before a production historical backfill:
+
+1. Apply/verify only the daily evidence schema. Do not run the monthly flow or
+   mark a month Odoo-final as part of daily backfill.
+2. Take a verified PostgreSQL backup and record current row/load counts.
+3. Run a dry-run canary, then one database + Sheet canary for one cluster/date.
+4. Confirm the canary source load, raw row count, daily summary, unusual count,
+   Sheet update, and rerun behavior.
+5. Process files in ascending report date, one execution at a time. Stop on the
+   first non-`SUCCESS` state; do not submit later files over a failed date.
+6. Compare source file/row/date coverage with the backfill inventory and verify
+   all generations remain retained, including superseded generations.
+
+Before enabling the pipeline DB role in production, run a read-only privilege
+preflight using that role against the target database:
+
+```sql
+SELECT current_user,
+       has_schema_privilege(current_user, 'public', 'USAGE') AS public_usage,
+       has_schema_privilege(current_user, 'public', 'CREATE') AS public_create;
+
+SELECT has_table_privilege(current_user, 'finpay_raw_transactions', 'SELECT,INSERT,UPDATE,DELETE'),
+       has_table_privilege(current_user, 'finpay_source_loads', 'SELECT,INSERT,UPDATE,DELETE'),
+       has_table_privilege(current_user, 'finpay_ledger_events', 'SELECT,INSERT,UPDATE,DELETE');
+```
+
+The first daily canary must apply only daily evidence DDL; it must not create or
+change monthly snapshot/publication relations. Keep the production monthly flow
+disabled for this daily backfill rollout.
+
+Backup verification example (use the approved production connection secret or
+`PGSERVICE`, never place credentials in the command text):
+
+```bash
+pg_dump --format=custom --file="$BACKUP_FILE" "$PROD_DATABASE_URL"
+pg_restore --list "$BACKUP_FILE" >/dev/null
+```
+
+After migration, verify the deployed role can use/create in the target schema
+and can select/insert/update/delete the daily raw and source-evidence relations.
+Run these checks using the production pipeline role, not a DBA/superuser role.
+
+The daily schema supports evidence collection and daily reporting. Reversal
+resolution in the monthly model is not authorization to settle Odoo; keep monthly
+publication disabled until Finance approves its close gates and waiver policy.
 
 ### Monthly flow
 

@@ -43,12 +43,25 @@ the production workflow until dbt output parity is established.
 
 ### Inputs and side effects
 
-The daily workflow accepts one CSV export for one cluster.
+The daily workflow accepts one CSV export for one cluster. After PostgreSQL
+persistence, it writes the current daily fee summary and per-cluster ledger
+detail to the shared monitoring spreadsheet.
+
+Daily evidence is retained independently of the compatibility current-state
+table. `linkaja_source_loads` tracks exact file generations, while
+`linkaja_ledger_versions` is append-only source-row history. The compatibility
+`linkaja_raw_transactions` table remains the current fact state. Reprocessing a
+file with the same logical filename and date range supersedes that manifest
+generation. A merely overlapping date range does not deactivate another file
+generation. Historical ledger versions remain available for backfills and
+monthly reversal analysis.
 
 | Input | Meaning |
 |---|---|
 | `source_file` | Required LinkAja CSV. The filename normally identifies the cluster, for example `laporan-411311-...csv`. |
+| `source_filename` | Optional original basename for API uploads where Kestra stores the FILE under a temporary `.upl` handle. |
 | `dry_run` | `true` validates and normalizes only. It does not run migrations or write PostgreSQL rows. |
+| `write_gsheet` | Defaults to `true`. When `false`, PostgreSQL persists normally but Google Sheets writes are skipped. |
 
 For `dry_run=false`, the workflow does the following in order:
 
@@ -61,20 +74,17 @@ source CSV
    -> replace affected raw transaction IDs atomically
    -> calculate live daily views and daily summary rows
 -> linkaja_database_result.json
+-> write_linkaja_daily_sheets (when enabled)
+   -> shared `LinkAja` fee summary
+   -> per-cluster `- LinkAja Detail` sheet
+   -> linkaja_google_write_result.json
 ```
 
-The database task uses exponential retries. A dry run performs no database
-write. The production workflow has no Google Sheets task or GCP credentials;
-PostgreSQL and Kestra artifacts are the reporting boundary for dashboard and
-API consumers.
-
-`sheets.py` remains temporarily as an inactive, direct-import compatibility
-module for historical renderer tests and any external migration work. It is no
-longer exported by `linkaja_pipeline`, and the LinkAja runtime image no longer
-installs Google client libraries. Neither production LinkAja workflow can call
-that module through its supported public API. Delete the compatibility file
-only as a separate cleanup after confirming that no external scripts import it
-directly.
+Google writes use the existing Kestra `GCP_SA_KEY` secret and target
+`Salinan dari Monitoring Finpay & LinkAja`. Sheet tasks execute after database
+commit; a Google failure therefore leaves the database current but the sheet
+stale until the same file is retried. The writer is idempotent by report date
+and cluster and updates the existing monitoring layout.
 
 ### CSV validation and normalization
 
@@ -404,8 +414,11 @@ remain on their actual posting dates and are labeled `Complete Reversal -
 <original scenario>` only when `Original Transaction ID` resolves in the same
 cluster before the cutoff. An unresolved reversal is labeled separately and is
 also written at transaction detail grain to the unresolved CSV. The calculation
-does not look up a later withdrawal, build a MANDIRI or Cash section, or read or
-write Google Sheets.
+does not look up a later withdrawal or build a MANDIRI or Cash settlement. The
+monthly workflow renders its cutoff-bound fee and unresolved-reversal result to
+a dedicated `LINKAJA MONTHLY <cluster> <month>` worksheet using the protected
+monitoring palette. Preview worksheets are marked `PREVIEW - NOT FINAL` and
+retain unresolved reversal evidence.
 
 ### Monthly fee release calculation
 
@@ -484,7 +497,11 @@ the Kestra output artifact.
    materialization ID.
 3. Insert or update the corresponding `linkaja_monthly_refreshes` audit row.
 
-The flow does not read or write Google Sheets. After publication, run
+After PostgreSQL calculation, the monthly task optionally writes summary and
+exception output to the shared spreadsheet. With `publish=false` this is a
+preview worksheet and no monthly snapshot is changed. With `publish=true`,
+PostgreSQL commits before Google rendering; inspect the Kestra task state if the
+sheet write fails. After publication, run
 `queries/linkaja_monthly_fee_summary.sql` in pgAdmin or another PostgreSQL
 client. Update only the report month and optional cluster; the report reads each
 publication's recorded cutoff. Its fee result comes from

@@ -26,6 +26,12 @@ inputs:
     description: "false previews the month. true atomically replaces this cluster-month in linkaja_transactions."
     defaults: false
 
+  - id: write_gsheet
+    type: BOOLEAN
+    displayName: "Write monthly Google Sheet?"
+    description: "Render the monthly preview/publication to the shared monitoring spreadsheet."
+    defaults: true
+
 tasks:
   - id: calculate_and_optionally_publish_month
     type: io.kestra.plugin.scripts.python.Script
@@ -55,7 +61,9 @@ tasks:
       CALCULATION_CUTOFF: "{{ inputs.calculation_cutoff }}"
       MATERIALIZATION_ID: "{{ execution.id }}"
       PUBLISH: "{{ inputs.publish }}"
+      WRITE_GSHEET: "{{ inputs.write_gsheet }}"
     script: |
+      import json
       import os
       import sys
       from kestra import Kestra
@@ -65,6 +73,7 @@ tasks:
           linkaja_postgres_dsn_from_env,
           materialize_linkaja_month,
           migrate_linkaja_database,
+          update_linkaja_monthly_google_status,
           write_linkaja_monthly_artifacts,
       )
 
@@ -92,6 +101,10 @@ tasks:
           daily_path="linkaja_daily_raw_calculation.csv",
           unresolved_path="linkaja_unresolved_reversals.csv",
       )
+      if result["published"] and os.environ.get("WRITE_GSHEET", "true").lower() != "true":
+          update_linkaja_monthly_google_status(
+              dsn, result["materialization_id"], "SKIPPED"
+          )
       action = "published" if result["published"] else "previewed"
       print(f"✅ Current schema version : {migration['current_version']}")
       print(f"✅ Month {action}         : {result['report_month']}")
@@ -125,3 +138,102 @@ tasks:
               result["monthly_payable_complete"],
           "fee_rows": len(result["fee_rows"]),
       })
+
+  - id: write_linkaja_monthly_google_sheet
+    type: io.kestra.plugin.scripts.python.Script
+    runIf: "{{ inputs.write_gsheet }}"
+    containerImage: linkaja-fee-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    pythonVersion: "3.11"
+    timeout: PT15M
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT60S
+      maxAttempts: 3
+    inputFiles:
+      linkaja_monthly_result.json: "{{ outputs.calculate_and_optionally_publish_month.outputFiles['linkaja_monthly_result.json'] }}"
+    outputFiles:
+      - linkaja_google_write_result.json
+    env:
+      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+      TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
+    script: |
+      import json
+      import os
+      import sys
+      import tempfile
+      from kestra import Kestra
+
+      sys.path.insert(0, "/app")
+      from linkaja_fee_pipeline.sheets import make_gspread_client, write_linkaja_monthly_to_gsheet
+
+      with open("linkaja_monthly_result.json", encoding="utf-8") as handle:
+          result = json.load(handle)
+      write_result = {"status": "FAILED", "materialization_id": result.get("materialization_id")}
+      key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+      if not key_json or key_json.strip() == "{}":
+          write_result["error"] = "GCP_SA_KEY is empty or not configured in Kestra"
+      else:
+          credential_path = None
+          try:
+              with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+                  handle.write(key_json)
+                  credential_path = handle.name
+              client = make_gspread_client(credential_path)
+              sheet_result = write_linkaja_monthly_to_gsheet(
+                  client,
+                  os.environ["TARGET_SPREADSHEET"],
+                  result,
+              )
+              write_result.update({**sheet_result, "status": "COMPLETE"})
+          except Exception as exc:
+              write_result["error"] = str(exc)[:2000]
+          finally:
+              if credential_path and os.path.exists(credential_path):
+                  os.unlink(credential_path)
+      with open("linkaja_google_write_result.json", "w", encoding="utf-8") as handle:
+          json.dump(write_result, handle, indent=2, default=str)
+      Kestra.outputs(write_result)
+
+  - id: record_linkaja_monthly_google_status
+    type: io.kestra.plugin.scripts.python.Script
+    runIf: "{{ inputs.write_gsheet and inputs.publish }}"
+    containerImage: linkaja-fee-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: mmpp-finance-network
+    pythonVersion: "3.11"
+    timeout: PT3M
+    inputFiles:
+      linkaja_google_write_result.json: "{{ outputs.write_linkaja_monthly_google_sheet.outputFiles['linkaja_google_write_result.json'] }}"
+      linkaja_monthly_result.json: "{{ outputs.calculate_and_optionally_publish_month.outputFiles['linkaja_monthly_result.json'] }}"
+    env:
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+    script: |
+      import json
+      import os
+      import sys
+      sys.path.insert(0, "/app")
+      from linkaja_fee_pipeline import linkaja_postgres_dsn_from_env, update_linkaja_monthly_google_status
+
+      with open("linkaja_google_write_result.json", encoding="utf-8") as handle:
+          write_result = json.load(handle)
+      with open("linkaja_monthly_result.json", encoding="utf-8") as handle:
+          monthly_result = json.load(handle)
+      status = write_result.get("status", "FAILED")
+      update_linkaja_monthly_google_status(
+          linkaja_postgres_dsn_from_env(),
+          monthly_result["materialization_id"],
+          status,
+          write_result.get("error"),
+      )
+      print(f"LinkAja Google publication status recorded: {status}")
+      if status != "COMPLETE":
+          raise RuntimeError(write_result.get("error", "Google Sheet write failed"))

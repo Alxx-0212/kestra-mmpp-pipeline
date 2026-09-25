@@ -1,6 +1,10 @@
   id: linkaja_fee_pipeline_v1
   namespace: finance.linkaja
 
+  concurrency:
+    limit: 1
+    behavior: QUEUE
+
   inputs:
     - id: source_file
       type: FILE
@@ -13,6 +17,18 @@
       displayName: "Dry run?"
       description: "true → validate only. false → apply pending LinkAja schema migrations, replace affected raw transaction IDs, and calculate database-backed daily results."
       defaults: false
+
+    - id: source_filename
+      type: STRING
+      displayName: "Original source filename"
+      description: "Optional original basename if Kestra stores the FILE as a temporary upload handle."
+      defaults: ""
+
+    - id: write_gsheet
+      type: BOOLEAN
+      displayName: "Write Google Sheets?"
+      description: "Write the shared daily LinkAja summary and per-cluster detail tabs after PostgreSQL succeeds."
+      defaults: true
 
   tasks:
     - id: validate_and_normalize_linkaja_csv
@@ -29,7 +45,7 @@
         - normalized_linkaja.csv
         - linkaja_manifest.json
       env:
-        ORIGINAL_FILE_PATH: "{{ inputs.source_file }}"
+        ORIGINAL_FILE_PATH: "{{ inputs.source_filename }}"
         LOAD_ID: "{{ execution.id }}"
         DRY_RUN: "{{ inputs.dry_run }}"
       script: |
@@ -45,7 +61,7 @@
             manifest = normalize_linkaja_csv(
                 "source_file",
                 "normalized_linkaja.csv",
-                filename_hint=os.path.basename(original_file_path),
+            filename_hint=os.path.basename(original_file_path) if original_file_path.strip() else None,
                 load_id=os.environ["LOAD_ID"],
             )
         except Exception as exc:
@@ -139,4 +155,85 @@
             "report_dates": result["report_dates"],
             "detail_rows": len(result["detail_rows"]),
             "ledger_measure_rows": len(result["detail_rows"]),
+        })
+
+    - id: write_linkaja_daily_sheets
+      type: io.kestra.plugin.scripts.python.Script
+      runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
+      containerImage: linkaja-fee-pipeline:3.11
+      taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+        networkMode: host
+      pythonVersion: "3.11"
+      timeout: PT10M
+      retry:
+        type: exponential
+        interval: PT10S
+        maxInterval: PT60S
+        maxAttempts: 3
+      inputFiles:
+        linkaja_database_result.json: "{{ outputs.persist_and_summarize_linkaja.outputFiles['linkaja_database_result.json'] }}"
+      outputFiles:
+        - linkaja_google_write_result.json
+      env:
+        SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+        TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
+      script: |
+        import json
+        import os
+        import sys
+        import tempfile
+        from kestra import Kestra
+
+        sys.path.insert(0, "/app")
+        from linkaja_fee_pipeline.sheets import (
+            make_gspread_client,
+            process_linkaja_detail_sheet_upload,
+            process_linkaja_fee_sheet_upload,
+        )
+
+        with open("linkaja_database_result.json", encoding="utf-8") as handle:
+            result = json.load(handle)
+        key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+        if not key_json or key_json.strip() == "{}":
+            raise ValueError("GCP_SA_KEY is empty or not configured in Kestra")
+
+        credential_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+                handle.write(key_json)
+                credential_path = handle.name
+            client = make_gspread_client(credential_path)
+            summary_result = process_linkaja_fee_sheet_upload(
+                target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+                target_worksheet="LinkAja",
+                rows=result.get("fee_rows", []),
+                gspread_client=client,
+            )
+            detail_result = process_linkaja_detail_sheet_upload(
+                target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
+                cluster_id=result["cluster_id"],
+                rows=result.get("detail_rows", []),
+                report_dates=result.get("report_dates", []),
+                gspread_client=client,
+            )
+        finally:
+            if credential_path and os.path.exists(credential_path):
+                os.unlink(credential_path)
+
+        write_result = {
+            "spreadsheet": os.environ["TARGET_SPREADSHEET"],
+            "summary": summary_result,
+            "detail": detail_result,
+        }
+        with open("linkaja_google_write_result.json", "w", encoding="utf-8") as handle:
+            json.dump(write_result, handle, indent=2, default=str)
+        print(f"✅ LinkAja summary worksheet: {summary_result['worksheet']}")
+        print(f"✅ LinkAja detail worksheet: {detail_result['worksheet']}")
+        Kestra.outputs({
+            "summary_worksheet": summary_result["worksheet"],
+            "detail_worksheet": detail_result["worksheet"],
+            "summary_rows": summary_result["rows"],
+            "detail_rows": detail_result["rows"],
+            "report_dates": detail_result["report_dates"],
         })

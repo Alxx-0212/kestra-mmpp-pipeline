@@ -90,9 +90,6 @@ tasks:
       APPROVED_BY: "{{ inputs.approved_by }}"
       PUBLICATION_ID: "{{ execution.id }}"
       WRITE_GSHEET: "{{ inputs.write_gsheet }}"
-      TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
-      TARGET_WORKSHEET: "FINPAY MONTHLY - {{ inputs.cluster_id }}"
-      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
     script: |
       import csv
       import json
@@ -101,14 +98,12 @@ tasks:
 
       sys.path.insert(0, "/app")
       from kestra import Kestra
-      from pipeline import (
+      from finpay_pipeline import (
           build_finpay_monthly_preview,
-          make_gspread_client,
           mark_finpay_google_publication_status,
           publish_finpay_monthly_snapshot,
           postgres_dsn_from_env,
           record_finpay_monthly_preview,
-          write_finpay_monthly_to_gsheet,
       )
 
       expected_dates = [
@@ -144,38 +139,7 @@ tasks:
                   expected_source_fingerprint=fingerprint,
               )
 
-              if os.environ.get("WRITE_GSHEET", "true").lower() == "true":
-                  sa_key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
-                  if not sa_key_json or sa_key_json.strip() == "{}":
-                      mark_finpay_google_publication_status(
-                          dsn, result["publication_id"], "FAILED", "GCP_SA_KEY is empty"
-                      )
-                      raise ValueError("GCP_SA_KEY secret is empty or not set")
-                  import tempfile
-                  sa_key_path = None
-                  try:
-                      with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
-                          handle.write(sa_key_json)
-                          sa_key_path = handle.name
-                      client = make_gspread_client(sa_key_path)
-                      result["gsheet"] = write_finpay_monthly_to_gsheet(
-                          client,
-                          spreadsheet_title=os.environ["TARGET_SPREADSHEET"],
-                          worksheet_title=os.environ["TARGET_WORKSHEET"],
-                          result=result,
-                      )
-                      mark_finpay_google_publication_status(
-                          dsn, result["publication_id"], "COMPLETE"
-                      )
-                  except Exception as exc:
-                      mark_finpay_google_publication_status(
-                          dsn, result["publication_id"], "FAILED", str(exc)[:2000]
-                      )
-                      raise
-                  finally:
-                      if sa_key_path and os.path.exists(sa_key_path):
-                          os.unlink(sa_key_path)
-              else:
+              if os.environ.get("WRITE_GSHEET", "true").lower() != "true":
                   result["gsheet"] = {"status": "skipped", "reason": "write_gsheet=false"}
                   mark_finpay_google_publication_status(
                       dsn, result["publication_id"], "SKIPPED"
@@ -246,3 +210,105 @@ tasks:
           "release_ready": result["release_ready"],
           "published": result["published"],
       })
+
+  - id: write_finpay_monthly_google_sheet
+    type: io.kestra.plugin.scripts.python.Script
+    runIf: "{{ inputs.write_gsheet }}"
+    containerImage: finpay-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    pythonVersion: "3.11"
+    timeout: PT15M
+    retry:
+      type: exponential
+      interval: PT10S
+      maxInterval: PT60S
+      maxAttempts: 3
+    inputFiles:
+      finpay_monthly_result.json: "{{ outputs.calculate_and_optionally_publish_month.outputFiles['finpay_monthly_result.json'] }}"
+    outputFiles:
+      - finpay_google_write_result.json
+    env:
+      SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+      TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
+      TARGET_WORKSHEET: "FINPAY MONTHLY - {{ inputs.cluster_id }}"
+    script: |
+      import json
+      import os
+      import sys
+      import tempfile
+      from kestra import Kestra
+
+      sys.path.insert(0, "/app")
+      from finpay_pipeline import make_gspread_client, write_finpay_monthly_to_gsheet
+
+      with open("finpay_monthly_result.json", encoding="utf-8") as handle:
+          result = json.load(handle)
+      write_result = {"status": "FAILED", "publication_id": result.get("publication_id")}
+      key_json = os.environ.get("SECRET_GCP_SA_KEY", "")
+      if not key_json or key_json.strip() == "{}":
+          write_result["error"] = "GCP_SA_KEY is empty or not configured in Kestra"
+      else:
+          credential_path = None
+          try:
+              with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+                  handle.write(key_json)
+                  credential_path = handle.name
+              client = make_gspread_client(credential_path)
+              sheet_result = write_finpay_monthly_to_gsheet(
+                  client,
+                  spreadsheet_title=os.environ["TARGET_SPREADSHEET"],
+                  worksheet_title=os.environ["TARGET_WORKSHEET"],
+                  result=result,
+              )
+              write_result.update({"status": "COMPLETE", **sheet_result})
+          except Exception as exc:
+              write_result["error"] = str(exc)[:2000]
+          finally:
+              if credential_path and os.path.exists(credential_path):
+                  os.unlink(credential_path)
+
+      with open("finpay_google_write_result.json", "w", encoding="utf-8") as handle:
+          json.dump(write_result, handle, indent=2, default=str)
+      Kestra.outputs(write_result)
+
+  - id: record_finpay_monthly_google_status
+    type: io.kestra.plugin.scripts.python.Script
+    runIf: "{{ inputs.write_gsheet and inputs.publish }}"
+    containerImage: finpay-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: mmpp-finance-network
+    pythonVersion: "3.11"
+    timeout: PT3M
+    inputFiles:
+      finpay_google_write_result.json: "{{ outputs.write_finpay_monthly_google_sheet.outputFiles['finpay_google_write_result.json'] }}"
+      finpay_monthly_result.json: "{{ outputs.calculate_and_optionally_publish_month.outputFiles['finpay_monthly_result.json'] }}"
+    env:
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+    script: |
+      import json
+      import os
+      import sys
+      sys.path.insert(0, "/app")
+      from finpay_pipeline import mark_finpay_google_publication_status, postgres_dsn_from_env
+
+      with open("finpay_google_write_result.json", encoding="utf-8") as handle:
+          write_result = json.load(handle)
+      with open("finpay_monthly_result.json", encoding="utf-8") as handle:
+          monthly_result = json.load(handle)
+      status = write_result.get("status", "FAILED")
+      mark_finpay_google_publication_status(
+          postgres_dsn_from_env(),
+          monthly_result["publication_id"],
+          status,
+          write_result.get("error"),
+      )
+      print(f"Google publication status recorded: {status}")
+      if status != "COMPLETE":
+          raise RuntimeError(write_result.get("error", "Google Sheet write failed"))

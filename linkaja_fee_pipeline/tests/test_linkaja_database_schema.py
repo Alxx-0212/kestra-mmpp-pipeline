@@ -23,6 +23,8 @@ from linkaja_fee_pipeline.sql import (
     MONTHLY_UNRESOLVED_REVERSALS_STATEMENT,
     REPLACE_RAW_STATEMENTS,
     STAGE_CONFLICTS_STATEMENT,
+    REPLACE_SOURCE_LOAD_STATEMENTS,
+    INSERT_LEDGER_VERSION_STATEMENT,
 )
 
 
@@ -32,9 +34,9 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
 
         self.assertEqual(
             [migration.version for migration in migrations],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         )
-        self.assertEqual(latest_linkaja_schema_version(), 10)
+        self.assertEqual(latest_linkaja_schema_version(), 12)
         self.assertTrue(all(len(migration.checksum) == 64 for migration in migrations))
 
     def test_final_transaction_schema_keeps_facts_not_report_amounts(self):
@@ -134,6 +136,59 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
             delete_statement,
         )
         self.assertNotIn("incoming.finalized_date", delete_statement)
+
+    def test_source_generation_supersession_is_exact_file_scope_not_date_overlap(self):
+        from linkaja_fee_pipeline.sql import REPLACE_SOURCE_LOAD_STATEMENTS
+
+        supersede = " ".join(REPLACE_SOURCE_LOAD_STATEMENTS[0].lower().split())
+        link = " ".join(REPLACE_SOURCE_LOAD_STATEMENTS[1].lower().split())
+        self.assertIn("source_file = %(source_file)s", supersede)
+        self.assertIn("source_start_date is not distinct from %(source_start_date)s", supersede)
+        self.assertIn("source_end_date is not distinct from %(source_end_date)s", supersede)
+        self.assertNotIn("coalesce(source_end_date", supersede)
+        self.assertIn("source_file = %(source_file)s", link)
+        self.assertIn("source_start_date is not distinct from %(source_start_date)s", link)
+        self.assertIn("source_end_date is not distinct from %(source_end_date)s", link)
+        self.assertIn("order by valid_to desc nulls last, load_id desc limit 1", link)
+        self.assertIn("and not is_current", link)
+
+    def test_ledger_versions_are_append_only_and_raw_table_is_current_state(self):
+        insert = " ".join(INSERT_LEDGER_VERSION_STATEMENT.lower().split())
+        self.assertIn("insert into linkaja_ledger_versions", insert)
+        self.assertIn("on conflict (load_id, source_row_number) do update", insert)
+        self.assertNotIn("delete from linkaja_ledger_versions", insert)
+        self.assertNotIn("is_current", insert)
+
+    def test_row_current_migration_repairs_load_and_transaction_generations(self):
+        migration_path = (
+            Path(__file__).parents[1]
+            / "migrations"
+            / "012_row_scoped_source_current.sql"
+        )
+        normalized = " ".join(migration_path.read_text(encoding="utf-8").lower().split())
+        self.assertIn("partition by cluster_id, source_file, source_start_date, source_end_date", normalized)
+        self.assertNotIn("update linkaja_ledger_versions", normalized)
+        self.assertIn("partition by cluster_id, source_file, source_start_date, source_end_date", normalized)
+        self.assertIn("create unique index linkaja_source_loads_current_identity_idx", normalized)
+
+    def test_source_generation_replaces_exact_file_not_overlapping_date_ranges(self):
+        supersede_load = " ".join(REPLACE_SOURCE_LOAD_STATEMENTS[0].lower().split())
+        insert_load = " ".join(REPLACE_SOURCE_LOAD_STATEMENTS[1].lower().split())
+        self.assertIn("source_file = %(source_file)s", supersede_load)
+        self.assertIn("source_start_date is not distinct from %(source_start_date)s", supersede_load)
+        self.assertIn("source_end_date is not distinct from %(source_end_date)s", supersede_load)
+        self.assertIn("load_id <> %(load_id)s", supersede_load)
+        self.assertNotIn("coalesce(source_end_date", supersede_load)
+        self.assertIn("source_file = %(source_file)s", insert_load)
+        self.assertIn("on conflict (load_id) do update", insert_load)
+
+    def test_daily_writer_keeps_versions_append_only_and_updates_compatibility_raw(self):
+        from pathlib import Path
+
+        source = (Path(__file__).parents[1] / "database.py").read_text(encoding="utf-8")
+        self.assertIn("cursor.execute(INSERT_LEDGER_VERSION_STATEMENT)", source)
+        self.assertIn("for statement in REPLACE_RAW_STATEMENTS", source)
+        self.assertNotIn("SUPERSEDE_LEDGER_VERSIONS_STATEMENT", source)
 
     def test_affected_dates_come_from_preserved_refresh_scope(self):
         normalized = " ".join(AFFECTED_DATES_STATEMENT.lower().split())
@@ -252,7 +307,7 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
         self.assertNotIn("company_credit =", normalized)
         self.assertNotIn("ledger_debit_total =", normalized)
 
-    def test_monthly_workflow_publishes_database_analysis_files_only(self):
+    def test_monthly_workflow_can_write_review_sheet(self):
         workflow_path = (
             Path(__file__).parents[2] / "linkaja_fee_pipeline" / "workflows" / "linkaja_monthly_materialization.yml"
         )
@@ -262,11 +317,13 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
 
         self.assertIn("linkaja_daily_raw_calculation.csv", normalized)
         self.assertIn("linkaja_unresolved_reversals.csv", normalized)
-        self.assertNotIn("gspread", normalized)
-        self.assertNotIn("gcp_sa_key", normalized)
+        self.assertIn("write_gsheet", normalized)
+        self.assertIn("write_linkaja_monthly_to_gsheet", normalized)
+        self.assertIn("gcp_sa_key", normalized)
+        self.assertIn("linkaja_google_write_result.json", normalized)
         self.assertNotIn("next available withdrawal", normalized)
 
-    def test_daily_workflow_persists_results_without_sheet_side_effects(self):
+    def test_daily_workflow_writes_shared_and_cluster_detail_sheets(self):
         workflow_path = Path(__file__).parents[2] / "linkaja_fee_pipeline" / "workflows" / "linkaja_fee_pipeline.yml"
         normalized = " ".join(
             workflow_path.read_text(encoding="utf-8").lower().split()
@@ -274,12 +331,14 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
 
         self.assertIn("linkaja_database_result.json", normalized)
         self.assertIn("persist_linkaja_normalized_csv", normalized)
-        self.assertNotIn("upload_linkaja_summaries_to_sheets", normalized)
-        self.assertNotIn("gspread", normalized)
-        self.assertNotIn("gcp_sa_key", normalized)
-        self.assertNotIn("target_spreadsheet", normalized)
+        self.assertIn("write_linkaja_daily_sheets", normalized)
+        self.assertIn("process_linkaja_fee_sheet_upload", normalized)
+        self.assertIn("process_linkaja_detail_sheet_upload", normalized)
+        self.assertIn("target_spreadsheet", normalized)
+        self.assertIn("source_filename", normalized)
+        self.assertIn("write_gsheet", normalized)
 
-    def test_linkaja_runtime_api_and_dependencies_are_sheet_free(self):
+    def test_linkaja_public_database_api_and_sheet_dependencies(self):
         self.assertFalse(hasattr(linkaja_fee_pipeline, "make_gspread_client"))
         self.assertFalse(
             hasattr(linkaja_fee_pipeline, "process_linkaja_fee_sheet_upload")
@@ -292,8 +351,8 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
             Path(__file__).parents[2] / "linkaja_fee_pipeline" / "requirements.txt"
         )
         normalized = requirements_path.read_text(encoding="utf-8").lower()
-        self.assertNotIn("gspread", normalized)
-        self.assertNotIn("google-auth", normalized)
+        self.assertIn("gspread", normalized)
+        self.assertIn("google-auth", normalized)
 
     def test_manual_monthly_query_uses_summary_view_and_published_cutoff(self):
         query_path = (

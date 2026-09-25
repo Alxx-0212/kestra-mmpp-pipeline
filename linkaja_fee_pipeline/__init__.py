@@ -28,6 +28,7 @@ from .migrations import (
 from .database import (
     DETAIL_HEADERS,
     linkaja_postgres_dsn_from_env,
+    update_linkaja_monthly_google_status,
     load_linkaja_database_result,
     materialize_linkaja_month,
     persist_linkaja_normalized_csv,
@@ -51,6 +52,7 @@ __all__ = [
     "SHEET_HEADERS",
     "aggregate_linkaja_fee_file",
     "linkaja_postgres_dsn_from_env",
+    "update_linkaja_monthly_google_status",
     "latest_linkaja_schema_version",
     "load_linkaja_database_result",
     "load_linkaja_fee_json",

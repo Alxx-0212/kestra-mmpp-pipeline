@@ -12,7 +12,7 @@ import psycopg
 
 from .classification import prepare_reversal_summary_transactions, preprocess_transaction_labels
 from .detail_exports import extract_disbursement_date_from_remarks
-from .database import ensure_finpay_transaction_model
+from .database import ensure_finpay_monthly_model
 from .sheets_common import (
     _add_protected_sheet_request,
     _delete_all_banded_range_requests,
@@ -350,6 +350,11 @@ def build_finpay_monthly_preview_from_dataframe(
             for value in loaded_source_dates
         }
     missing_dates = sorted(expected_dates - loaded_dates) if expected_dates else []
+    report_source_dates = (
+        expected_dates.intersection(loaded_dates)
+        if expected_dates
+        else set(month_source["event_timestamp"].dt.date)
+    )
     coverage_verified = bool(expected_dates)
     missing_source_count = len(set(missing_dates) | set(expected_period_missing_dates))
 
@@ -457,7 +462,8 @@ def build_finpay_monthly_preview_from_dataframe(
         "release_ready": status == MONTHLY_STATUS_READY,
         "restatement_required": False,
         "published": False,
-        "source_day_count": len(loaded_dates),
+        "source_day_count": len(report_source_dates),
+        "evidence_source_day_count": len(loaded_dates),
         "missing_source_day_count": missing_source_count,
         "missing_source_dates": [value.isoformat() for value in missing_dates],
         "expected_period_missing_dates": [
@@ -497,6 +503,8 @@ def _calculation_fingerprint(result: dict) -> str:
         "cluster_id": result.get("cluster_id"),
         "report_month": result.get("report_month"),
         "calculation_cutoff": result.get("calculation_cutoff"),
+        "report_source_day_count": result.get("source_day_count", 0),
+        "evidence_source_day_count": result.get("evidence_source_day_count", 0),
         "expected_period_missing_dates": result.get("expected_period_missing_dates", []),
         "category_rows": result.get("category_rows", []),
         "unresolved_reversal_count": result.get("unresolved_reversal_count", 0),
@@ -519,7 +527,7 @@ def build_finpay_monthly_preview(
     """Build a preview from current append-only evidence without publishing."""
     month_start, month_end = _month_bounds(report_month)
     cutoff = _cutoff_timestamp(calculation_cutoff)
-    ensure_finpay_transaction_model(dsn)
+    ensure_finpay_monthly_model(dsn)
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             events = _fetch_dataframe(
@@ -604,9 +612,10 @@ def build_finpay_monthly_preview(
             )
             final_publication = cur.fetchone()
     if final_publication and final_publication[0] != result["source_fingerprint"]:
-        result["status"] = MONTHLY_STATUS_RESTATEMENT_REQUIRED
-        result["release_ready"] = False
         result["restatement_required"] = True
+        if result["status"] == MONTHLY_STATUS_READY:
+            result["status"] = MONTHLY_STATUS_RESTATEMENT_REQUIRED
+            result["release_ready"] = True
     return result
 
 
@@ -617,47 +626,9 @@ def record_finpay_monthly_preview(
     preview_id: str,
 ) -> dict:
     """Persist preview metadata without mutating the frozen monthly snapshot."""
-    ensure_finpay_transaction_model(dsn)
-    month_start, month_end = _month_bounds(result["report_month"])
+    ensure_finpay_monthly_model(dsn)
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (f"finpay-monthly:{result['cluster_id']}:{result['report_month']}",),
-            )
-            cur.execute(
-                """
-                SELECT load_id, source_sha256, report_date, source_start_date,
-                       source_end_date, source_file, row_count
-                FROM finpay_source_loads
-                WHERE cluster_id = %s
-                  AND is_current
-                  AND COALESCE(source_end_date, report_date) >= %s
-                  AND COALESCE(source_start_date, report_date) < %s
-                """,
-                (result["cluster_id"], month_start, pd.to_datetime(result["calculation_cutoff"]).date()),
-            )
-            load_rows = cur.fetchall()
-            load_columns = [column.name for column in cur.description]
-            current_fingerprint = _source_fingerprint(
-                pd.DataFrame(load_rows, columns=load_columns)
-            )
-            if current_fingerprint != expected_source_fingerprint:
-                raise ValueError(
-                    "Monthly source fingerprint changed during publication lock"
-                )
-            if result.get("preview_id"):
-                cur.execute(
-                    """
-                    SELECT source_fingerprint, calculation_fingerprint, status
-                    FROM finpay_monthly_previews
-                    WHERE preview_id = %s
-                    """,
-                    (result["preview_id"],),
-                )
-                preview = cur.fetchone()
-                if not preview or preview[0] != result["source_fingerprint"] or preview[1] != result["calculation_fingerprint"]:
-                    raise ValueError("Monthly preview metadata no longer matches publication")
             cur.execute(
                 """
                 INSERT INTO finpay_monthly_previews (
@@ -710,18 +681,76 @@ def publish_finpay_monthly_snapshot(
     expected_source_fingerprint: str | None = None,
 ) -> dict:
     """Publish one ready preview as an atomic cluster-month snapshot."""
-    if result.get("status") != MONTHLY_STATUS_READY:
+    publishable_status = result.get("status") in {
+        MONTHLY_STATUS_READY,
+        MONTHLY_STATUS_RESTATEMENT_REQUIRED,
+    }
+    blocking_exceptions = any(int(result.get(key, 0) or 0) > 0 for key in (
+        "blocking_exception_count",
+        "missing_source_day_count",
+        "unresolved_reversal_count",
+        "multiple_reversal_count",
+        "qris_missing_disbursement_count",
+    ))
+    if not publishable_status or not result.get("expected_period_complete") or blocking_exceptions:
         raise ValueError(
-            f"Monthly result is not ready for publication: {result.get('status')}"
+            "Monthly result is not ready for publication: "
+            f"status={result.get('status')} blockers={result.get('blocking_exception_count')}"
         )
     if expected_source_fingerprint is None:
         raise ValueError("expected_source_fingerprint is required for publication")
     if result.get("source_fingerprint") != expected_source_fingerprint:
         raise ValueError("Monthly preview source fingerprint changed before publication")
 
-    ensure_finpay_transaction_model(dsn)
+    ensure_finpay_monthly_model(dsn)
+    month_start, month_end = _month_bounds(result["report_month"])
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"finpay-monthly:{result['cluster_id']}:{result['report_month']}",),
+            )
+            cur.execute(
+                """
+                SELECT load_id, source_sha256, report_date, source_start_date,
+                       source_end_date, source_file, row_count
+                FROM finpay_source_loads
+                WHERE cluster_id = %s
+                  AND is_current
+                  AND COALESCE(source_end_date, report_date) >= %s
+                  AND COALESCE(source_start_date, report_date) < %s
+                """,
+                (
+                    result["cluster_id"],
+                    month_start,
+                    pd.to_datetime(result["calculation_cutoff"]).date(),
+                ),
+            )
+            load_rows = cur.fetchall()
+            load_columns = [column.name for column in cur.description]
+            current_fingerprint = _source_fingerprint(
+                pd.DataFrame(load_rows, columns=load_columns)
+            )
+            if current_fingerprint != expected_source_fingerprint:
+                raise ValueError(
+                    "Monthly source fingerprint changed during publication lock"
+                )
+            if result.get("preview_id"):
+                cur.execute(
+                    """
+                    SELECT source_fingerprint, calculation_fingerprint, status
+                    FROM finpay_monthly_previews
+                    WHERE preview_id = %s
+                    """,
+                    (result["preview_id"],),
+                )
+                preview = cur.fetchone()
+                if (
+                    not preview
+                    or preview[0] != result["source_fingerprint"]
+                    or preview[1] != result["calculation_fingerprint"]
+                ):
+                    raise ValueError("Monthly preview metadata no longer matches publication")
             cur.execute(
                 """
                 UPDATE finpay_monthly_publications
@@ -783,7 +812,7 @@ def publish_finpay_monthly_snapshot(
                         reversal_count, eligible, source_fingerprint, classification_version
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     rows,
                 )
@@ -937,12 +966,17 @@ def write_finpay_monthly_to_gsheet(
             "SOURCE FINGERPRINT", result.get("source_fingerprint", ""),
         ]),
         row8([
-            "SOURCE DAYS", result.get("source_day_count", 0),
+            "REPORT SOURCE DAYS", result.get("source_day_count", 0),
+            "EVIDENCE WINDOW DAYS", result.get("evidence_source_day_count", 0),
             "MISSING SOURCE DAYS", result.get("missing_source_day_count", 0),
             "UNRESOLVED REVERSALS", result.get("unresolved_reversal_count", 0),
-            "BLOCKING EXCEPTIONS", result.get("blocking_exception_count", 0),
         ]),
-        row8([]),
+        row8([
+            "BLOCKING EXCEPTIONS", result.get("blocking_exception_count", 0),
+            "MULTIPLE REVERSALS", result.get("multiple_reversal_count", 0),
+            "DUPLICATE SOURCE ROWS", result.get("duplicate_source_row_count", 0),
+            "QRIS MISSING DATES", result.get("qris_missing_disbursement_count", 0),
+        ]),
         row8([
             "CATEGORY", "GROSS COUNT", "REVERSED COUNT", "ACTIVE COUNT",
             "GROSS AMOUNT", "REVERSED AMOUNT", "NET PAYABLE", "STATUS",
@@ -964,6 +998,22 @@ def write_finpay_monthly_to_gsheet(
     values.append(row8(["EXCEPTION", "VALUE", "DETAIL"]))
     values.extend(row8(row) for row in exception_rows)
 
+    metadata = spreadsheet.fetch_sheet_metadata({
+        "fields": "sheets(properties(sheetId),merges)",
+    })
+    prewrite_requests = [
+        *_delete_all_banded_range_requests(spreadsheet, worksheet),
+        *_delete_all_protected_range_requests(spreadsheet, worksheet),
+    ]
+    for sheet in metadata.get("sheets", []):
+        if sheet.get("properties", {}).get("sheetId") == worksheet.id:
+            prewrite_requests.extend(
+                {"unmergeCells": {"range": merge}}
+                for merge in sheet.get("merges", [])
+            )
+    if prewrite_requests:
+        spreadsheet.batch_update({"requests": prewrite_requests})
+
     worksheet.clear()
     ensure_row_capacity(
         spreadsheet,
@@ -978,22 +1028,7 @@ def write_finpay_monthly_to_gsheet(
         value_input_option="USER_ENTERED",
     )
 
-    metadata = spreadsheet.fetch_sheet_metadata({
-        "fields": "sheets(properties(sheetId),merges)",
-    })
-    unmerge_requests = []
-    for sheet in metadata.get("sheets", []):
-        if sheet.get("properties", {}).get("sheetId") != worksheet.id:
-            continue
-        unmerge_requests.extend(
-            {"unmergeCells": {"range": merge}}
-            for merge in sheet.get("merges", [])
-        )
-
     requests = [
-        *_delete_all_banded_range_requests(spreadsheet, worksheet),
-        *_delete_all_protected_range_requests(spreadsheet, worksheet),
-        *unmerge_requests,
         {
             "updateSheetProperties": {
                 "properties": {
@@ -1046,13 +1081,13 @@ def write_finpay_monthly_to_gsheet(
         "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)",
     )
     repeat(
-        2, 4, 1, 8,
+        2, 5, 1, 8,
         {"backgroundColor": cash_body, "textFormat": {"foregroundColor": text}, "verticalAlignment": "MIDDLE"},
         "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
     )
     for column in (1, 3, 5, 7):
         repeat(
-            2, 4, column, column,
+            2, 5, column, column,
             {"backgroundColor": cash_header, "textFormat": {"bold": True, "foregroundColor": text}},
             "userEnteredFormat(backgroundColor,textFormat)",
         )

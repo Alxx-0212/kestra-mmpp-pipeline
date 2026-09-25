@@ -26,7 +26,15 @@ FINPAY_DB_TABLES = {
 }
 
 FINPAY_TRANSACTION_MODEL_MIGRATION = (
-    Path(__file__).resolve().parent / "migrations" / "001_finpay_transaction_model.sql"
+    Path(__file__).resolve().parent
+    / "migrations"
+    / "001_finpay_transaction_model_legacy_compat.sql"
+)
+FINPAY_DAILY_SOURCE_EVIDENCE_MIGRATION = (
+    Path(__file__).resolve().parent / "migrations" / "001_finpay_daily_source_evidence.sql"
+)
+FINPAY_MONTHLY_MODEL_MIGRATION = (
+    Path(__file__).resolve().parent / "migrations" / "002_finpay_monthly_model.sql"
 )
 
 FINPAY_DB_CORE_COLUMNS = [
@@ -153,11 +161,31 @@ def postgres_dsn_from_env(prefix: str = "FINPAY_DB_") -> str:
 
 
 def ensure_finpay_transaction_model(dsn: str) -> None:
-    """Apply the additive, versioned transaction-model DDL."""
+    """Compatibility initializer for the historical combined model DDL."""
     migration_sql = FINPAY_TRANSACTION_MODEL_MIGRATION.read_text(encoding="utf-8")
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(migration_sql)
+        conn.commit()
+
+
+def ensure_finpay_daily_source_evidence(dsn: str) -> None:
+    """Create only the append-only evidence schema required by daily ingestion."""
+    migration_sql = FINPAY_DAILY_SOURCE_EVIDENCE_MIGRATION.read_text(encoding="utf-8")
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(migration_sql)
+        conn.commit()
+
+
+def ensure_finpay_monthly_model(dsn: str) -> None:
+    """Initialize daily evidence plus monthly-only modeling relations."""
+    daily_sql = FINPAY_DAILY_SOURCE_EVIDENCE_MIGRATION.read_text(encoding="utf-8")
+    monthly_sql = FINPAY_MONTHLY_MODEL_MIGRATION.read_text(encoding="utf-8")
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(daily_sql)
+            cur.execute(monthly_sql)
         conn.commit()
 
 
@@ -614,7 +642,7 @@ def write_finpay_dataframe_to_postgres(
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             if table_name == "finpay_raw_transactions" and load_id:
-                migration_sql = FINPAY_TRANSACTION_MODEL_MIGRATION.read_text(
+                migration_sql = FINPAY_DAILY_SOURCE_EVIDENCE_MIGRATION.read_text(
                     encoding="utf-8"
                 )
                 cur.execute(migration_sql)

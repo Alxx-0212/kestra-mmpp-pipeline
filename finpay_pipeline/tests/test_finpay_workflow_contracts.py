@@ -144,7 +144,7 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         inputs = text.split("\ninputs:\n", 1)[1].split("\ntasks:\n", 1)[0]
         self.assertEqual(
             re.findall(r"(?m)^  - id: ([A-Za-z0-9_-]+)$", inputs),
-            ["csv_file", "dry_run", "source_filename", "write_gsheet"],
+            ["csv_file", "dry_run", "source_filename", "write_gsheet", "send_telegram"],
         )
         self.assertNotRegex(text, r"(?m)^triggers:$")
 
@@ -251,6 +251,7 @@ class FinPayWorkflowContractTest(unittest.TestCase):
             "dry_run",
             "source_filename",
             "write_gsheet",
+            "send_telegram",
             "Asia/Makassar",
             "2026-09-01",
             "SELLTHRUSALESFEE",
@@ -303,6 +304,13 @@ class FinPayMonthlyWorkflowContractTest(unittest.TestCase):
         self.assertIn("expected_source_fingerprint is required", text)
         self.assertIn("publish_finpay_monthly_snapshot", text)
         self.assertIn("source_fingerprint", text)
+
+    def test_daily_upload_uses_public_package_migration_contract(self):
+        text = _workflow_text()
+        task = _task_block(text, "persist_raw_transactions_to_db")
+        self.assertIn("write_finpay_dataframe_to_postgres", task)
+        self.assertIn("finpay_source_sha256", task)
+        self.assertNotIn("ensure_finpay_monthly_model", task)
 
     def test_monthly_workflow_imports_are_in_the_public_api(self):
         workflow_imports = _workflow_imports(_monthly_workflow_text())

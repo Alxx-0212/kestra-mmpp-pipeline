@@ -186,6 +186,8 @@ MONTHLY_REFRESH_COLUMNS = {
     "transaction_rows",
     "unresolved_reversal_count",
     "refreshed_at",
+    "google_status",
+    "google_error",
 }
 
 MONTHLY_FEE_SUMMARY_VIEW_COLUMNS = {

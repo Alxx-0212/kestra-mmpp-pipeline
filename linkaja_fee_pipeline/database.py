@@ -135,6 +135,37 @@ def linkaja_postgres_dsn_from_env(prefix: str = "FINPAY_DB_") -> str:
     )
 
 
+def update_linkaja_monthly_google_status(
+    dsn: str,
+    materialization_id: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Persist Google rendering status separately from the DB snapshot."""
+    if status not in {"PENDING", "COMPLETE", "FAILED", "SKIPPED"}:
+        raise ValueError(f"Unsupported LinkAja Google status: {status}")
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise RuntimeError("psycopg is required for LinkAja Google status updates") from exc
+    with psycopg.connect(dsn) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE linkaja_monthly_refreshes
+                SET google_status = %s,
+                    google_error = %s
+                WHERE materialization_id = %s
+                """,
+                (status, error, materialization_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"LinkAja monthly materialization not found: {materialization_id}"
+                )
+        connection.commit()
+
+
 def _normalized_copy_value(column: str, value: str):
     text = str(value or "").strip()
     if not text:

@@ -513,6 +513,44 @@ monthly worksheet was rewritten with the daily monitoring palette, frozen header
 section fills, alternating category rows, numeric formats, borders, and output
 protection.
 
+## 21. 2026-09-24 Simulation Refresh
+
+After the August daily Sheet replay, a final category audit found 346
+`FeeTransaksi` rows were excluded because in-memory labels were normalized to
+uppercase while the known-label and remark-pattern maps still used mixed case.
+Both keys are now canonical uppercase and a regression fixture verifies the
+observed remark structure.
+
+The corrected local simulation then:
+
+```text
+FinPay daily August uploads: 31/31 SUCCESS with Google writes
+FinPay post-month reversal-window data: Sep 1-17, DB-only
+FinPay August source coverage: 31 report days
+FinPay reversal evidence window: 48 days (Aug 1-Sep 17)
+FinPay unresolved/multiple reversals: 0 / 0
+FinPay FEETRANSAKSI restored: 346 daily/monthly eligible rows
+FinPay monthly snapshot: FINAL in the local simulation DB
+FinPay monthly Google worksheet: COMPLETE
+
+LinkAja July source bundle: 43 files loaded DB-only
+LinkAja latest snapshot generations: 204 ranges loaded through Sep 20
+LinkAja August daily Google writes: 120 range executions SUCCESS
+LinkAja August monthly summaries: 6 cluster snapshots and worksheets COMPLETE
+LinkAja unresolved reversal targets: 878 across the six monthly close windows
+```
+
+The LinkAja monthly worksheets are explicitly marked
+`PUBLISHED WITH EXCEPTIONS - REVIEW REQUIRED`; they are not Odoo-final because
+no missing-history waivers were approved. The August source bundle is rendered
+in `Salinan dari Monitoring Finpay & LinkAja` using the existing daily monitoring
+styles plus dedicated monthly tabs.
+
+All writes were to the local simulation database/Kestra stack and the named
+spreadsheet copy. They are not production deployment or Finance approval. The
+local Google writer tasks use host networking because Google egress from
+`mmpp-finance-network` timed out while host-network OAuth/Sheets calls succeeded.
+
 ## 14. P0 Hardening Implementation Plan
 
 P0 is the work required before a monthly result can be treated as an

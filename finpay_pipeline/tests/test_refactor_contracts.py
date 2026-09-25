@@ -201,7 +201,7 @@ class UnknownTransactionContractTest(unittest.TestCase):
                 "CASHOUT APOLLO",
                 "QRISDUWIT",
                 "DISBURSEMENT",
-                "FeeTransaksi",
+                "FEETRANSAKSI",
                 "RECHARGE",
                 "RECHARGEFEE",
                 classification.PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
@@ -223,6 +223,24 @@ class UnknownTransactionContractTest(unittest.TestCase):
             classification.KNOWN_SUMMARY_TRANSACTION_LABELS,
             set(classification.KNOWN_TRANSACTION_REMARK_PATTERNS),
         )
+
+    def test_fee_transaksi_remains_known_after_case_insensitive_normalization(self):
+        df = _non_reversal_rows(["FeeTransaksi"])
+        df.loc[0, "Transaction"] = "fEeTrAnSaKsI"
+        df.loc[0, "Remarks"] = (
+            "Fee Digipos Rp.20.00 | Fee SBP Rp.0.00 | Dari Nomor :411311"
+        )
+
+        preprocessed = classification.preprocess_transaction_labels(df)
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, summary_unusual = (
+            classification.prepare_reversal_summary_transactions(preprocessed)
+        )
+
+        self.assertEqual(preprocessed.loc[0, "Transaction"], "FEETRANSAKSI")
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["FEETRANSAKSI"])
 
     def test_unknown_transaction_is_reported_as_unusual(self):
         df = _non_reversal_rows(["QRISDUWIT", "NEWPAY"])
@@ -1236,6 +1254,36 @@ class FinPayMonthlyTransactionContractTest(unittest.TestCase):
         self.assertEqual(result["status"], monthly.MONTHLY_STATUS_INCOMPLETE_SOURCE)
         self.assertFalse(result["release_ready"])
 
+    def test_month_coverage_is_separate_from_reversal_evidence_window(self):
+        events = self._events([{
+            "transaction_date": pd.Timestamp("2026-08-01 10:00:00"),
+            "transaction_id": "TXN1",
+            "raw_transaction_label": "RECHARGE",
+            "remarks": "Biaya Pembelian recharge sejumlah 100 rupiah, dari 081234 ke 411311",
+            "kredit": 100,
+            "debet": 0,
+        }])
+        expected_dates = [
+            f"2026-08-{day:02d}" for day in range(1, 32)
+        ]
+        evidence_dates = expected_dates + [
+            f"2026-09-{day:02d}" for day in range(1, 18)
+        ]
+
+        result = monthly.build_finpay_monthly_preview_from_dataframe(
+            events,
+            cluster_id="411311",
+            report_month="2026-08",
+            calculation_cutoff="2026-09-18T00:00:00",
+            expected_source_dates=expected_dates,
+            loaded_source_dates=evidence_dates,
+            source_fingerprint="fingerprint-coverage",
+        )
+
+        self.assertEqual(result["source_day_count"], 31)
+        self.assertEqual(result["evidence_source_day_count"], 48)
+        self.assertTrue(result["expected_period_complete"])
+
     def test_qris_missing_disbursement_blocks_month(self):
         result = self._preview([
             {
@@ -1395,7 +1443,8 @@ class FinPayGoogleSheetHardeningContractTest(unittest.TestCase):
                 "publication_id": "pub-1",
                 "source_fingerprint": "fingerprint",
                 "release_ready": True,
-                "source_day_count": 31,
+                    "source_day_count": 31,
+                    "evidence_source_day_count": 48,
                 "missing_source_day_count": 0,
                 "unresolved_reversal_count": 0,
                 "blocking_exception_count": 0,
@@ -1422,6 +1471,15 @@ class FinPayGoogleSheetHardeningContractTest(unittest.TestCase):
         self.assertTrue(any("mergeCells" in request for request in requests))
         self.assertTrue(any("repeatCell" in request for request in requests))
         self.assertTrue(any("addProtectedRange" in request for request in requests))
+        update_call = worksheet.update.call_args
+        updated_values = (
+            update_call.kwargs["values"]
+            if "values" in update_call.kwargs
+            else update_call.args[1]
+        )
+        rendered = str(updated_values)
+        self.assertIn("REPORT SOURCE DAYS", rendered)
+        self.assertIn("EVIDENCE WINDOW DAYS", rendered)
 
 
 if __name__ == "__main__":

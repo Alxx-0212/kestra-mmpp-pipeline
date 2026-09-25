@@ -173,7 +173,7 @@ KNOWN_SUMMARY_TRANSACTION_LABELS = {
     'CASHOUT APOLLO',
     'QRISDUWIT',
     'DISBURSEMENT',
-    'FeeTransaksi',
+    'FEETRANSAKSI',
     'RECHARGE',
     'RECHARGEFEE',
     PEMBELIAN_RECHARGE_OUT_CLUSTER_CATEGORY,
@@ -235,7 +235,7 @@ KNOWN_TRANSACTION_REMARK_PATTERNS = {
         'sales fee payment untuk perdana sebanyak <value> dan voucher sebanyak '
         '<value> sejumlah <value> rupiah',
     }),
-    'FeeTransaksi': frozenset({
+    'FEETRANSAKSI': frozenset({
         'fee digipos rp.<value> | fee sbp rp.<value> | dari nomor :<value>',
     }),
     'RECHARGE': RECHARGE_REMARK_PATTERNS,

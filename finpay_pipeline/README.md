@@ -49,6 +49,7 @@ workflow; this flow begins at the immutable uploaded file boundary.
 | `dry_run` | `BOOLEAN` | `false` | When `true`, execute validation and calculation but skip PostgreSQL, Google Sheets, Telegram, and the final sleep. |
 | `source_filename` | `STRING` | empty | Original basename supplied by API clients when Kestra stores the FILE input under a temporary `.upl` path. |
 | `write_gsheet` | `BOOLEAN` | `true` | When `false`, skip Google Sheets and Telegram side effects while retaining PostgreSQL/source-ledger persistence for isolated replay. |
+| `send_telegram` | `BOOLEAN` | `true` | Disable unusual Telegram notifications independently while keeping Google Sheet writes enabled. |
 
 The filename parser uses this exact shape:
 
@@ -363,8 +364,8 @@ columns except `No`, with transaction date compared at minute precision.
 
 ## Postgres Rules
 
-There are five daily compatibility tables and six additive monthly-model
-relations:
+There are five daily compatibility tables, two daily evidence relations, and
+seven monthly-only relations/views:
 
 | Table | Source | Scope |
 |---|---|---|
@@ -375,19 +376,37 @@ relations:
 | `finpay_qrisduwit_transactions` | `qrisduwit.parquet` | QRISDUWIT detail output with `disbursement_date`. |
 | `finpay_source_loads` | Daily raw persistence | Append-only source generations and current-load replacement metadata. |
 | `finpay_ledger_events` | Daily raw persistence | Append-only source rows with load ID and content hash. |
-| `finpay_transaction_events_current_v` | Migration view | Current transaction-group events by exact cluster and ID. |
-| `finpay_reversal_status_current_v` | Migration view | Guarded exact-ID reversal states and active flags. |
-| `finpay_monthly_transactions` | Monthly publication | Frozen cluster-month transaction facts. |
-| `finpay_monthly_publications` | Monthly publication | Cutoff, fingerprint, release status, and approval audit. |
+| `finpay_current_ledger_events_v` | Monthly model | Ledger events filtered to currently selected source generations. |
+| `finpay_transaction_events_current_v` | Monthly model | Current transaction-group events by exact cluster and ID. |
+| `finpay_reversal_status_current_v` | Monthly model | Guarded exact-ID reversal states and active flags. |
+| `finpay_monthly_transactions` | Monthly model | Frozen cluster-month transaction/reversal facts. |
+| `finpay_monthly_publications` | Monthly model | Cutoff, fingerprint, release status, and approval audit. |
+| `finpay_monthly_source_expectations` | Monthly model | Expected report dates used to gate source coverage. |
+| `finpay_monthly_previews` | Monthly model | Durable preview fingerprint/status records. |
 
 All DB writes replace the current `cluster_id + report_date` batch before
 insert. This is the primary rerun/idempotency mechanism.
 
-The additive transaction model is different by design: source loads and ledger
-events are retained across reruns, while a corrected upload marks the previous
-generation for that cluster/report date non-current. Monthly snapshots are
-replaced only for the explicit cluster-month publication and retain their
-source fingerprint.
+Daily source evidence is created by
+`migrations/001_finpay_daily_source_evidence.sql` only. A daily raw upload does
+not create monthly tables or views. Source loads and ledger events are retained
+across reruns, while a corrected upload marks the previous generation for that
+cluster/report date non-current. The historical combined
+`001_finpay_transaction_model_legacy_compat.sql` remains only for compatibility
+callers; new daily tasks must use the daily-only initializer. Monthly objects
+are created by `migrations/002_finpay_monthly_model.sql` when a monthly flow is
+explicitly run. Monthly snapshots are replaced only for the explicit
+cluster-month publication and retain their source fingerprint.
+
+### Daily historical backfill procedure
+
+Use `finpay_daily_pipeline_v5` for each source file in chronological order. First
+run a representative file with `dry_run=true`; after it succeeds, run production
+mode (`dry_run=false`) with a unique source filename. Poll each execution to
+`SUCCESS` before submitting the next file. Replays replace the compatibility
+`cluster_id + report_date` daily batch but retain prior source generations and
+ledger rows for audit. Daily backfill does not apply monthly DDL, resolve
+reversal-adjusted payable, or publish an Odoo monthly snapshot.
 
 Schema rules:
 

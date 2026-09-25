@@ -1,2 +1,5 @@
 kestra
 psycopg[binary]==3.2.3
+gspread>=6,<7
+google-auth>=2,<3
+requests>=2.31,<3

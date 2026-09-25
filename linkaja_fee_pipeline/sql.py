@@ -173,9 +173,11 @@ REPLACE_SOURCE_LOAD_STATEMENTS = [
     SET is_current = FALSE,
         valid_to = CURRENT_TIMESTAMP
     WHERE cluster_id = %(cluster_id)s
+      AND source_file = %(source_file)s
+      AND source_start_date IS NOT DISTINCT FROM %(source_start_date)s
+      AND source_end_date IS NOT DISTINCT FROM %(source_end_date)s
       AND is_current
-      AND COALESCE(source_end_date, source_start_date) >= %(source_start_date)s
-      AND COALESCE(source_start_date, source_end_date) <= %(source_end_date)s
+      AND load_id <> %(load_id)s
     """,
     """
     INSERT INTO linkaja_source_loads (
@@ -197,15 +199,23 @@ REPLACE_SOURCE_LOAD_STATEMENTS = [
         SELECT load_id
         FROM linkaja_source_loads
         WHERE cluster_id = %(cluster_id)s
+          AND source_file = %(source_file)s
+          AND source_start_date IS NOT DISTINCT FROM %(source_start_date)s
+          AND source_end_date IS NOT DISTINCT FROM %(source_end_date)s
           AND NOT is_current
         ORDER BY valid_to DESC NULLS LAST, load_id DESC
         LIMIT 1
         )
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM linkaja_source_loads AS existing
-        WHERE existing.load_id = %(load_id)s
-    )
+    ON CONFLICT (load_id) DO UPDATE SET
+        source_file = EXCLUDED.source_file,
+        source_sha256 = EXCLUDED.source_sha256,
+        source_start_date = EXCLUDED.source_start_date,
+        source_end_date = EXCLUDED.source_end_date,
+        row_count = EXCLUDED.row_count,
+        valid_from = CURRENT_TIMESTAMP,
+        valid_to = NULL,
+        is_current = TRUE,
+        supersedes_load_id = EXCLUDED.supersedes_load_id
     """,
 ]
 
@@ -237,6 +247,19 @@ SELECT
                   stage.fee)
     )
 FROM linkaja_raw_stage AS stage
+ON CONFLICT (load_id, source_row_number) DO UPDATE SET
+    source_file = EXCLUDED.source_file,
+    source_row_hash = EXCLUDED.source_row_hash,
+    transaction_id = EXCLUDED.transaction_id,
+    original_transaction_id = EXCLUDED.original_transaction_id,
+    finalized_date = EXCLUDED.finalized_date,
+    finalized_time = EXCLUDED.finalized_time,
+    transaction_scenario = EXCLUDED.transaction_scenario,
+    transaction_status = EXCLUDED.transaction_status,
+    debit = EXCLUDED.debit,
+    credit = EXCLUDED.credit,
+    balance = EXCLUDED.balance,
+    fee = EXCLUDED.fee
 """
 
 
