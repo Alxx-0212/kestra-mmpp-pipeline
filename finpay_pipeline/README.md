@@ -38,10 +38,123 @@ shims for older callers; new Kestra code imports `finpay_pipeline` directly.
 
 ### Current Invocation And Inputs
 
-Despite `daily` in the flow ID, the active workflow has no Kestra trigger or
-schedule. An operator or API client starts it and supplies the file. Website
-scraping, Hermes, and the existing external acquisition cron are outside this
-workflow; this flow begins at the immutable uploaded file boundary.
+Despite `daily` in the flow ID, the reporting flow has no Kestra trigger or
+schedule. An operator or API client can start it with an uploaded file. The
+separate `finpay_digipos_acquisition_v1` parent flow can acquire the six daily
+exports in Kestra and call this reporting flow sequentially as subflows; the
+reporting flow still begins at the immutable `FILE` boundary. A 05:00
+Asia/Makassar daily schedule is defined on the acquisition flow but is
+`disabled: true`; it remains manual until explicitly activated in production.
+
+### Kestra DigiPOS acquisition flow
+
+The acquisition flow is:
+
+```text
+finance.finpay.finpay_digipos_acquisition_v1
+```
+
+Build its browser runtime from repository root after building/releasing the flow
+image:
+
+```bash
+docker build -f finpay_pipeline/Dockerfile.digipos-scraper \
+  -t finpay-digipos-scraper:1.0 .
+```
+
+It runs Chromium/Playwright in a dedicated `finpay-digipos-scraper:1.0` image,
+downloads and validates all six DigiPOS `Riwayat Saldo Transaksi` XLSX exports
+for one report date, persists them as Kestra artifacts, then calls
+`finpay_daily_pipeline_v5` once per cluster in fixed order. The all-cluster
+scrape/validation task is a barrier: if any account fails or any export count,
+header, date, or `Nomor RS` validation fails, no daily reporting subflow starts.
+
+Required Kestra secret:
+
+```text
+DIGIPOS_PASSWORD
+```
+
+Set this to the **rotated** DigiPOS credential; do not copy credentials from a
+scraper script, pass them in inputs/CLI arguments, or log them. The legacy
+standalone scraper skill has a historical credential exposure and must not be
+used as the Kestra runtime. Rotate that credential before enabling this flow.
+
+Inputs:
+
+| Input | Type | Required | Default | Meaning |
+|---|---|---:|---|---|
+| `report_date` | STRING | yes | - | One business date in `YYYY-MM-DD`, interpreted in Asia/Makassar. |
+| `dry_run` | BOOLEAN | no | `true` | Scrape and validate, then invoke daily v5 without normal DB/Sheet effects. |
+| `write_gsheet` | BOOLEAN | no | `true` | Pass through to each daily v5 subflow. |
+| `send_telegram` | BOOLEAN | no | `true` | Pass through unusual Telegram alert preference to each daily v5 subflow. |
+
+The flow is manually triggered through the Kestra execution API while its
+schedule is disabled. When enabled, it runs at 05:00 Asia/Makassar and sets
+`report_date` to the previous local calendar day (for example, Sep 28 runs Sep
+27). The scraper task uses host networking for DigiPOS
+egress; production must permit this or provide an approved egress network/proxy.
+The child daily flow waits for each prior execution and propagates failures.
+Re-running the same date re-downloads the six files and relies on the existing
+daily `cluster_id + report_date` idempotency contract. The schedule starts in
+production mode (`dry_run=false`) with Google Sheets writes enabled.
+
+The Kestra server must have the acquisition YAML deployed and the
+`finpay-digipos-scraper:1.0` image available to its Docker task runner. The image
+is a large Playwright/Chromium image; build it in an egress-enabled build
+environment and publish/load it where Kestra's Docker runner can pull it. The
+local simulation built the image and completed a real DigiPOS portal canary.
+
+Dry-run canary:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --user "$KESTRA_USER:$KESTRA_PASSWORD" \
+  -X POST \
+  -F "report_date=2026-09-27" \
+  -F "dry_run=true" \
+  -F "write_gsheet=false" \
+  -F "send_telegram=false" \
+  "$KESTRA_URL/api/v1/$KESTRA_TENANT/executions/finance.finpay/finpay_digipos_acquisition_v1"
+```
+
+Use `dry_run=false` only after checking the six XLSX artifacts and manifest.
+Poll the parent execution to a terminal `SUCCESS`; its six child daily-flow
+executions are sequential and surfaced as subflow task state/outputs.
+
+### Local E2E result (2026-09-28)
+
+The complete scraper-to-daily-reporting flow was run for the last completed
+business date, `2026-09-27`, with `dry_run=false`, Google Sheets enabled, and
+Telegram alerts disabled.
+
+| Cluster | Validated XLSX rows | Daily child state | Summary tab |
+|---|---:|---|---|
+| `411311` | 548 | `SUCCESS` | `PKY` |
+| `421306` | 2,779 | `SUCCESS` | `MRT` |
+| `421307` | 2,412 | `SUCCESS` | `TDR` |
+| `421315` | 904 | `SUCCESS` | `BGI` |
+| `421318` | 424 | `SUCCESS` | `MRW` |
+| `421320` | 1,908 | `SUCCESS` | `TNT` |
+| **Total** | **8,975** | **6/6 succeeded** | - |
+
+All six exports passed header/schema, exact DataTables/XLSX row-count, requested
+date, and `Nomor RS` validation before any child flow started. PostgreSQL source,
+raw, and summary rows were persisted for all six clusters. Google Sheet summary
+writes succeeded in `Salinan dari Monitoring Finpay & LinkAja`; unusual tabs were
+updated with zero rows, and QRISDUWIT/Reversal tabs were cleared for the date
+because those categories had no rows.
+
+The separate August monthly simulation was also written to PostgreSQL and
+Google Sheets. FinPay cluster `411311` is `FINAL` in the simulation with 31
+report days, a 48-day reversal evidence window, and zero unresolved reversals.
+LinkAja has six August monthly worksheets with 878 unresolved reversals total;
+they are marked `PUBLISHED WITH EXCEPTIONS - REVIEW REQUIRED`, not Odoo-final.
+
+These writes used the local simulation stack and the copied monitoring
+spreadsheet, not production. The Kestra `DIGIPOS_PASSWORD` key was configured
+and the portal login succeeded; its value was not read. Rotate the credential
+exposed by the legacy scraper before production enablement.
 
 | Input | Type | Default | Contract |
 |---|---|---|---|

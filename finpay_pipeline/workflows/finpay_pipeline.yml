@@ -1118,6 +1118,7 @@ tasks:
 errors:
   - id: notify_on_failure
     type: io.kestra.plugin.core.http.Request
+    runIf: "{{ inputs.dry_run == false and inputs.send_telegram }}"
     uri: "https://api.telegram.org/bot{{ secret('TELEGRAM_BOT_TOKEN') }}/sendMessage"
     method: POST
     contentType: multipart/form-data

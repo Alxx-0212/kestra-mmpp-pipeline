@@ -227,6 +227,12 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                 self.assertIn("runIf:", task_block)
                 self.assertIn("inputs.dry_run == false", task_block)
 
+    def test_failure_notification_is_disabled_for_dry_run_or_opt_out(self):
+        task_block = _task_block(_workflow_text(), "notify_on_failure")
+        self.assertIn("runIf:", task_block)
+        self.assertIn("inputs.dry_run == false", task_block)
+        self.assertIn("inputs.send_telegram", task_block)
+
     def test_summary_upload_passes_explicit_report_date(self):
         task_block = _task_block(_workflow_text(), "upload_to_sheets")
         self.assertIn("REPORT_DATE:", task_block)

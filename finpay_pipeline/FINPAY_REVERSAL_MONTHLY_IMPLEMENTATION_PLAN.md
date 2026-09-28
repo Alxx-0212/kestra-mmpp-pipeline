@@ -551,6 +551,35 @@ spreadsheet copy. They are not production deployment or Finance approval. The
 local Google writer tasks use host networking because Google egress from
 `mmpp-finance-network` timed out while host-network OAuth/Sheets calls succeeded.
 
+## 22. 2026-09-28 DigiPOS Kestra Acquisition E2E
+
+The manually triggered `finance.finpay.finpay_digipos_acquisition_v1` flow was
+run for the last completed day, `2026-09-27`, with `dry_run=false`,
+`write_gsheet=true`, and `send_telegram=false`.
+
+| Cluster | XLSX/DataTables rows | v5 child state | Daily summary tab |
+|---|---:|---|---|
+| `411311` | 548 | `SUCCESS` | `PKY` |
+| `421306` | 2,779 | `SUCCESS` | `MRT` |
+| `421307` | 2,412 | `SUCCESS` | `TDR` |
+| `421315` | 904 | `SUCCESS` | `BGI` |
+| `421318` | 424 | `SUCCESS` | `MRW` |
+| `421320` | 1,908 | `SUCCESS` | `TNT` |
+
+All six exports passed header/schema, exact DataTables row-count, requested-date,
+and `Nomor RS` integrity checks before any daily child started. All six child
+flows completed; PostgreSQL source manifests/raw/summary rows were written for
+each cluster. Google Sheet tasks completed for the summaries, unusual tabs, and
+empty QRISDUWIT/reversal tabs. The parent used Kestra-stored XLSX artifacts and
+preserved each canonical source filename.
+
+The full run used the local simulation Kestra/PostgreSQL stack and the copied
+spreadsheet `Salinan dari Monitoring Finpay & LinkAja`; it is not a production
+deployment. The rotated `DIGIPOS_PASSWORD` secret was available in local Kestra,
+but its value was not read or logged. Before production cutover, rotate/remove
+the credential exposed by the legacy scraper, publish the browser image to the
+production task runner's registry, and confirm its approved DigiPOS egress path.
+
 ## 14. P0 Hardening Implementation Plan
 
 P0 is the work required before a monthly result can be treated as an

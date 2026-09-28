@@ -1,0 +1,174 @@
+id: finpay_digipos_acquisition_v1
+namespace: finance.finpay
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: report_date
+    type: STRING
+    displayName: "DigiPOS report date"
+    description: "One business date in YYYY-MM-DD, interpreted as Asia/Makassar."
+    required: true
+
+  - id: dry_run
+    type: BOOLEAN
+    displayName: "Dry run reporting flows?"
+    description: "Scrape and validate all six XLSX files, then invoke daily v5 in dry-run mode."
+    defaults: true
+
+  - id: write_gsheet
+    type: BOOLEAN
+    displayName: "Write Google Sheets?"
+    defaults: true
+
+  - id: send_telegram
+    type: BOOLEAN
+    displayName: "Send unusual Telegram alerts?"
+    defaults: true
+
+triggers:
+  - id: daily_reconciliation_0500_wita
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 5 * * *"
+    timezone: Asia/Makassar
+    disabled: true
+    inputs:
+      report_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+      dry_run: false
+      write_gsheet: true
+      send_telegram: true
+
+tasks:
+  - id: scrape_and_validate_all_clusters
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-digipos-scraper:1.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    pythonVersion: "3.12"
+    timeout: PT2H
+    env:
+      DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+      REPORT_DATE: "{{ inputs.report_date }}"
+    outputFiles:
+      - "411311.xlsx"
+      - "421306.xlsx"
+      - "421307.xlsx"
+      - "421315.xlsx"
+      - "421318.xlsx"
+      - "421320.xlsx"
+      - "digipos_manifest.json"
+    script: |
+      import json
+      import os
+      import sys
+      from kestra import Kestra
+
+      sys.path.insert(0, "/app")
+      from digipos_scraper import scrape_all_clusters
+
+      password = os.environ.get("DIGIPOS_PASSWORD", "")
+      if not password:
+          raise ValueError("Kestra secret DIGIPOS_PASSWORD is required")
+
+      manifest = scrape_all_clusters(
+          report_date=os.environ["REPORT_DATE"],
+          password=password,
+          output_dir=os.getcwd(),
+          max_attempts=5,
+      )
+      with open("digipos_manifest.json", "w", encoding="utf-8") as handle:
+          json.dump(manifest, handle, indent=2)
+
+      outputs = {
+          "report_date": manifest["report_date"],
+          "validated_clusters": len(manifest["files"]),
+      }
+      for item in manifest["files"]:
+          outputs[f"filename_{item['cluster_id']}"] = item["filename"]
+          outputs[f"rows_{item['cluster_id']}"] = item["row_count"]
+          outputs[f"sha256_{item['cluster_id']}"] = item["sha256"]
+      print(f"Validated complete daily acquisition: {len(manifest['files'])} clusters")
+      for item in manifest["files"]:
+          print(f"cluster={item['cluster_id']} rows={item['row_count']}")
+      Kestra.outputs(outputs)
+
+  - id: process_411311_daily
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_daily_pipeline_v5
+    wait: true
+    transmitFailed: true
+    inputs:
+      csv_file: "{{ outputs.scrape_and_validate_all_clusters.outputFiles['411311.xlsx'] }}"
+      source_filename: "{{ outputs.scrape_and_validate_all_clusters.vars.filename_411311 }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"
+      send_telegram: "{{ inputs.send_telegram }}"
+
+  - id: process_421306_daily
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_daily_pipeline_v5
+    wait: true
+    transmitFailed: true
+    inputs:
+      csv_file: "{{ outputs.scrape_and_validate_all_clusters.outputFiles['421306.xlsx'] }}"
+      source_filename: "{{ outputs.scrape_and_validate_all_clusters.vars.filename_421306 }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"
+      send_telegram: "{{ inputs.send_telegram }}"
+
+  - id: process_421307_daily
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_daily_pipeline_v5
+    wait: true
+    transmitFailed: true
+    inputs:
+      csv_file: "{{ outputs.scrape_and_validate_all_clusters.outputFiles['421307.xlsx'] }}"
+      source_filename: "{{ outputs.scrape_and_validate_all_clusters.vars.filename_421307 }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"
+      send_telegram: "{{ inputs.send_telegram }}"
+
+  - id: process_421315_daily
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_daily_pipeline_v5
+    wait: true
+    transmitFailed: true
+    inputs:
+      csv_file: "{{ outputs.scrape_and_validate_all_clusters.outputFiles['421315.xlsx'] }}"
+      source_filename: "{{ outputs.scrape_and_validate_all_clusters.vars.filename_421315 }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"
+      send_telegram: "{{ inputs.send_telegram }}"
+
+  - id: process_421318_daily
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_daily_pipeline_v5
+    wait: true
+    transmitFailed: true
+    inputs:
+      csv_file: "{{ outputs.scrape_and_validate_all_clusters.outputFiles['421318.xlsx'] }}"
+      source_filename: "{{ outputs.scrape_and_validate_all_clusters.vars.filename_421318 }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"
+      send_telegram: "{{ inputs.send_telegram }}"
+
+  - id: process_421320_daily
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_daily_pipeline_v5
+    wait: true
+    transmitFailed: true
+    inputs:
+      csv_file: "{{ outputs.scrape_and_validate_all_clusters.outputFiles['421320.xlsx'] }}"
+      source_filename: "{{ outputs.scrape_and_validate_all_clusters.vars.filename_421320 }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"
+      send_telegram: "{{ inputs.send_telegram }}"

@@ -1,0 +1,13 @@
+FROM mcr.microsoft.com/playwright/python:v1.58.0-noble
+
+ENV PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /app
+
+COPY finpay_pipeline/requirements-digipos-scraper.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY finpay_pipeline/digipos_scraper.py ./digipos_scraper.py
+
+CMD ["python", "-c", "print('finpay-digipos-scraper image ready')"]

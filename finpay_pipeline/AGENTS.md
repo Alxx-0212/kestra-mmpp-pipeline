@@ -102,24 +102,29 @@ handoff and let the integrating agent coordinate the FinPay-side formula change.
 Run FinPay checks with Python 3.11 and dependencies from `requirements.txt`:
 
 ```bash
-python3 -m compileall -q pipeline.py pipeline_refactored.py finpay_pipeline tests/test_refactor_contracts.py tests/test_finpay_workflow_contracts.py
-python3 -m unittest -v tests.test_finpay_workflow_contracts
-python3 -m unittest -v tests.test_refactor_contracts
+python3 -m compileall -q finpay_pipeline
+python3 -m unittest -v finpay_pipeline.tests.test_finpay_digipos_acquisition_contract
+python3 -m unittest -v finpay_pipeline.tests.test_digipos_scraper
+python3 -m unittest -v finpay_pipeline.tests.test_finpay_workflow_contracts
+python3 -m unittest -v finpay_pipeline.tests.test_refactor_contracts
 git diff --check
 git diff --cached --check
 ```
 
 Do not report the FinPay suite as passing when imports failed or all relevant
 tests were skipped. When workflow imports change, verify every
-`from pipeline import ...` symbol in the YAML is exported by
-`finpay_pipeline/__init__.py` and validate the flow against the deployed Kestra
+`from finpay_pipeline import ...` symbol in the YAML is exported by
+`finpay_pipeline/__init__.py` and validate both the acquisition and reporting
+flows against the deployed Kestra
 version. Use the root `config/kestra-validation.yml` for the pinned local
 validation command documented in the root and FinPay README files.
 
 ## Kestra API Trigger Guide
 
-FinPay flows are manual. They have no schedule trigger and are executed through
-the Kestra API.
+The reporting flow is manually callable. The DigiPOS acquisition parent also
+has a 05:00 Asia/Makassar schedule definition, but it is `disabled: true` and
+must remain inactive until an operator enables it in production. The acquisition
+flow can also be run manually through the Kestra API/UI.
 
 Set credentials in the calling shell without printing them:
 
@@ -184,6 +189,93 @@ curl --fail-with-body --silent --show-error \
 
 Use `write_gsheet=false` only for an isolated database replay. Submit the next
 chronological file after the previous execution reaches `SUCCESS`.
+
+### DigiPOS acquisition parent flow
+
+Flow:
+
+```text
+finance.finpay.finpay_digipos_acquisition_v1
+```
+
+This flow scrapes all six configured DigiPOS accounts for one date, validates
+all six XLSX exports, then calls daily v5 in order. It is a complete-day barrier:
+if any account/export fails validation, no daily child starts.
+
+Inputs:
+
+| Input | Type | Required | Default | Meaning |
+|---|---|---:|---|---|
+| `report_date` | STRING | yes | - | Business date in `YYYY-MM-DD`, Asia/Makassar. |
+| `dry_run` | BOOLEAN | no | `true` | Scrape and validate, then call daily v5 with DB/Sheet writes disabled. |
+| `write_gsheet` | BOOLEAN | no | `true` | Pass through to all six daily executions. |
+| `send_telegram` | BOOLEAN | no | `true` | Pass through unusual-alert preference to daily v5. |
+
+The acquisition flow declares this inactive schedule:
+
+```yaml
+cron: "0 5 * * *"
+timezone: Asia/Makassar
+disabled: true
+inputs:
+  report_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+  dry_run: false
+  write_gsheet: true
+  send_telegram: true
+```
+
+Thus a 05:00 run on Sep 28 assigns `report_date=2026-09-27`. The `disabled`
+flag is intentional. Do not activate it until the production browser image,
+rotated Kestra secret, task-runner egress, and server boot/restart configuration
+have been verified.
+
+The browser flow requires the Kestra secret `DIGIPOS_PASSWORD`; never add the
+credential to workflow YAML, script arguments, artifacts, or logs. The historical
+standalone scraper skill contains a credential exposure: rotate that credential
+and remove it from the legacy script before production enablement. The Kestra
+image is built separately:
+
+```bash
+docker build -f finpay_pipeline/Dockerfile.digipos-scraper \
+  -t finpay-digipos-scraper:1.0 .
+```
+
+Deploy the acquisition flow YAML to the target Kestra tenant after the scraper
+image is available to its Docker task runner:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --user "$KESTRA_USER:$KESTRA_PASSWORD" \
+  -X POST \
+  -H 'Content-Type: application/x-yaml' \
+  --data-binary @finpay_digipos_acquisition.yml \
+  "$KESTRA_URL/api/v1/$KESTRA_TENANT/flows"
+```
+
+For an existing flow ID, use
+`PUT /api/v1/{tenant}/flows/{namespace}/{flow_id}` instead of `POST /flows`.
+
+Trigger a safe canary:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --user "$KESTRA_USER:$KESTRA_PASSWORD" \
+  -X POST \
+  -F "report_date=2026-09-27" \
+  -F "dry_run=true" \
+  -F "write_gsheet=false" \
+  -F "send_telegram=false" \
+  "$KESTRA_URL/api/v1/$KESTRA_TENANT/executions/finance.finpay/finpay_digipos_acquisition_v1"
+```
+
+For production, keep the schedule disabled during canary. Set `dry_run=false`
+only after inspecting all six XLSX artifacts and `digipos_manifest.json`. Poll
+the parent until `SUCCESS`; each child is a waiting Subflow to
+`finpay_daily_pipeline_v5`. The browser task uses host network access for
+DigiPOS; confirm production task-runner policy or provide an approved egress
+network/proxy. After production commissioning, an operator may explicitly
+enable the schedule in Kestra or remove `disabled: true` in a reviewed config
+change.
 
 ### Production daily backfill gate
 
