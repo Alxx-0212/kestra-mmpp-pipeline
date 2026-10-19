@@ -3,6 +3,8 @@
 # Single PostgreSQL instance hosting: kestra, finpay, finpay_txn, linkaja
 # Secret management: Docker Secrets (files in ./secrets/)
 
+name: ${COMPOSE_PROJECT_NAME:-mmpp-finpay-${USER:-deployment}}
+
 services:
   # Single PostgreSQL instance hosting all project databases
   # - kestra:      Kestra metadata (workflows, executions, queue)
@@ -42,7 +44,7 @@ services:
       GRIST_DB_PASSWORD_FILE: /run/secrets/grist_db_password
       FINPAY_READONLY_PASSWORD_FILE: /run/secrets/finpay_readonly_password
     ports:
-      - "5433:5432"
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_HOST_PORT:-15433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       interval: 30s
@@ -59,6 +61,7 @@ services:
 
   # Idempotent Top-Up schema/foundation setup. It never imports legacy rows.
   finpay-topup-db-init:
+    profiles: ["finpay-topup"]
     build:
       context: .
       dockerfile: finpay_topup_pipeline/Dockerfile
@@ -157,7 +160,7 @@ services:
     volumes:
       - kestra-data:/app/storage
       - /var/run/docker.sock:/var/run/docker.sock
-      - /tmp/kestra-wd:/tmp/kestra-wd
+      - ${KESTRA_TASK_WORKDIR:-${PWD}/tmp/kestra-wd}:${KESTRA_TASK_WORKDIR:-${PWD}/tmp/kestra-wd}
     env_file:
       - .env_encoded
     environment:
@@ -174,6 +177,7 @@ services:
             type: env
           server:
             basic-auth:
+              enabled: true
               username: ${KESTRA_BASIC_AUTH_USERNAME}
               password: ${KESTRA_BASIC_AUTH_PASSWORD}
           repository:
@@ -186,26 +190,26 @@ services:
             type: postgres
           tasks:
             tmp-dir:
-              path: /tmp/kestra-wd/tmp
+              path: ${KESTRA_TASK_WORKDIR:-${PWD}/tmp/kestra-wd}/tmp
             python:
               version: "3.11"
-          url: http://localhost:8081/
+          url: ${KESTRA_EXTERNAL_URL:-http://localhost:18081/}
           
           plugins:
             configurations:
               - type: io.kestra.plugin.scripts.runner.docker.Docker
                 values:
                   volumeEnabled: true
-                  networkMode: mmpp-finance-network
+                  networkMode: ${COMPOSE_PROJECT_NAME:-mmpp-finpay-${USER:-deployment}}_mmpp-finance-network
               - type: io.kestra.plugin.core.trigger.Schedule
                 values:
                   recoverMissedSchedules: NONE
     ports:
-      - "8081:8080"
+      - "${KESTRA_BIND_ADDRESS:-127.0.0.1}:${KESTRA_HOST_PORT:-18081}:8080"
     depends_on:
       postgres:
         condition: service_healthy
-      finpay-topup-db-init:
+      finpay-db-provision:
         condition: service_completed_successfully
     secrets:
       - kestra_basic_auth_password
@@ -215,6 +219,7 @@ services:
   # idempotent and creates no execution; it closes the clean-volume gap where
   # Kestra starts with only tutorial flows loaded.
   finpay-topup-flow-deploy:
+    profiles: ["finpay-topup"]
     image: kestra/kestra:v1.3.26
     pull_policy: if_not_present
     restart: "no"
@@ -237,6 +242,42 @@ services:
           --server=http://kestra:8080 \
           --user="$${KESTRA_BASIC_AUTH_USERNAME}:$${password}"
         echo "event=finpay_topup_flow_deploy status=success"
+    depends_on:
+      kestra:
+        condition: service_started
+    secrets:
+      - kestra_basic_auth_password
+
+  # Deploy only the active reporting workflows; Top-Up deployment is separately
+  # gated by the finpay-topup profile.
+  finpay-reporting-flow-deploy:
+    profiles: ["flow-deploy"]
+    image: kestra/kestra:v1.3.26
+    pull_policy: if_not_present
+    restart: "no"
+    user: "0:0"
+    networks:
+      - mmpp-finance-network
+    volumes:
+      - ./finpay_pipeline/workflows:/flows/finpay:ro
+      - ./linkaja_fee_pipeline/workflows:/flows/linkaja:ro
+    environment:
+      KESTRA_BASIC_AUTH_USERNAME: ${KESTRA_BASIC_AUTH_USERNAME}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        password="$$(tr -d '\r\n' < /run/secrets/kestra_basic_auth_password)"
+        until curl --fail --silent \
+          --user "$${KESTRA_BASIC_AUTH_USERNAME}:$${password}" \
+          http://kestra:8080/api/v1/configs >/dev/null; do sleep 2; done
+        /app/kestra flow updates /flows/finpay --no-delete --namespace=finance.finpay \
+          --server=http://kestra:8080 \
+          --user="$${KESTRA_BASIC_AUTH_USERNAME}:$${password}"
+        /app/kestra flow updates /flows/linkaja --no-delete --namespace=finance.linkaja \
+          --server=http://kestra:8080 \
+          --user="$${KESTRA_BASIC_AUTH_USERNAME}:$${password}"
+        echo "event=reporting_flow_deploy status=success"
     depends_on:
       kestra:
         condition: service_started
@@ -272,7 +313,7 @@ services:
       SUPERSET_ADMIN_LASTNAME: ${SUPERSET_ADMIN_LASTNAME:-Admin}
       # Security
       ENABLE_PROXY_FIX: "true"
-      SUPERSET_WEBSERVER_ADDRESS: ${SUPERSET_WEBSERVER_ADDRESS:-http://localhost:8088}
+      SUPERSET_WEBSERVER_ADDRESS: ${SUPERSET_WEBSERVER_ADDRESS:-http://localhost:18088}
       WEBDRIVER_BASEURL: ${WEBDRIVER_BASEURL:-http://superset:8088/}
       # Metadata DB (PostgreSQL) - base URI without password (will be constructed at runtime)
       SQLALCHEMY_DATABASE_URI: postgresql://${SUPERSET_DB_USER}:@postgres:5432/${SUPERSET_DB_NAME}
@@ -319,7 +360,7 @@ services:
           --limit-request-field_size 0 \
           "superset.app:create_app()"
     ports:
-      - "8088:8088"
+      - "${SUPERSET_BIND_ADDRESS:-127.0.0.1}:${SUPERSET_HOST_PORT:-18088}:8088"
     depends_on:
       postgres:
         condition: service_healthy
@@ -408,7 +449,7 @@ services:
       - DATABASE_URL=postgresql://${GRIST_DB_USER:-grist}:${GRIST_DB_PASSWORD:-}@postgres:5432/${GRIST_DB_NAME:-grist}
     command: ./sandbox/run.sh
     ports:
-      - "8484:8484"
+      - "${GRIST_BIND_ADDRESS:-127.0.0.1}:${GRIST_HOST_PORT:-18484}:8484"
     depends_on:
       postgres:
         condition: service_healthy
@@ -424,6 +465,7 @@ services:
   #  - setWebhook must pass the same secret as telegram_webhook_secret
   # ─────────────────────────────────────────────────────────────────
   telegram-bot:
+    profiles: ["finpay-topup"]
     build:
       context: .
       dockerfile: services/telegram_bot/Dockerfile
@@ -460,7 +502,7 @@ services:
       TELEGRAM_REFRESH_COOLDOWN_SECONDS: ${TELEGRAM_REFRESH_COOLDOWN_SECONDS:-600}
       TELEGRAM_SELECTIVE_REFRESH_ENABLED: ${TELEGRAM_SELECTIVE_REFRESH_ENABLED:-true}
     ports:
-      - "8096:8096"
+      - "${TELEGRAM_BIND_ADDRESS:-127.0.0.1}:${TELEGRAM_HOST_PORT:-18096}:8096"
     depends_on:
       postgres:
         condition: service_healthy
@@ -481,6 +523,7 @@ services:
       - telegram_webhook_secret
 
   ngrok:
+    profiles: ["finpay-topup"]
     # Explicit version tag; use a versioned image rather than a digest here.
     image: ngrok/ngrok:3.39.8-debian
     restart: unless-stopped
@@ -490,7 +533,7 @@ services:
     networks:
       - mmpp-finance-network
     ports:
-      - "4041:4040"
+      - "${NGROK_BIND_ADDRESS:-127.0.0.1}:${NGROK_HOST_PORT:-14041}:4040"
     environment:
       NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
     depends_on:
@@ -500,6 +543,7 @@ services:
   # Register the account-assigned ngrok dev domain once; it remains stable
   # across connector restarts and does not require log parsing.
   telegram-webhook-register:
+    profiles: ["finpay-topup"]
     image: curlimages/curl:8.11.1
     user: "0:0"
     restart: "no"
@@ -563,7 +607,7 @@ volumes:
 
 networks:
   mmpp-finance-network:
-    name: mmpp-finance-network
+    name: ${COMPOSE_PROJECT_NAME:-mmpp-finpay-${USER:-deployment}}_mmpp-finance-network
     driver: bridge
 
 secrets:

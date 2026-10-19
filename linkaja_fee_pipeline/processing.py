@@ -315,9 +315,16 @@ def _decimal_text(
     *,
     blank_is_null: bool = False,
 ) -> str:
-    if blank_is_null and not str(value or "").strip():
-        return ""
-    return format(parse_amount(value, source_name, row_number, column), "f")
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return "" if blank_is_null else "0"
+    amount = parse_amount(value, source_name, row_number, column)
+    # Legacy parsing maps NaN to zero; strict source evidence must reject it.
+    if text.lower() == "nan" or not amount.is_finite():
+        raise ValueError(
+            f"{source_name}:{row_number}: non-finite {column} value {value!r}"
+        )
+    return format(amount, "f")
 
 
 def _source_cluster_id(value: Any) -> str | None:

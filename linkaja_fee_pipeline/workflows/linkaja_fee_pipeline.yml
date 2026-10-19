@@ -36,7 +36,6 @@
       containerImage: linkaja-fee-pipeline:3.11
       taskRunner:
         type: io.kestra.plugin.scripts.runner.docker.Docker
-        networkMode: mmpp-finance-network
       pythonVersion: "3.11"
       timeout: PT10M
       inputFiles:
@@ -92,7 +91,6 @@
       containerImage: linkaja-fee-pipeline:3.11
       taskRunner:
         type: io.kestra.plugin.scripts.runner.docker.Docker
-        networkMode: mmpp-finance-network
       pythonVersion: "3.11"
       timeout: PT15M
       retry:

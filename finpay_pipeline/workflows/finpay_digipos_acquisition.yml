@@ -28,6 +28,14 @@ inputs:
     displayName: "Send unusual Telegram alerts?"
     defaults: true
 
+  - id: scrape_workers
+    type: INT
+    displayName: "Parallel scraping workers"
+    description: "Concurrent DigiPOS accounts; reporting and Google Sheets writes stay sequential. Set 1 for serial scraping."
+    defaults: 3
+    min: 1
+    max: 6
+
 triggers:
   - id: daily_reconciliation_0500_wita
     type: io.kestra.plugin.core.trigger.Schedule
@@ -52,6 +60,7 @@ tasks:
     env:
       DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
       REPORT_DATE: "{{ inputs.report_date }}"
+      SCRAPE_WORKERS: "{{ inputs.scrape_workers }}"
     outputFiles:
       - "411311.xlsx"
       - "421306.xlsx"
@@ -78,6 +87,7 @@ tasks:
           password=password,
           output_dir=os.getcwd(),
           max_attempts=5,
+          max_workers=int(os.environ["SCRAPE_WORKERS"]),
       )
       with open("digipos_manifest.json", "w", encoding="utf-8") as handle:
           json.dump(manifest, handle, indent=2)

@@ -1,4 +1,7 @@
 import re
+import json
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -7,6 +10,31 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RepositorySetupContractTest(unittest.TestCase):
+    def test_pinned_kestra_explicitly_enables_configured_basic_auth(self):
+        compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertTrue(
+            re.search(r"basic-auth:\s*\n\s+enabled: true\s*\n\s+username:", compose),
+            "Pinned Kestra basic auth must explicitly enable the configured account",
+        )
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose is required for the resolved mount check")
+    def test_resolved_kestra_task_workdir_matches_host_bind_path(self):
+        result = subprocess.run(
+            ["docker", "compose", "config", "--no-env-resolution", "--format", "json"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        kestra = json.loads(result.stdout)["services"]["kestra"]
+        workdir = next(
+            mount for mount in kestra["volumes"]
+            if mount["type"] == "bind" and mount["target"] != "/var/run/docker.sock"
+        )
+        self.assertEqual(workdir["source"], workdir["target"])
+        config = kestra["environment"]["KESTRA_CONFIGURATION"]
+        self.assertIn(f"path: {workdir['target']}/tmp", config)
+
     def test_docker_context_excludes_sensitive_and_large_local_state(self):
         patterns = {
             line.strip()
@@ -170,30 +198,39 @@ class RepositorySetupContractTest(unittest.TestCase):
         self.assertNotIn("FINPAY_DB_PASSWORD", config)
         self.assertNotIn("basic-auth", config)
 
-    def test_initdb_resolves_custom_docker_secret_files(self):
-        script = (
+    def test_provisioner_resolves_project_secrets_after_postgres_is_healthy(self):
+        init_script = (
             REPOSITORY_ROOT / "docker" / "initdb" / "00-create-databases.sh"
         ).read_text(encoding="utf-8")
-        for value_name in (
-            "FINPAY_DB_PASSWORD",
-            "FINPAY_TXN_DB_PASSWORD",
-            "SUPERSET_DB_PASSWORD",
-            "LINKAJA_DB_PASSWORD",
-            "GRIST_DB_PASSWORD",
-            "FINPAY_READONLY_PASSWORD",
+        script = (
+            REPOSITORY_ROOT / "docker" / "provision" / "01-provision-databases.sh"
+        ).read_text(encoding="utf-8")
+        compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        provisioner = compose.split("  finpay-db-provision:", 1)[1].split("  kestra:", 1)[0]
+        self.assertIn("condition: service_healthy", provisioner)
+        self.assertNotIn("/run/secrets/", init_script)
+        for secret in (
+            "finpay_db_password",
+            "finpay_txn_db_password",
+            "superset_db_password",
+            "linkaja_db_password",
+            "grist_db_password",
+            "finpay_readonly_password",
         ):
-            with self.subTest(secret=value_name):
-                self.assertIn(
-                    f"resolve_secret {value_name} {value_name}_FILE",
-                    script,
-                )
+            with self.subTest(secret=secret):
+                self.assertIn(f"read_secret /run/secrets/{secret}", script)
 
     def test_documented_kestra_port_matches_compose_host_port(self):
         compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text(
             encoding="utf-8"
         )
         readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
-        match = re.search(r'^\s*- "(\d+):8080"\s*$', compose, re.MULTILINE)
+        match = re.search(
+            r'^\s*- "\$\{KESTRA_BIND_ADDRESS:-[^}]+\}:'
+            r'\$\{KESTRA_HOST_PORT:-(\d+)\}:8080"\s*$',
+            compose,
+            re.MULTILINE,
+        )
         self.assertIsNotNone(match)
         self.assertIn(f"http://localhost:{match.group(1)}", readme)
 

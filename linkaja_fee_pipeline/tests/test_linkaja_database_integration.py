@@ -1,10 +1,12 @@
 import csv
+import json
 import os
 import tempfile
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from linkaja_fee_pipeline.database import (
     materialize_linkaja_month,
@@ -15,6 +17,8 @@ from linkaja_fee_pipeline.processing import (
     LINKAJA_SOURCE_COLUMNS,
     normalize_linkaja_csv,
 )
+from linkaja_fee_pipeline.sheets import DETAIL_SECTION_LABEL, _merge_detail_summary_values
+from linkaja_fee_pipeline.tests.test_linkaja_monthly_artifacts import execute_monthly_task
 
 
 TEST_DSN = os.environ.get("LINKAJA_TEST_DSN", "").strip()
@@ -62,7 +66,8 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
             with connection.cursor() as cursor:
                 cursor.execute(
                     "TRUNCATE linkaja_transactions, linkaja_monthly_refreshes, "
-                    "linkaja_raw_transactions"
+                    "linkaja_raw_transactions, linkaja_source_loads, "
+                    "linkaja_ledger_versions, linkaja_monthly_impacts"
                 )
 
     @staticmethod
@@ -108,6 +113,136 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
                 manifest.to_json_dict(),
                 TEST_DSN,
             )
+
+    def test_corrected_date_rerun_retains_old_date_after_post_commit_failure(self):
+        original = self._row(**{
+            "Transaction ID": "MOVED-TX",
+            "Finalized Date": "01/07/2026",
+            "Transaction Scenario": "Digipos B2B Transfer",
+        })
+        first = self._persist([original], "laporan-123456-moved.csv", "moved-original")
+        old_sheet, _ = _merge_detail_summary_values([], first["detail_rows"], first["report_dates"])
+        self.assertTrue(any(row[0] == "01/07/2026" and row[2] == "Digipos B2B Transfer"
+                            and row[3] == 200 for row in old_sheet[1:]))
+        corrected = {**original, "Finalized Date": "02/07/2026"}
+        correction = self._persist([corrected], "laporan-123456-moved.csv", "moved-correction")
+        self.assertEqual(correction["report_dates"], ["01/07/2026", "02/07/2026"])
+
+        # The DB commit succeeded, but rendering/artifact delivery did not update the old sheet.
+        for load_id in ("moved-correction", "moved-retry"):
+            with self.subTest(load_id=load_id):
+                retry = self._persist([corrected], "laporan-123456-moved.csv", load_id)
+                self.assertEqual(retry["report_dates"], ["01/07/2026", "02/07/2026"])
+                self.assertEqual(
+                    [(row["REPORT DATE"], row["TOTAL FEE"], row["SOURCE ROWS"]) for row in retry["fee_rows"]],
+                    [("01/07/2026", 0, 0), ("02/07/2026", 200, 1)],
+                )
+                refreshed, _ = _merge_detail_summary_values(
+                    old_sheet, retry["detail_rows"], retry["report_dates"]
+                )
+                self.assertFalse(any(row[:3] == ["01/07/2026", DETAIL_SECTION_LABEL, "Digipos B2B Transfer"]
+                                     for row in refreshed[1:]))
+                self.assertTrue(any(row[:4] == ["02/07/2026", DETAIL_SECTION_LABEL, "Digipos B2B Transfer", 200]
+                                    for row in refreshed[1:]))
+
+        with psycopg.connect(TEST_DSN) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT load_id, finalized_date FROM linkaja_ledger_versions "
+                    "WHERE transaction_id = 'MOVED-TX' ORDER BY load_id"
+                )
+                self.assertEqual(cursor.fetchall(), [
+                    ("moved-correction", date(2026, 7, 2)),
+                    ("moved-original", date(2026, 7, 1)),
+                    ("moved-retry", date(2026, 7, 2)),
+                ])
+
+    def test_monthly_writer_audits_failed_publication_and_retry_completion(self):
+        result = materialize_linkaja_month(
+            TEST_DSN, "123456", "2026-07", "2026-08-05T00:00:00",
+            "writer-audit-publication", publish=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "linkaja_monthly_result.json").write_text(json.dumps(result))
+            with patch("linkaja_fee_pipeline.linkaja_postgres_dsn_from_env", return_value=TEST_DSN), patch(
+                "linkaja_fee_pipeline.sheets.make_gspread_client", return_value=object()
+            ), patch(
+                "linkaja_fee_pipeline.sheets.write_linkaja_monthly_to_gsheet",
+                side_effect=RuntimeError("synthetic Google failure"),
+            ):
+                for key in ("", '{"fixture": true}'):
+                    with self.subTest(key=key):
+                        with self.assertRaisesRegex(RuntimeError, "GCP_SA_KEY|synthetic Google failure"):
+                            execute_monthly_task("write_linkaja_monthly_google_sheet", directory, {
+                                "SECRET_GCP_SA_KEY": key, "TARGET_SPREADSHEET": "synthetic-test-sheet",
+                            })
+                        with psycopg.connect(TEST_DSN) as connection:
+                            status, error = connection.execute(
+                                "SELECT google_status, google_error FROM linkaja_monthly_refreshes "
+                                "WHERE materialization_id = 'writer-audit-publication'"
+                            ).fetchone()
+                        self.assertEqual(status, "FAILED")
+                        self.assertRegex(error, "GCP_SA_KEY|synthetic Google failure")
+
+            with patch("linkaja_fee_pipeline.linkaja_postgres_dsn_from_env", return_value=TEST_DSN), patch(
+                "linkaja_fee_pipeline.sheets.make_gspread_client", return_value=object()
+            ), patch(
+                "linkaja_fee_pipeline.sheets.write_linkaja_monthly_to_gsheet", return_value={"worksheet": "synthetic"}
+            ):
+                execute_monthly_task("write_linkaja_monthly_google_sheet", directory, {
+                    "SECRET_GCP_SA_KEY": '{"fixture": true}', "TARGET_SPREADSHEET": "synthetic-test-sheet",
+                })
+                execute_monthly_task("record_linkaja_monthly_google_status", directory, {})
+        with psycopg.connect(TEST_DSN) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT google_status, google_error FROM linkaja_monthly_refreshes "
+                "WHERE materialization_id = 'writer-audit-publication'"
+            ).fetchone(), ("COMPLETE", None))
+
+    def test_corrected_reversal_reference_rerun_restores_old_original_date(self):
+        originals = self._persist([
+            self._row(**{
+                "Transaction ID": "OLD-ORIGINAL", "Finalized Date": "01/07/2026",
+                "Transaction Scenario": "Digipos B2B Transfer",
+            }),
+            self._row(**{
+                "No": "2", "Transaction ID": "NEW-ORIGINAL", "Finalized Date": "02/07/2026",
+                "Transaction Scenario": "Digipos B2B Transfer",
+            }),
+        ], "laporan-123456-originals.csv", "reference-originals")
+        reversal = self._row(**{
+            "Transaction ID": "CORRECTED-REVERSAL",
+            "Original Transaction ID": "OLD-ORIGINAL",
+            "Finalized Date": "03/07/2026",
+            "Transaction Scenario": "Buy Goods Reversal for General Merchant",
+            "Debit": "200", "Credit": "0",
+        })
+        first = self._persist([reversal], "laporan-123456-reversal.csv", "reference-first")
+        old_sheet = {row["REPORT DATE"]: row["TOTAL FEE"] for row in originals["fee_rows"]}
+        old_sheet.update({row["REPORT DATE"]: row["TOTAL FEE"] for row in first["fee_rows"]})
+        self.assertEqual(old_sheet["01/07/2026"], 0)
+        self.assertEqual(old_sheet["02/07/2026"], 200)
+
+        corrected = {**reversal, "Original Transaction ID": "NEW-ORIGINAL"}
+        correction = self._persist([corrected], "laporan-123456-reversal.csv", "reference-correction")
+        self.assertEqual(correction["report_dates"], ["01/07/2026", "02/07/2026", "03/07/2026"])
+        # The correction committed, but the old rendered fee totals were not updated.
+        for load_id in ("reference-correction", "reference-retry"):
+            with self.subTest(load_id=load_id):
+                retry = self._persist([corrected], "laporan-123456-reversal.csv", load_id)
+                self.assertEqual(retry["report_dates"], ["01/07/2026", "02/07/2026", "03/07/2026"])
+                refreshed = {**old_sheet, **{
+                    row["REPORT DATE"]: row["TOTAL FEE"] for row in retry["fee_rows"]
+                }}
+                self.assertEqual(refreshed["01/07/2026"], 200)
+                self.assertEqual(refreshed["02/07/2026"], 0)
+
+        with psycopg.connect(TEST_DSN) as connection:
+            references = connection.execute(
+                "SELECT DISTINCT original_transaction_id FROM linkaja_ledger_versions "
+                "WHERE transaction_id = 'CORRECTED-REVERSAL' ORDER BY original_transaction_id"
+            ).fetchall()
+        self.assertEqual(references, [("NEW-ORIGINAL",), ("OLD-ORIGINAL",)])
 
     def test_non_company_facts_and_late_reversals(self):
         initial = self._persist(
@@ -1047,7 +1182,7 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
                 "SOURCE FILES":
                     "laporan-123456-closing-reversal.csv",
                 "UPDATED LOAD ID": "load-closing-reversal",
-                "UNUSUAL REASON CODE": "UNRESOLVED_REVERSAL",
+                "UNUSUAL REASON CODE": "UNRESOLVED_MISSING_ORIGINAL",
             }],
         )
 

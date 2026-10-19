@@ -72,6 +72,15 @@ CREATE_REFRESH_SCOPE_STATEMENTS = [
      AND incoming.transaction_id = existing.transaction_id
     WHERE existing.original_transaction_id IS NOT NULL
       AND BTRIM(existing.original_transaction_id) <> ''
+    UNION
+    -- A rerun must refresh originals referenced before a committed link correction.
+    SELECT DISTINCT history.cluster_id, history.original_transaction_id
+    FROM linkaja_ledger_versions AS history
+    JOIN linkaja_raw_stage AS incoming
+      ON incoming.cluster_id = history.cluster_id
+     AND incoming.transaction_id = history.transaction_id
+    WHERE history.original_transaction_id IS NOT NULL
+      AND BTRIM(history.original_transaction_id) <> ''
     ON CONFLICT DO NOTHING
     """,
     """
@@ -130,6 +139,13 @@ FROM linkaja_raw_transactions AS raw
 JOIN linkaja_impacted_ids AS impacted
   ON impacted.cluster_id = raw.cluster_id
  AND impacted.transaction_id = raw.transaction_id
+UNION
+-- Retain corrected-away dates when a post-commit render/artifact failure is retried.
+SELECT DISTINCT history.cluster_id, history.finalized_date
+FROM linkaja_ledger_versions AS history
+JOIN linkaja_impacted_ids AS impacted
+  ON impacted.cluster_id = history.cluster_id
+ AND impacted.transaction_id = history.transaction_id
 ON CONFLICT DO NOTHING
 """
 

@@ -74,13 +74,13 @@ def _coerce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     Coerce numeric and datetime columns so dtypes are consistent regardless of
     whether the source was CSV or Excel.
     """
-    # integer-like numeric columns → int64
-    for col in df.select_dtypes(include=["number"]).columns:
+    numeric_columns = ["No", "Saldo Awal", "Kredit", "Debet", "Saldo Akhir"]
+    for col in df.select_dtypes(include=["number"]).columns.intersection(numeric_columns):
         if (df[col].dropna() % 1 == 0).all():
             df[col] = df[col].astype("int64")
 
-    # string columns that are actually numbers (e.g. "543,174,458")
-    for col in df.select_dtypes(include=["object"]).columns:
+    # Identifiers, phone numbers, and Remarks must never be inferred as numbers.
+    for col in df.select_dtypes(include=["object"]).columns.intersection(numeric_columns):
         stripped = df[col].astype(str).str.replace(",", "", regex=False).str.strip()
         try:
             converted = pd.to_numeric(stripped, errors="raise")
@@ -91,8 +91,7 @@ def _coerce_dtypes(df: pd.DataFrame) -> pd.DataFrame:
         except (ValueError, TypeError):
             pass
 
-    # date parsing
-    for col in df.select_dtypes(include=["object"]).columns:
+    for col in df.select_dtypes(include=["object"]).columns.intersection(["Transaction Date"]):
         try:
             parsed = pd.to_datetime(df[col], format="mixed", dayfirst=True)
             if parsed.notna().sum() > len(df) * 0.5:
@@ -131,14 +130,14 @@ def load_file(path: str) -> pd.DataFrame:
     ext = _detect_file_type(path)
 
     if ext == ".xlsx":
-        return _read_with_header_detect(pd.read_excel, path)
+        return _read_with_header_detect(pd.read_excel, path, dtype=str, keep_default_na=False)
 
     if ext == ".csv":
         # Try separators in priority order
         for sep in (";", ",", "|", "\t"):
             try:
                 df = _read_with_header_detect(
-                    pd.read_csv, path, sep=sep, dtype=str, encoding="utf-8",
+                    pd.read_csv, path, sep=sep, dtype=str, encoding="utf-8", keep_default_na=False,
                 )
                 if df.shape[1] > 1:
                     return df

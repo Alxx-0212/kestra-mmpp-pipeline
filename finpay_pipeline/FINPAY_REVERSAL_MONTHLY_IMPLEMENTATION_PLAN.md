@@ -861,8 +861,9 @@ Expected FinPay-owned changes:
 | `finpay_pipeline/monthly.py` | Consume canonical SQL facts, enforce status/gate contract, produce artifacts |
 | `finpay_pipeline/database.py` | Migration runner, source-manifest helpers, bulk persistence, publication lock helpers |
 | `finpay_pipeline/queries/` | Coverage, reversal, reconciliation, and restatement queries |
-| `finpay_monthly_materialization.yml` | Preview/final inputs, approval/fingerprint contract, separate DB/Google status handling |
-| `finpay_pipeline.yml` | Preserve daily behavior; add only compatible source-manifest and preflight changes |
+| `finpay_pipeline/workflows/finpay_monthly_materialization.yml` | Preview/final inputs, approval/fingerprint contract, separate DB/Google status handling |
+| `finpay_pipeline/workflows/finpay_pipeline.yml` | Preserve daily behavior; add only compatible source-manifest and preflight changes |
+| `finpay_pipeline/workflows/finpay_digipos_acquisition.yml` | Manual/scheduled scrape, validation barrier, sequential daily Subflows |
 | `finpay_pipeline/summary_sheets.py` | Read-only rendering of frozen monthly rows; no independent settlement formulas |
 | `tests/test_refactor_contracts.py` | Unit and fixture-level correctness tests |
 | `tests/test_finpay_workflow_contracts.py` | Kestra input/task/output contracts |

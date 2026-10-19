@@ -32,8 +32,10 @@ REVERSAL_ST_UNSUPPORTED_REASON = 'unsupported reversal ST category'
 PROCESSED_TRANSACTION_LABEL_COLUMN = 'processed_transaction_label'
 STANDALONE_SELLTHRU_REMARK = 'transaksi sellthru'
 ST_RULE_CUTOFF_DATE = date(2026, 9, 1)
+ST_RULE_SALES_FEE_RETURN_DATE = date(2026, 10, 1)
 ST_RULE_LEGACY = 'legacy'
 ST_RULE_CURRENT = 'current'
+ST_RULE_RESTORED = 'restored'
 
 # Transaction group validation rules. A group is keyed by Transaction ID with
 # fee suffixes removed, then the main transaction determines the required rows.
@@ -208,19 +210,22 @@ RECHARGE_FEE_REMARK_PATTERNS = frozenset({
 SELLTHRU_MAIN_REMARK_PATTERNS = frozenset({
     'sellthru sales fee',
     STANDALONE_SELLTHRU_REMARK,
+    'transaksi sellthru sejumlah rp<value>,- dari <value>',
 })
 SELLTHRU_FEE_REMARK_PATTERNS = frozenset({
     'platform fee sellthru rp. <value>,-',
+    'platform fee sellthru rp<value>,-',
     'fee transaksi sellthru sejumlah <value> rupiah, dari <value> ke <value>, '
     'fee tsel rp.<value> | fee finnet rp.<value>',
 })
 SELLTHRU_SALES_FEE_REMARK_PATTERNS = frozenset({
     'sales hold transaksi sellthru sejumlah <value> rupiah, dari <value>',
+    'sales hold transaksi sellthru sejumlah rp<value>,- dari <value>',
 })
 
-# This allowlist was characterized from all FinPay exports currently available
-# under data/411311. Numeric values and DD-MM-YYYY dates are normalized before
-# comparison, while the source Remarks value remains unchanged in every output.
+# This allowlist covers historical data/411311 exports and the October ST
+# snapshot under data/new_finpay_data. Numeric values and DD-MM-YYYY dates are
+# normalized before comparison; source Remarks remain unchanged in every output.
 KNOWN_TRANSACTION_REMARK_PATTERNS = {
     'CASHOUT APOLLO': frozenset({'apollo mrc<value> <date>'}),
     'QRISDUWIT': frozenset({
@@ -279,7 +284,7 @@ def _remarks_contain(remarks: pd.Series, phrase: str) -> pd.Series:
 def _base_id_from_transaction_id(transaction_id: pd.Series) -> pd.Series:
     return (
         transaction_id.astype(str)
-        .str.replace(r'(SLSFEE|SALESFEE|FEE)$', '', regex=True)
+        .str.replace(r'(SLSHLD|SLSFEE|SALESFEE|FEE)$', '', regex=True)
     )
 
 
@@ -287,7 +292,7 @@ def _st_rule_era_for_group(group: pd.DataFrame) -> tuple[str | None, str | None]
     """Return the ST policy era for one transaction family.
 
     Transaction timestamps are the source of truth. A family that crosses the
-    cutover cannot be assigned one deterministic fee policy, so it is rejected
+    cutovers cannot be assigned one deterministic fee policy, so it is rejected
     rather than silently applying one side of the boundary to all rows.
     """
     if 'Transaction Date' not in group.columns:
@@ -297,13 +302,16 @@ def _st_rule_era_for_group(group: pd.DataFrame) -> tuple[str | None, str | None]
     if parsed.isna().any():
         return None, 'invalid Transaction Date for ST rule classification'
 
-    eras = set((value.date() >= ST_RULE_CUTOFF_DATE) for value in parsed)
+    eras = {
+        ST_RULE_LEGACY if value.date() < ST_RULE_CUTOFF_DATE
+        else ST_RULE_CURRENT if value.date() < ST_RULE_SALES_FEE_RETURN_DATE
+        else ST_RULE_RESTORED
+        for value in parsed
+    }
     if len(eras) != 1:
-        return None, 'ST transaction family crosses the 2026-09-01 rule cutoff'
-    return (
-        ST_RULE_CURRENT if True in eras else ST_RULE_LEGACY,
-        None,
-    )
+        cutoff = ST_RULE_CUTOFF_DATE if ST_RULE_LEGACY in eras else ST_RULE_SALES_FEE_RETURN_DATE
+        return None, f'ST transaction family crosses the {cutoff} rule cutoff'
+    return eras.pop(), None
 
 
 def _is_standalone_sellthru_source_row(row: pd.Series) -> bool:
@@ -704,13 +712,13 @@ def _collect_st_family_unusual_transactions(
         exclude_from_summary = False
         if era == ST_RULE_CURRENT and not sales_fee_rows.empty:
             reasons.append(
-                'SELLTHRUSALESFEE retired from 2026-09-01; excluded from summary'
+                'SELLTHRUSALESFEE retired during September 2026; excluded from summary'
             )
             exclude_from_summary = True
         reasons.extend(
             _st_fee_validation_reasons(
                 non_reversal_group,
-                require_sales_fee=era == ST_RULE_LEGACY,
+                require_sales_fee=era in {ST_RULE_LEGACY, ST_RULE_RESTORED},
             )
         )
         if not reasons:
@@ -907,6 +915,11 @@ def preprocess_transaction_labels(df: pd.DataFrame) -> pd.DataFrame:
     result['Transaction'] = (
         result['Transaction'].fillna('').astype(str).str.strip().str.upper()
     )
+    hold_mask = result['Transaction'].eq('SELLTHRUSALESHOLD')
+    if hold_mask.any() and 'Transaction Date' in result.columns:
+        hold_dates = pd.to_datetime(result['Transaction Date'], errors='coerce')
+        restored = hold_mask & (hold_dates.dt.date >= ST_RULE_SALES_FEE_RETURN_DATE)
+        result.loc[restored, 'Transaction'] = 'SELLTHRUSALESFEE'
     result = relabel_reversal_transactions(result)
     result = relabel_standalone_sellthru_transactions(result)
     result = relabel_out_cluster_transactions(result)

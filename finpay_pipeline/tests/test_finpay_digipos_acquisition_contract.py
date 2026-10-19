@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-FLOW_PATH = REPOSITORY_ROOT / "finpay_digipos_acquisition.yml"
+FLOW_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "workflows" / "finpay_digipos_acquisition.yml"
 DAILY_FLOW_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "workflows" / "finpay_pipeline.yml"
 
 
@@ -37,6 +37,12 @@ class FinPayDigiposAcquisitionContractTest(unittest.TestCase):
         self.assertEqual(text.count("flowId: finpay_daily_pipeline_v5"), 6)
         self.assertEqual(text.count("wait: true"), 6)
         self.assertEqual(text.count("transmitFailed: true"), 6)
+        self.assertNotIn("type: io.kestra.plugin.core.flow.Parallel", text)
+        self.assertRegex(text, r"(?ms)^concurrency:\s+limit: 1\s+behavior: QUEUE$")
+        self.assertRegex(
+            DAILY_FLOW_PATH.read_text(encoding="utf-8"),
+            r"(?ms)^concurrency:\s+limit: 1\s+behavior: QUEUE$",
+        )
         for cluster in ("411311", "421306", "421307", "421315", "421318", "421320"):
             self.assertIn(f"outputFiles['{cluster}.xlsx']", text)
             self.assertIn(f"filename_{cluster}", text)
@@ -46,6 +52,18 @@ class FinPayDigiposAcquisitionContractTest(unittest.TestCase):
         for field in ("csv_file", "source_filename", "dry_run", "write_gsheet", "send_telegram"):
             self.assertEqual(text.count(f"      {field}: \"{{{{"), 6, field)
         self.assertIn("finpay_daily_pipeline_v5", DAILY_FLOW_PATH.read_text(encoding="utf-8"))
+
+    def test_scrape_worker_input_is_bounded_and_passed_only_to_scraper(self):
+        text = FLOW_PATH.read_text(encoding="utf-8")
+        inputs = text.split("\ninputs:\n", 1)[1].split("\ntriggers:\n", 1)[0]
+        self.assertRegex(
+            inputs,
+            r"(?ms)^  - id: scrape_workers\s+type: INT\s+.*?defaults: 3\s+min: 1\s+max: 6$",
+        )
+        self.assertIn('SCRAPE_WORKERS: "{{ inputs.scrape_workers }}"', text)
+        self.assertIn('max_workers=int(os.environ["SCRAPE_WORKERS"])', text)
+        child_tasks = text.split("\n  - id: process_411311_daily\n", 1)[1]
+        self.assertNotIn("scrape_workers", child_tasks)
 
 
 if __name__ == "__main__":

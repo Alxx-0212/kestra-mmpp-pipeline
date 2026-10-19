@@ -1,12 +1,19 @@
 import ast
+import json
+import os
 import re
+import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "workflows" / "finpay_pipeline.yml"
-MONTHLY_WORKFLOW_PATH = REPOSITORY_ROOT / "finpay_monthly_materialization.yml"
+MONTHLY_WORKFLOW_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "workflows" / "finpay_monthly_materialization.yml"
 PACKAGE_API_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "__init__.py"
 FINPAY_README_PATH = REPOSITORY_ROOT / "finpay_pipeline" / "README.md"
 
@@ -322,6 +329,194 @@ class FinPayMonthlyWorkflowContractTest(unittest.TestCase):
         workflow_imports = _workflow_imports(_monthly_workflow_text())
         package_exports = _literal_package_exports()
         self.assertEqual(workflow_imports - package_exports, set())
+
+    def test_monthly_publication_is_queued_through_sheet_write_and_audit(self):
+        text = _monthly_workflow_text()
+        self.assertRegex(text, r"(?ms)^concurrency:\s+limit: 1\s+behavior: QUEUE$")
+        tasks = text.split("\ntasks:\n", 1)[1]
+        self.assertEqual(
+            re.findall(r"(?m)^  - id: (\w+)$", tasks),
+            [
+                "calculate_and_optionally_publish_month",
+                "write_finpay_monthly_google_sheet",
+                "record_finpay_monthly_google_status",
+            ],
+        )
+
+    def test_monthly_sheet_retry_and_failure_audit_secret_mapping(self):
+        task = _task_block(_monthly_workflow_text(), "write_finpay_monthly_google_sheet")
+        self.assertIn('runIf: "{{ inputs.write_gsheet }}"', task)
+        self.assertRegex(
+            task,
+            r"retry:\s+type: exponential\s+interval: PT10S\s+"
+            r"maxInterval: PT60S\s+maxAttempts: 3",
+        )
+        for name in ("HOST", "PORT", "NAME", "USER", "PASSWORD"):
+            self.assertIn(f"FINPAY_DB_{name}: \"{{{{ secret('FINPAY_DB_{name}') }}}}\"", task)
+        self.assertNotIn("networkMode: host", task)
+
+
+class FinPayMonthlyGoogleWriterBehaviorTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(directory.name)
+        self.result = {
+            "published": False,
+            "publication_id": "synthetic-publication",
+            "cluster_id": "411311",
+            "report_month": "2026-08",
+            "status": "READY_FOR_APPROVAL",
+        }
+        self.env = {
+            "SECRET_GCP_SA_KEY": '{"synthetic": true}',
+            "TARGET_SPREADSHEET": "synthetic spreadsheet",
+            "TARGET_WORKSHEET": "synthetic monthly worksheet",
+        }
+        self.credential_paths = []
+        self.client = object()
+
+        def make_client(path):
+            self.credential_paths.append(Path(path))
+            self.assertEqual(Path(path).read_text(), '{"synthetic": true}')
+            return self.client
+
+        # Only the external boundaries are faked; execute the workflow's real script.
+        self.package = ModuleType("finpay_pipeline")
+        self.package.make_gspread_client = Mock(side_effect=make_client)
+        self.package.write_finpay_monthly_to_gsheet = Mock(
+            return_value={"worksheet": "synthetic monthly worksheet", "rows": 7}
+        )
+        self.package.postgres_dsn_from_env = Mock(return_value="synthetic-not-a-dsn")
+        self.package.mark_finpay_google_publication_status = Mock()
+        self.kestra = ModuleType("kestra")
+        self.outputs = Mock()
+        self.kestra.Kestra = SimpleNamespace(outputs=self.outputs)
+
+    def _execute_task(self, task_id="write_finpay_monthly_google_sheet"):
+        Path("finpay_monthly_result.json").write_text(json.dumps(self.result))
+        task = _task_block(_monthly_workflow_text(), task_id)
+        script = textwrap.dedent(task.split("    script: |\n", 1)[1])
+        with (
+            patch.dict(os.environ, self.env, clear=True),
+            patch.dict(sys.modules, {"finpay_pipeline": self.package, "kestra": self.kestra}),
+            patch.object(sys, "path", list(sys.path)),
+        ):
+            exec(compile(script, str(MONTHLY_WORKFLOW_PATH), "exec"), {})
+
+    def _assert_write_result(self, status):
+        artifact = json.loads(Path("finpay_google_write_result.json").read_text())
+        self.assertEqual(artifact["status"], status)
+        self.assertEqual(artifact["publication_id"], "synthetic-publication")
+        self.outputs.assert_called_with(artifact)
+        return artifact
+
+    def test_failed_preview_raises_after_failed_artifact_and_output(self):
+        self.package.write_finpay_monthly_to_gsheet.side_effect = RuntimeError("synthetic Sheets outage")
+        with self.assertRaisesRegex(RuntimeError, "synthetic Sheets outage"):
+            self._execute_task()
+        artifact = self._assert_write_result("FAILED")
+        self.assertEqual(artifact["error"], "synthetic Sheets outage")
+        self.package.postgres_dsn_from_env.assert_not_called()
+        self.package.mark_finpay_google_publication_status.assert_not_called()
+        self.assertEqual(len(self.credential_paths), 1)
+        self.assertFalse(self.credential_paths[0].exists())
+
+    def test_missing_credentials_fail_preview_without_database_writes(self):
+        for key in ("", "{}"):
+            with self.subTest(key=key):
+                self.env["SECRET_GCP_SA_KEY"] = key
+                with self.assertRaisesRegex(RuntimeError, "GCP_SA_KEY"):
+                    self._execute_task()
+                self._assert_write_result("FAILED")
+        self.package.make_gspread_client.assert_not_called()
+        self.package.write_finpay_monthly_to_gsheet.assert_not_called()
+        self.package.postgres_dsn_from_env.assert_not_called()
+        self.package.mark_finpay_google_publication_status.assert_not_called()
+
+    def test_published_failure_audits_failed_before_raising(self):
+        self.result["published"] = True
+        self.package.write_finpay_monthly_to_gsheet.side_effect = RuntimeError("synthetic Sheets outage")
+
+        def audit(dsn, publication_id, status, error):
+            self.assertEqual((dsn, publication_id, status, error), (
+                "synthetic-not-a-dsn", "synthetic-publication", "FAILED", "synthetic Sheets outage"
+            ))
+            self._assert_write_result("FAILED")
+            self.assertFalse(self.credential_paths[0].exists())
+
+        self.package.mark_finpay_google_publication_status.side_effect = audit
+        with self.assertRaisesRegex(RuntimeError, "synthetic Sheets outage"):
+            self._execute_task()
+        self.package.mark_finpay_google_publication_status.assert_called_once()
+
+    def test_published_missing_credentials_are_audited(self):
+        self.result["published"] = True
+        self.env["SECRET_GCP_SA_KEY"] = "{}"
+        with self.assertRaisesRegex(RuntimeError, "GCP_SA_KEY"):
+            self._execute_task()
+        artifact = self._assert_write_result("FAILED")
+        self.package.mark_finpay_google_publication_status.assert_called_once_with(
+            "synthetic-not-a-dsn", "synthetic-publication", "FAILED", artifact["error"]
+        )
+
+    def test_client_creation_failure_cleans_up_credentials(self):
+        def fail_client(path):
+            self.credential_paths.append(Path(path))
+            raise RuntimeError("synthetic client failure")
+
+        self.package.make_gspread_client.side_effect = fail_client
+        with self.assertRaisesRegex(RuntimeError, "synthetic client failure"):
+            self._execute_task()
+        self._assert_write_result("FAILED")
+        self.assertFalse(self.credential_paths[0].exists())
+        self.package.write_finpay_monthly_to_gsheet.assert_not_called()
+
+    def test_success_retains_writer_call_artifact_and_separate_audit(self):
+        for published in (False, True):
+            with self.subTest(published=published):
+                self.result["published"] = published
+                self._execute_task()
+                artifact = self._assert_write_result("COMPLETE")
+                self.assertEqual(artifact, {
+                    "status": "COMPLETE",
+                    "publication_id": "synthetic-publication",
+                    "worksheet": "synthetic monthly worksheet",
+                    "rows": 7,
+                })
+                self.package.write_finpay_monthly_to_gsheet.assert_called_with(
+                    self.client,
+                    spreadsheet_title="synthetic spreadsheet",
+                    worksheet_title="synthetic monthly worksheet",
+                    result=self.result,
+                )
+                self.assertFalse(self.credential_paths[-1].exists())
+        self.package.postgres_dsn_from_env.assert_not_called()
+        self.package.mark_finpay_google_publication_status.assert_not_called()
+        self._execute_task("record_finpay_monthly_google_status")
+        self.package.mark_finpay_google_publication_status.assert_called_once_with(
+            "synthetic-not-a-dsn", "synthetic-publication", "COMPLETE", None
+        )
+
+    def test_failed_attempt_can_be_retried_then_recorded_complete(self):
+        self.result["published"] = True
+        self.package.write_finpay_monthly_to_gsheet.side_effect = [
+            RuntimeError("synthetic transient outage"),
+            {"worksheet": "synthetic monthly worksheet", "rows": 7},
+        ]
+        with self.assertRaisesRegex(RuntimeError, "synthetic transient outage"):
+            self._execute_task()
+        self._assert_write_result("FAILED")
+        self._execute_task()
+        self._assert_write_result("COMPLETE")
+        self._execute_task("record_finpay_monthly_google_status")
+        self.assertEqual(
+            [call.args[2] for call in self.package.mark_finpay_google_publication_status.call_args_list],
+            ["FAILED", "COMPLETE"],
+        )
+        self.assertEqual(len(self.credential_paths), 2)
+        self.assertFalse(any(path.exists() for path in self.credential_paths))
 
 
 if __name__ == "__main__":

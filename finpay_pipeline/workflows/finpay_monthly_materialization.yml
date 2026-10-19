@@ -62,7 +62,6 @@ tasks:
     containerImage: finpay-pipeline:3.11
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: mmpp-finance-network
     pythonVersion: "3.11"
     timeout: PT30M
     retry:
@@ -217,7 +216,6 @@ tasks:
     containerImage: finpay-pipeline:3.11
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: host
     pythonVersion: "3.11"
     timeout: PT15M
     retry:
@@ -230,6 +228,11 @@ tasks:
     outputFiles:
       - finpay_google_write_result.json
     env:
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
       SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
       TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
       TARGET_WORKSHEET: "FINPAY MONTHLY - {{ inputs.cluster_id }}"
@@ -241,7 +244,12 @@ tasks:
       from kestra import Kestra
 
       sys.path.insert(0, "/app")
-      from finpay_pipeline import make_gspread_client, write_finpay_monthly_to_gsheet
+      from finpay_pipeline import (
+          make_gspread_client,
+          mark_finpay_google_publication_status,
+          postgres_dsn_from_env,
+          write_finpay_monthly_to_gsheet,
+      )
 
       with open("finpay_monthly_result.json", encoding="utf-8") as handle:
           result = json.load(handle)
@@ -272,6 +280,16 @@ tasks:
       with open("finpay_google_write_result.json", "w", encoding="utf-8") as handle:
           json.dump(write_result, handle, indent=2, default=str)
       Kestra.outputs(write_result)
+      if write_result["status"] != "COMPLETE":
+          # The following audit task is skipped when this task fails.
+          if result.get("published"):
+              mark_finpay_google_publication_status(
+                  postgres_dsn_from_env(),
+                  result["publication_id"],
+                  "FAILED",
+                  write_result.get("error"),
+              )
+          raise RuntimeError(write_result.get("error", "Google Sheet write failed"))
 
   - id: record_finpay_monthly_google_status
     type: io.kestra.plugin.scripts.python.Script
@@ -279,7 +297,6 @@ tasks:
     containerImage: finpay-pipeline:3.11
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
-      networkMode: mmpp-finance-network
     pythonVersion: "3.11"
     timeout: PT3M
     inputFiles:

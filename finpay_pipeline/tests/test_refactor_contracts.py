@@ -6,6 +6,8 @@ from unittest.mock import Mock, patch
 import pandas as pd
 from finpay_pipeline import (
     classification,
+    database,
+    dedup,
     detail_exports,
     loading,
     monthly,
@@ -146,6 +148,24 @@ def _sellthru_family_rows(
                 "Remarks": "Sales hold transaksi sellthru sejumlah 10 rupiah, dari 411311",
             })
     return pd.DataFrame(rows)
+
+
+def _october_sellthru_family_rows():
+    rows = _sellthru_family_rows("2026-10-10 12:30:00", include_sales_fee=True)
+    rows.loc[0, "Remarks"] = "Transaksi Sellthru sejumlah Rp200000,- dari 411311"
+    rows.loc[1, "Debet"] = 25
+    rows.loc[1, "Remarks"] = "Platform fee Sellthru Rp25,-"
+    rows.loc[2, "Transaction ID"] = "STFAMILYSLSHLD"
+    rows.loc[2, "Transaction"] = "SELLTHRUSALESHOLD"
+    rows.loc[2, "raw_transaction_label"] = "SELLTHRUSALESHOLD"
+    rows.loc[2, "processed_transaction_label"] = "SELLTHRUSALESHOLD"
+    rows.loc[2, "Debet"] = 4000
+    rows.loc[2, "Remarks"] = "Sales hold Transaksi Sellthru sejumlah Rp4000,- dari 411311"
+    second_fee = rows.iloc[[1]].copy()
+    second_fee["No"] = 4
+    second_fee["Debet"] = 75
+    second_fee["Remarks"] = "Platform fee Sellthru Rp75,-"
+    return pd.concat([rows, second_fee], ignore_index=True).drop(columns="processed_transaction_label")
 
 
 class PreprocessedReversalContractTest(unittest.TestCase):
@@ -453,6 +473,87 @@ class SellthruEffectiveDateContractTest(unittest.TestCase):
             ).all()
         )
 
+    def test_october_sales_fee_is_accepted_without_changing_source_rows(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-10-01 00:00:00",
+            include_sales_fee=True,
+        )
+        original = df.copy(deep=True)
+
+        preprocessed = classification.preprocess_transaction_labels(df)
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, summary_unusual = classification.prepare_reversal_summary_transactions(preprocessed)
+
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["SELLTHRU", "SELLTHRUFEE", "SELLTHRUSALESFEE"])
+        pd.testing.assert_frame_equal(df, original)
+        for column in ("Transaction ID", "Kredit", "Debet", "Remarks", "raw_transaction_label"):
+            pd.testing.assert_series_equal(preprocessed[column], original[column])
+
+    def test_september_ends_before_october_sales_fee_restoration(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-09-30 23:59:59",
+            include_sales_fee=True,
+        )
+        unusual, summary_ready, _ = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 3)
+        self.assertTrue(summary_ready.empty)
+        self.assertTrue(unusual["unusual_reason"].str.contains("SELLTHRUSALESFEE retired", regex=False).all())
+
+    def test_october_missing_sales_fee_is_flagged_without_excluding_family(self):
+        df = _sellthru_family_rows(transaction_date="2026-10-01 00:00:00")
+        unusual, summary_ready, summary_unusual = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 2)
+        self.assertEqual(len(summary_ready), 2)
+        self.assertEqual(len(summary_unusual), 2)
+        self.assertTrue(unusual["unusual_reason"].str.contains("missing SELLTHRUSALESFEE", regex=False).all())
+
+    def test_october_invalid_platform_fee_stays_flagged_but_included(self):
+        df = _sellthru_family_rows(
+            transaction_date="2026-10-12 10:00:00", fee_amount=80, include_sales_fee=True,
+        )
+        unusual, summary_ready, _ = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 3)
+        self.assertEqual(len(summary_ready), 3)
+        self.assertTrue(unusual["unusual_reason"].str.contains("SELLTHRUFEE Debet=80", regex=False).all())
+        self.assertFalse(unusual["unusual_reason"].str.contains("retired", regex=False).any())
+
+    def test_family_crossing_october_restoration_is_quarantined(self):
+        df = _sellthru_family_rows(transaction_date="2026-09-30 23:59:59")
+        df.loc[df["Transaction"] == "SELLTHRUFEE", "Transaction Date"] = pd.Timestamp("2026-10-01 00:00:00")
+        unusual, summary_ready, _ = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 2)
+        self.assertTrue(summary_ready.empty)
+        self.assertTrue(unusual["unusual_reason"].str.contains("crosses the 2026-10-01 rule cutoff", regex=False).all())
+
+    def test_august_and_october_are_distinct_eras_even_with_same_fee_requirements(self):
+        df = _sellthru_family_rows(transaction_date="2026-08-31 23:59:59", include_sales_fee=True)
+        df.loc[df["Transaction"] == "SELLTHRUSALESFEE", "Transaction Date"] = pd.Timestamp("2026-10-01 00:00:00")
+        unusual, summary_ready, _ = self._evaluate(df)
+
+        self.assertEqual(len(unusual), 3)
+        self.assertTrue(summary_ready.empty)
+        self.assertTrue(unusual["unusual_reason"].str.contains("crosses", regex=False).all())
+
+    def test_october_fee_free_raw_recharge_exception_is_unchanged(self):
+        df = _sellthru_family_rows(transaction_date="2026-10-12 10:00:00", standalone=True)
+        unusual, summary_ready, _ = self._evaluate(df)
+
+        self.assertTrue(unusual.empty)
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["SELLTHRU"])
+
+    def test_sales_fee_restoration_is_not_an_annually_recurring_rule(self):
+        df = _sellthru_family_rows(transaction_date="2027-09-01 00:00:00", include_sales_fee=True)
+        unusual, summary_ready, _ = self._evaluate(df)
+
+        self.assertTrue(unusual.empty)
+        self.assertEqual(len(summary_ready), 3)
+
     def test_current_invalid_fee_is_flagged_but_remains_in_summary(self):
         df = _sellthru_family_rows(
             transaction_date="2026-09-02 10:00:00",
@@ -498,6 +599,80 @@ class SellthruEffectiveDateContractTest(unittest.TestCase):
         self.assertEqual(len(unusual), 3)
         self.assertTrue(summary_ready.empty)
         self.assertEqual(len(summary_unusual), 3)
+
+
+class OctoberSalesHoldPreprocessingContractTest(unittest.TestCase):
+    def test_observed_hold_label_and_split_platform_fees_form_one_family(self):
+        source = _october_sellthru_family_rows()
+        original = source.copy(deep=True)
+        preprocessed = classification.preprocess_transaction_labels(source)
+        unusual = classification.flag_unusual_transactions(preprocessed)
+        summary_ready, summary_unusual = classification.prepare_reversal_summary_transactions(preprocessed)
+
+        self.assertEqual(preprocessed["Transaction"].tolist(), ["SELLTHRU", "SELLTHRUFEE", "SELLTHRUSALESFEE", "SELLTHRUFEE"])
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(len(summary_ready), 4)
+        self.assertEqual(int(summary_ready.loc[summary_ready["Transaction"].eq("SELLTHRUFEE"), "Debet"].sum()), 100)
+        pd.testing.assert_frame_equal(source, original)
+        pd.testing.assert_frame_equal(preprocessed.drop(columns="Transaction"), original.drop(columns="Transaction"))
+
+    def test_hold_label_alias_does_not_apply_to_september(self):
+        source = _october_sellthru_family_rows()
+        source["Transaction Date"] = pd.Timestamp("2026-09-30 23:59:59")
+        preprocessed = classification.preprocess_transaction_labels(source)
+        summary_ready, unusual = classification.prepare_reversal_summary_transactions(preprocessed)
+
+        self.assertEqual(preprocessed.loc[2, "Transaction"], "SELLTHRUSALESHOLD")
+        self.assertTrue(summary_ready.empty)
+        self.assertEqual(len(unusual), 4)
+
+    def test_returned_hold_alias_does_not_expire_without_a_new_policy_change(self):
+        source = _october_sellthru_family_rows()
+        source["Transaction Date"] = pd.Timestamp("2026-11-01 00:00:00")
+        preprocessed = classification.preprocess_transaction_labels(source)
+        summary_ready, unusual = classification.prepare_reversal_summary_transactions(preprocessed)
+
+        self.assertEqual(preprocessed.loc[2, "Transaction"], "SELLTHRUSALESFEE")
+        self.assertTrue(unusual.empty)
+        self.assertEqual(len(summary_ready), 4)
+
+    def test_hold_alias_does_not_relabel_unrelated_rows_with_repeated_index_labels(self):
+        hold = _october_sellthru_family_rows().iloc[[2]].copy()
+        recharge = _non_reversal_rows(["RECHARGE"]).drop(columns="processed_transaction_label")
+        hold.index = [0]
+        source = pd.concat([hold, recharge])
+        preprocessed = classification.preprocess_transaction_labels(source)
+
+        self.assertEqual(preprocessed["Transaction"].tolist(), ["SELLTHRUSALESFEE", "RECHARGE"])
+        pd.testing.assert_frame_equal(preprocessed.drop(columns="Transaction"), source.drop(columns="Transaction"))
+
+    def test_unknown_hold_remarks_still_quarantine_the_complete_family(self):
+        source = _october_sellthru_family_rows()
+        source.loc[2, "Remarks"] = "Unrecognized sales hold adjustment"
+        preprocessed = classification.preprocess_transaction_labels(source)
+        summary_ready, unusual = classification.prepare_reversal_summary_transactions(preprocessed)
+
+        self.assertTrue(summary_ready.empty)
+        self.assertEqual(len(unusual), 4)
+
+    def test_sales_hold_identity_enrichment_uses_existing_sales_fee_type(self):
+        source = _october_sellthru_family_rows()
+        enriched = database._db_enriched_dataframe(source)
+
+        self.assertEqual(enriched["base_id"].tolist(), ["STFAMILY"] * 4)
+        self.assertEqual(enriched["transaction_id_type"].tolist(), ["MAIN", "FEE", "SLSFEE", "FEE"])
+        pd.testing.assert_frame_equal(enriched[source.columns], source)
+
+    def test_duplicate_sales_hold_report_preserves_the_parent_family(self):
+        source = _october_sellthru_family_rows().iloc[[2]].copy()
+        duplicate = source.copy()
+        duplicate["No"] = 99
+        deduplicated, report = dedup.deduplicate_rows_by_minute_with_report(pd.concat([source, duplicate], ignore_index=True))
+
+        self.assertEqual(len(deduplicated), 1)
+        self.assertEqual(report["base_id"].tolist(), ["STFAMILY"])
+        self.assertEqual(report["Transaction ID"].tolist(), ["STFAMILYSLSHLD"])
 
 
 class SellthruSheetLayoutContractTest(unittest.TestCase):

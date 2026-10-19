@@ -1,0 +1,90 @@
+id: finpay_digipos_cell_acquisition_v2
+namespace: finance.finpay
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: report_date
+    type: STRING
+    required: true
+  - id: configuration
+    type: FILE
+    required: true
+  - id: configuration_sha256
+    type: STRING
+    required: true
+  - id: dry_run
+    type: BOOLEAN
+    defaults: true
+  - id: write_gsheet
+    type: BOOLEAN
+    defaults: true
+  - id: googleapis_compatibility
+    type: BOOLEAN
+    defaults: false
+
+triggers:
+  - id: daily_cells_0500_wita
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 5 * * *"
+    timezone: Asia/Makassar
+    disabled: true
+    inputs:
+      report_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+      dry_run: false
+      write_gsheet: true
+    # The approved FILE configuration and checksum must be bound by the operator
+    # before activation. No live defaults or spreadsheet identity are embedded.
+
+tasks:
+  - id: acquire_cell_bundle
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-digipos-cell-scraper:1.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    timeout: PT6H
+    inputFiles:
+      configuration.json: "{{ inputs.configuration }}"
+    env:
+      DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+      REPORT_DATE: "{{ inputs.report_date }}"
+      CONFIGURATION_SHA256: "{{ inputs.configuration_sha256 }}"
+      CELL_APPROVED_CONFIGURATION_SHA256: "{{ secret('FINPAY_CELL_CONFIG_SHA256') }}"
+      GOOGLEAPIS_COMPATIBILITY: "{{ inputs.googleapis_compatibility }}"
+    outputFiles:
+      - cell_sources.zip
+      - "*/*.xlsx"
+      - "*/cell_acquisition_state.json"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline import acquire_cell_bundle
+
+      try:
+          result = acquire_cell_bundle(
+              os.environ["REPORT_DATE"], "configuration.json",
+              os.environ["CONFIGURATION_SHA256"], os.getcwd(),
+              password=os.environ["DIGIPOS_PASSWORD"],
+              approved_configuration_sha256=os.environ["CELL_APPROVED_CONFIGURATION_SHA256"],
+              googleapis_compatibility=os.environ["GOOGLEAPIS_COMPATIBILITY"].lower() == "true",
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell acquisition failed: " + type(exc).__name__) from None
+      Kestra.outputs({key: value for key, value in result.items() if key != "source_bundle"})
+
+  - id: report_cells_serially
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_cell_reporting_v1
+    wait: true
+    transmitFailed: true
+    inputs:
+      source_bundle: "{{ outputs.acquire_cell_bundle.outputFiles['cell_sources.zip'] }}"
+      source_bundle_sha256: "{{ outputs.acquire_cell_bundle.vars.source_bundle_sha256 }}"
+      configuration: "{{ inputs.configuration }}"
+      configuration_sha256: "{{ inputs.configuration_sha256 }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"

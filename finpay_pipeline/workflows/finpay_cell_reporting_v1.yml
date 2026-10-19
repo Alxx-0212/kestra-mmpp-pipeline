@@ -1,0 +1,80 @@
+id: finpay_cell_reporting_v1
+namespace: finance.finpay
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: source_bundle
+    type: FILE
+    required: true
+  - id: source_bundle_sha256
+    type: STRING
+    required: true
+  - id: configuration
+    type: FILE
+    required: true
+  - id: configuration_sha256
+    type: STRING
+    required: true
+  - id: dry_run
+    type: BOOLEAN
+    defaults: true
+  - id: write_gsheet
+    type: BOOLEAN
+    defaults: true
+  - id: configuration_only
+    type: BOOLEAN
+    defaults: false
+
+tasks:
+  - id: validate_compute_and_publish_serially
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-pipeline:3.11
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    timeout: PT3H
+    inputFiles:
+      cell_sources.zip: "{{ inputs.source_bundle }}"
+      configuration.json: "{{ inputs.configuration }}"
+    env:
+      SOURCE_BUNDLE_SHA256: "{{ inputs.source_bundle_sha256 }}"
+      CONFIGURATION_SHA256: "{{ inputs.configuration_sha256 }}"
+      CELL_APPROVED_CONFIGURATION_SHA256: "{{ inputs.dry_run ? '' : secret('FINPAY_CELL_CONFIG_SHA256') }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+      CONFIGURATION_ONLY: "{{ inputs.configuration_only }}"
+      CELL_DB_PASSWORD: "{{ inputs.dry_run ? '' : secret('FINPAY_DB_PASSWORD') }}"
+      CELL_GOOGLE_KEY: "{{ (inputs.dry_run or not inputs.write_gsheet) ? '' : secret('GCP_SA_KEY') }}"
+    outputFiles:
+      - cell_prepared.json
+      - cell_design_matrices.json
+      - cell_reporting_result.json
+    script: |
+      import json
+      import os
+      from kestra import Kestra
+      from finpay_pipeline import decode_cell_google_credentials, run_cell_reporting
+
+      dry_run = os.environ["DRY_RUN"].lower() == "true"
+      write_gsheet = os.environ["WRITE_GSHEET"].lower() == "true"
+      credentials = None
+      if not dry_run and write_gsheet:
+          credentials = decode_cell_google_credentials(os.environ["CELL_GOOGLE_KEY"])
+      try:
+          result = run_cell_reporting(
+              "cell_sources.zip", "configuration.json",
+              os.environ["CONFIGURATION_SHA256"], os.environ["SOURCE_BUNDLE_SHA256"],
+              dry_run=dry_run, write_gsheet=write_gsheet,
+              database_password=None if dry_run else os.environ["CELL_DB_PASSWORD"],
+              credentials_info=credentials,
+              approved_configuration_sha256=os.environ["CELL_APPROVED_CONFIGURATION_SHA256"],
+              configuration_only=os.environ["CONFIGURATION_ONLY"].lower() == "true",
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell reporting failed: " + type(exc).__name__) from None
+      with open("cell_reporting_result.json", "w", encoding="utf-8") as handle:
+          json.dump(result, handle, sort_keys=True)
+      Kestra.outputs({"report_date": result["report_date"], "accounts": len(result["accounts"]),
+                      "dry_run": result["dry_run"]})

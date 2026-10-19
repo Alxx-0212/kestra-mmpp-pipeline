@@ -203,6 +203,49 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
 
         self.assertEqual(row["balance"], "")
 
+    def test_normalizer_rejects_non_finite_source_amounts(self):
+        tokens = ("NaN", "nan", "nAn", "+NaN", "-NaN", "sNaN", "NaN123",
+                  "Inf", "inf", "iNf", "+Inf", "-Inf", "Infinity", "-Infinity",
+                  "(Infinity)")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "laporan-123456-non-finite.csv"
+            output = Path(temp_dir) / "normalized.csv"
+            for column in ("Debit", "Credit", "Balance", "Fee"):
+                for token in tokens:
+                    with self.subTest(column=column, token=token):
+                        with source.open("w", newline="", encoding="utf-8") as handle:
+                            writer = csv.DictWriter(handle, fieldnames=LINKAJA_SOURCE_COLUMNS)
+                            writer.writeheader()
+                            writer.writerow(self.full_source_row(**{
+                                "Transaction Scenario": PPOB_SCENARIO,
+                                column: token,
+                            }))
+                        with self.assertRaisesRegex(ValueError, f":2:.*{column}"):
+                            normalize_linkaja_csv(source, output, load_id="non-finite")
+
+    def test_normalizer_distinguishes_blank_optional_amounts_from_explicit_zero(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "laporan-123456-optional-amounts.csv"
+            output = Path(temp_dir) / "normalized.csv"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=LINKAJA_SOURCE_COLUMNS)
+                writer.writeheader()
+                writer.writerows([
+                    self.full_source_row(**{
+                        "Transaction Scenario": PPOB_SCENARIO,
+                        "Debit": "", "Credit": "", "Balance": " ", "Fee": " ",
+                    }),
+                    self.full_source_row(**{
+                        "Transaction ID": "ZERO-FEE", "Balance": "0", "Fee": "0",
+                    }),
+                ])
+            normalize_linkaja_csv(source, output, load_id="optional-amounts")
+            with output.open(newline="", encoding="utf-8") as handle:
+                blank, zero = list(csv.DictReader(handle))
+        self.assertEqual([blank[name] for name in ("debit", "credit", "balance", "fee")],
+                         ["0", "0", "", ""])
+        self.assertEqual([zero["balance"], zero["fee"]], ["0", "0"])
+
     def test_normalizer_requires_exact_source_header(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "laporan-123456-TEST.csv"

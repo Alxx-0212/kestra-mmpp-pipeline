@@ -32,7 +32,8 @@ time and may span weekends, adjustments, late postings, and reversals.
 | `workflows/linkaja_monthly_materialization.yml` | `linkaja_monthly_materialization_v1` | Manual preview/publication of one frozen cluster-month snapshot plus downloadable daily raw and unresolved-reversal analysis. |
 
 Both workflows run the `linkaja-fee-pipeline:3.11` image and import their
-public functions through the package-local `linkaja_pipeline.py` facade.
+public functions from the `linkaja_fee_pipeline` package. The package-local
+`linkaja_pipeline.py` facade remains for compatibility callers.
 
 The `dbt/` directory is an isolated learning project over the existing
 PostgreSQL relations. It currently builds only a staging view and tests; it is
@@ -86,6 +87,13 @@ commit; a Google failure therefore leaves the database current but the sheet
 stale until the same file is retried. The writer is idempotent by report date
 and cluster and updates the existing monitoring layout.
 
+Retry scope includes historical posting dates and prior original IDs retained in
+the immutable ledger for the incoming transaction IDs. A committed correction
+followed by a failed Sheet render can therefore refresh the old day again,
+including when a reversal's original ID was changed. Amounts are recalculated
+from current facts, never summed from historical versions. If the old evidence
+was not retained, a rerun cannot reconstruct it; review coverage before release.
+
 ### CSV validation and normalization
 
 The CSV must have the exact LinkAja export header and column order:
@@ -110,6 +118,8 @@ The normalizer enforces these rules:
 - Debit and credit are normalized as decimal values, with blank values treated
   as zero movement. Blank optional Balance and Fee values remain null so
   unknown evidence is not converted into a verified zero.
+- Non-finite tokens such as `NaN` and `Infinity` are rejected by strict CSV
+  normalization; an unknown fee must not become a verified zero.
 - A manifest records cluster ID, source file, row count, posting dates,
   scenario counts, and the Kestra execution ID used as `load_id`.
 
@@ -509,10 +519,39 @@ publication's recorded cutoff. Its fee result comes from
 late original can disappear from the exception list, but the frozen snapshot
 changes only after explicit republication.
 
+The whole monthly flow queues at concurrency limit one, holding its slot through
+calculation, Google rendering, and status recording. A failed requested Sheet
+write raises and activates retries even for a preview. Published failures record
+`FAILED` inside the writer before raising; the existing following task records
+`COMPLETE` after a successful retry. Preview failures add no database audit row.
+The writer uses the existing `FINPAY_DB_*` secret mappings and inherits the
+finance task network; that network needs PostgreSQL access and Google HTTPS
+egress. A database outage can prevent failure auditing, but the task still fails.
+
+Monthly unresolved-reversal artifacts expose the typed edge reason, such as
+`UNRESOLVED_MISSING_ORIGINAL`; the generic live/snapshot unusual flag
+`UNRESOLVED_REVERSAL` is not a substitute for that detailed artifact reason.
+
 Run `queries/linkaja_monthly_refresh_candidates.sql` after any later daily
 uploads. A returned cluster-month may have changed facts or reversal resolution.
 Preview and republish it atomically, normally with the same cutoff. Extend the
 cutoff only when the close window itself is deliberately extended.
+
+### Local regression verification (2026-10-08)
+
+All 82 LinkAja tests passed with zero skips against an isolated tmpfs PostgreSQL
+18.4 database guarded by the exact disposable database name. Tests cover
+non-finite fees, posting-date corrections, reversal-reference corrections and
+same/new-execution reruns, retained source history, frozen snapshots, and monthly
+failure auditing. No migration or financial formula was changed by these fixes.
+
+Both synthetic daily dry runs succeeded on Kestra `v1.3.26` with persistence and
+Sheet tasks skipped. A probe of the actual monthly writer script propagated the
+missing-key error after three real Kestra attempts. The initial LinkAja audit was
+independent; follow-up review reached the subagent usage limit. Final fixes,
+including the remaining reversal-reference case, were self-reviewed and tested
+by the lead, not independently approved. See [shared verification evidence](../docs/validation.md#local-verification-2026-10-08)
+for remaining operational limitations.
 
 ## Schema Migration Process
 

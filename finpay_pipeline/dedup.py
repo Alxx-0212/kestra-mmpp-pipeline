@@ -33,6 +33,7 @@ def _duplicate_unusual_reason(
 
 def deduplicate_rows_by_minute_with_report(
     df: pd.DataFrame,
+    *, comparison_frame: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Split rows into calculation-ready rows and duplicate rows for unusual logging.
@@ -42,7 +43,9 @@ def deduplicate_rows_by_minute_with_report(
     The original Transaction Date value is preserved in both returned DataFrames.
     """
     result = df.copy()
-    dedup_key = _minute_level_dedup_key(result)
+    if comparison_frame is not None and not comparison_frame.index.equals(result.index):
+        raise ValueError("dedup comparison view must align with evidence rows")
+    dedup_key = _minute_level_dedup_key(result if comparison_frame is None else comparison_frame)
 
     duplicate_mask = dedup_key.duplicated(keep="first")
     dropped_rows = int(duplicate_mask.sum())
@@ -68,7 +71,7 @@ def deduplicate_rows_by_minute_with_report(
     duplicate_unusual["base_id"] = (
         duplicate_unusual["Transaction ID"]
         .astype(str)
-        .str.replace(r"(SLSFEE|SALESFEE|FEE)$", "", regex=True)
+        .str.replace(r"(SLSHLD|SLSFEE|SALESFEE|FEE)$", "", regex=True)
     )
     duplicate_unusual["unusual_reason"] = [
         _duplicate_unusual_reason(

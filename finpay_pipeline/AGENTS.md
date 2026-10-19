@@ -54,16 +54,26 @@ handoff and let the integrating agent coordinate the FinPay-side formula change.
   rows remain visible in the unusual report.
 - Evaluate each transaction family once and derive unusual output and summary
   membership from the same disposition. Unknown labels, unknown remarks,
-  retired post-cutoff SLSFEE, and malformed standalone ST families quarantine
+  September-retired SLSFEE, and malformed standalone ST families quarantine
   the complete family; missing or non-Rp100 ST fee totals remain flagged but
   included for finance review.
 - The exact raw `RECHARGE` plus normalized `transaksi sellthru` case is a
   permanent no-companion exception. It does not require `SELLTHRUFEE` or
   `SELLTHRUSALESFEE`; direct processed `SELLTHRU` rows do not receive this
   exemption.
-- Before `2026-09-01` Asia/Makassar normal ST requires SLSFEE; from that date
-  normal ST requires only SELLTHRUFEE totaling Rp100 and any incoming SLSFEE
-  quarantines the family. Historical reruns retain the legacy sheet layout.
+- Before `2026-09-01` Asia/Makassar normal ST requires SLSFEE; during September
+  2026 it requires only SELLTHRUFEE totaling Rp100 and incoming SLSFEE quarantines
+  the family. From `2026-10-01` preprocessing requires SLSFEE again and normalizes
+  source `SELLTHRUSALESHOLD` to `SELLTHRUSALESFEE`, preserving the raw label and
+  source values. Recognize the terminal `SLSHLD` ID suffix as a sales-fee companion,
+  not a new main or a row-number link. Families crossing either policy boundary
+  quarantine. The month-start return date follows the October update; the new
+  workbook directly characterizes only `2026-10-10`.
+- The October update is preprocessing-only. Do not infer a hold rate, extend
+  another transaction case, change Sheet/invoice layout or monthly publication,
+  or deploy it before the deferred downstream contracts are reviewed. Historical
+  reruns retain their existing sheet layout; October layout remains unchanged
+  in this phase. See README's October preprocessing evidence and pending work.
 - Keep Google Sheets writes sequential unless retry and rate-limit behavior is
   deliberately redesigned.
 - Do not allow overlapping writes to the same spreadsheet, worksheet, and
@@ -210,6 +220,7 @@ Inputs:
 | `dry_run` | BOOLEAN | no | `true` | Scrape and validate, then call daily v5 with DB/Sheet writes disabled. |
 | `write_gsheet` | BOOLEAN | no | `true` | Pass through to all six daily executions. |
 | `send_telegram` | BOOLEAN | no | `true` | Pass through unusual-alert preference to daily v5. |
+| `scrape_workers` | INT | no | `3` | Concurrent DigiPOS accounts, `1` through `6`; each uses an isolated browser. Daily children and Google Sheets writes remain sequential. |
 
 The acquisition flow declares this inactive schedule:
 
@@ -248,7 +259,7 @@ curl --fail-with-body --silent --show-error \
   --user "$KESTRA_USER:$KESTRA_PASSWORD" \
   -X POST \
   -H 'Content-Type: application/x-yaml' \
-  --data-binary @finpay_digipos_acquisition.yml \
+  --data-binary @finpay_pipeline/workflows/finpay_digipos_acquisition.yml \
   "$KESTRA_URL/api/v1/$KESTRA_TENANT/flows"
 ```
 

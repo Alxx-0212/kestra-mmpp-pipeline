@@ -13,7 +13,7 @@ from psycopg import sql
 def _base_id_from_transaction_id(transaction_id: pd.Series) -> pd.Series:
     return (
         transaction_id.astype(str)
-        .str.replace(r'(SLSFEE|SALESFEE|FEE)$', '', regex=True)
+        .str.replace(r'(SLSHLD|SLSFEE|SALESFEE|FEE)$', '', regex=True)
     )
 
 
@@ -388,8 +388,8 @@ def _db_value(value, column: str):
 
 def _transaction_id_type_from_transaction_id(transaction_id: pd.Series) -> pd.Series:
     transaction_text = transaction_id.astype(str)
-    suffix = transaction_text.str.extract(r"(SLSFEE|SALESFEE|FEE)$", expand=False)
-    return suffix.fillna("MAIN")
+    suffix = transaction_text.str.extract(r"(SLSHLD|SLSFEE|SALESFEE|FEE)$", expand=False)
+    return suffix.replace({"SLSHLD": "SLSFEE"}).fillna("MAIN")
 
 
 def _db_enriched_dataframe(df: pd.DataFrame) -> pd.DataFrame:
