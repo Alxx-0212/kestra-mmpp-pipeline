@@ -3,17 +3,23 @@
 This repository contains separately packaged FinPay reporting, FinPay Top-Up,
 Telegram, and LinkAja runtimes that share local infrastructure.
 
-## Read first
+## Read By Task
 
-- [Architecture and boundaries](docs/architecture.md)
-- [Validation](docs/validation.md)
-- [Dependencies](docs/dependencies.md)
-- [Security and data safety](docs/security.md)
-- [Git and agent lanes](docs/agent-lanes.md)
-- [FinPay reporting guide](finpay_pipeline/README.md)
-- [FinPay Top-Up guide](finpay_topup_pipeline/README.md)
-- [Telegram guide](services/telegram_bot/README.md)
-- [LinkAja guide](linkaja_fee_pipeline/README.md)
+Apply the universal rules and editing lanes below for every task. Read relevant
+sections of these references when their trigger applies, not all runtime manuals:
+
+- Before source, configuration, or runtime changes: [architecture and boundaries](docs/architecture.md) and [security/data safety](docs/security.md).
+- Before assigning edits or parallel work: [Git and agent lanes](docs/agent-lanes.md).
+- Before selecting, executing, or reporting checks: [validation](docs/validation.md).
+- For dependency, manifest, Dockerfile, image, or shared-container changes: [dependency matrix](docs/dependencies.md).
+- For FinPay reporting work: the closest package `AGENTS.md` and relevant [reporting guide](finpay_pipeline/README.md) sections.
+- For FinPay Top-Up work: the closest package `AGENTS.md` and relevant [Top-Up guide](finpay_topup_pipeline/README.md) sections.
+- For Telegram work: the closest package `AGENTS.md` and relevant [Telegram guide](services/telegram_bot/README.md) sections.
+- For LinkAja work: the closest package `AGENTS.md` and relevant [LinkAja guide](linkaja_fee_pipeline/README.md) sections.
+
+Cross-domain work must load all affected domains, not just the first one found.
+Live data, credentials, destructive actions, reset/repair, and image builds always
+require the security guide before acting, even during an otherwise read-only task.
 
 ## Universal rules
 
