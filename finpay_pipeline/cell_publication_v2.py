@@ -455,7 +455,16 @@ def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_
         if any(not item.get("description", "").startswith(MANAGED_PREFIX) for item in protections):
             raise ValueError("v2 target contains unmanaged protection")
         if prior:
-            if (prior[role]["worksheet_id"], prior[role]["title"]) != (target.worksheet_id, target.title):
+            prior_identity = (prior[role]["worksheet_id"], prior[role]["title"])
+            current_identity = (target.worksheet_id, target.title)
+            account = cluster_id + "_B"
+            alias_only_rename = (
+                prior_identity[0] == target.worksheet_id
+                and prior_identity[1] == cell_worksheet_title(account, role, "code")
+                and target.naming_scheme == "cluster_alias"
+                and target.title == cell_worksheet_title(account, role, "cluster_alias")
+            )
+            if prior_identity != current_identity and not alias_only_rename:
                 raise ValueError("v2 target set changed from prior committed snapshot")
             _verify_marker(meta, {"status": "COMPLETE", "epoch": publication["epoch"],
                                   "fingerprint": publication["fingerprint"]})
@@ -471,16 +480,29 @@ def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_
 
 
 def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, config, *,
-                            changed_dates, additional_batches=None, configuration_only=False,
-                            rows_per_request=200):
+                            changed_dates=None, additional_batches=None, configuration_only=False,
+                            rows_per_request=200, publication_only=False,
+                            preserve_manual_inputs=False):
     """Guard all tabs, stage once, write/read back all, then confirm one epoch."""
     from psycopg import InterfaceError, OperationalError
     if type(rows_per_request) is not int or rows_per_request < 1:
         raise ValueError("positive v2 write chunk size required")
-    validate_cluster_batch(batch, config.cells)
-    if changed_dates != [batch[0]["report_date"]]:
-        raise ValueError("publish one complete changed cluster date at a time")
-    submitted = changed_dates[0]
+    if any(type(value) is not bool for value in (
+        configuration_only, publication_only, preserve_manual_inputs,
+    )):
+        raise ValueError("publication mode flags must be explicit booleans")
+    if publication_only:
+        if batch is not None or changed_dates is not None or additional_batches or configuration_only:
+            raise ValueError("publication-only mode cannot import or recalculate source batches")
+        submitted = store.latest_report_date()
+        if not submitted:
+            raise ValueError("publication-only mode requires committed cell history")
+        additional_batches = []
+    else:
+        validate_cluster_batch(batch, config.cells)
+        if changed_dates != [batch[0]["report_date"]]:
+            raise ValueError("publish one complete changed cluster date at a time")
+        submitted = changed_dates[0]
     if configuration_only:
         selected = store.current_results(submitted, submitted)
         expected = {(item["identity"]["cell_code"], item["generation_id"]) for item in batch}
@@ -600,7 +622,10 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                      "config_id": row["config_id"], "rules_version": config.rules_version,
                      "calculation": row["result"]}
                     for row in session.current_results(config.first_report_date, through)]
-            reset = sorted((set() if configuration_only else {submitted}) | set(session.dirty_dates(reset_only=True)))
+            reset = sorted(
+                set(session.dirty_dates(reset_only=True)) if preserve_manual_inputs else
+                (set() if configuration_only else {submitted}) | set(session.dirty_dates(reset_only=True))
+            )
             report = build_cluster_report(config, days, through)
             matrices = build_cell_cluster_matrices_v2(config, days, through, summary_manual_values=manual,
                 summary_reset_dates=mandiri_reset_dates(report, reset) if reset and prior else set())
@@ -617,8 +642,16 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                 "source_calculations": {day: fingerprint(sorted(ids)) for day, ids in source_ids.items()}},
                 "refresh_audit_required": bool(audits)}
 
-        staged = store.commit_and_stage(batch, config.cells, render_committed,
-            write_gsheet=True, additional_batches=additional_batches)
+        if publication_only:
+            rendered = render_committed(store)
+            staged = store.stage_publication(
+                rendered["start"], rendered["end"], rendered["snapshot"],
+                write_gsheet=True,
+                refresh_audit_required=rendered.get("refresh_audit_required", False),
+            )
+        else:
+            staged = store.commit_and_stage(batch, config.cells, render_committed,
+                write_gsheet=True, additional_batches=additional_batches)
         saved = store.publication_snapshot(staged["epoch"])["snapshot"]["worksheets"]
         for audit in audits:
             store.record_manual_reset(staged["epoch"], audit["cell_code"], audit["report_date"],

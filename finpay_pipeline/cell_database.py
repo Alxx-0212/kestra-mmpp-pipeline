@@ -122,7 +122,12 @@ def validate_cluster_batch(batch: list[dict], expected_cells: tuple[CellIdentity
 
 
 class CellStore:
-    """One live session owns a target lock until DB and Sheet confirmation finish."""
+    """One phase session holds target/cluster locks until its own work completes.
+
+    The staged path persists sources in a DB-only session, then reacquires the
+    locks in a separate publication session; the combined helper remains for the
+    existing all-in-one caller.
+    """
 
     def __init__(self, connection, target, cluster_id, target_id):
         self.connection = connection
@@ -140,7 +145,7 @@ class CellStore:
 
     def assert_alive(self):
         if not self.locked or not self.cluster_locked or self.connection.closed:
-            raise RuntimeError("publication session lock is not available")
+            raise RuntimeError("cell workflow session lock is not available")
         self._execute("SELECT 1")
 
     def acquire(self):
@@ -280,11 +285,13 @@ class CellStore:
 
     def commit_and_stage(self, batch, expected_cells, render_committed, *, write_gsheet,
                          additional_batches=()):
-        """Commit current selections and the render snapshot/status together.
+        """Legacy combined commit/stage path; staged callers persist separately.
 
         The callback reads only this session's committed-candidate facts and
         performs no Google calls. The outer transaction finishes before sending
-        anything to Sheets, while the session advisory lock remains held.
+        anything to Sheets, while the session advisory lock remains held. New
+        split flows use commit_cluster_day, then stage_publication after reacquiring
+        their target/cluster locks and validating the persisted handoff.
         """
         self.assert_alive()
         cohorts = [*additional_batches, batch]
@@ -376,6 +383,13 @@ class CellStore:
         self.assert_alive()
         row = self._execute(self._query(
             "SELECT MAX(report_date) FROM {} WHERE cluster_id=%s", "finpay_cell_current_v1",
+        ), (self.cluster_id,)).fetchone()
+        return row[0].isoformat() if row and row[0] else None
+
+    def earliest_report_date(self):
+        self.assert_alive()
+        row = self._execute(self._query(
+            "SELECT MIN(report_date) FROM {} WHERE cluster_id=%s", "finpay_cell_current_v1",
         ), (self.cluster_id,)).fetchone()
         return row[0].isoformat() if row and row[0] else None
 

@@ -26,7 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY finpay_pipeline/*.py ./finpay_pipeline/
+COPY finpay_pipeline/legacy ./finpay_pipeline/legacy
+COPY finpay_pipeline/cell_format ./finpay_pipeline/cell_format
 COPY finpay_pipeline/migrations ./finpay_pipeline/migrations
 COPY finpay_pipeline/queries ./finpay_pipeline/queries
+
+ENV PYTHONPATH=/app
 
 CMD ["python", "-c", "print('finpay-pipeline image ready')"]

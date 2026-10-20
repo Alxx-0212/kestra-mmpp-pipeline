@@ -9,5 +9,9 @@ COPY finpay_pipeline/requirements-digipos-scraper.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY finpay_pipeline/digipos_scraper.py ./digipos_scraper.py
+COPY finpay_pipeline/digipos_scraper.py ./finpay_pipeline/digipos_scraper.py
+COPY finpay_pipeline/legacy ./finpay_pipeline/legacy
+
+ENV PYTHONPATH=/app
 
 CMD ["python", "-c", "print('finpay-digipos-scraper image ready')"]

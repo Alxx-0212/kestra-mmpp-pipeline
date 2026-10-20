@@ -1,0 +1,64 @@
+id: finpay_legacy_range_v1
+namespace: finance.finpay
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: start_date
+    type: STRING
+    required: true
+  - id: end_date
+    type: STRING
+    required: true
+  - id: cluster_id
+    type: STRING
+    required: true
+    description: "One configured previous-format cluster or ALL. Dates are inclusive."
+  - id: dry_run
+    type: BOOLEAN
+    defaults: true
+  - id: write_gsheet
+    type: BOOLEAN
+    defaults: false
+  - id: send_telegram
+    type: BOOLEAN
+    defaults: false
+
+tasks:
+  - id: expand_legacy_range
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-pipeline:3.11
+    timeout: PT1M
+    env:
+      START_DATE: "{{ inputs.start_date }}"
+      END_DATE: "{{ inputs.end_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.legacy import expand_legacy_range
+
+      runs = expand_legacy_range(
+          os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
+      )
+      Kestra.outputs({"runs": runs, "count": len(runs)})
+
+  - id: process_legacy_range_sequentially
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ outputs.expand_legacy_range.vars.runs }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: process_legacy_day
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: finance.finpay
+        flowId: finpay_legacy_day_v1
+        wait: true
+        transmitFailed: true
+        inputs:
+          report_date: "{{ fromJson(taskrun.value).report_date }}"
+          cluster_id: "{{ fromJson(taskrun.value).cluster_id }}"
+          dry_run: "{{ inputs.dry_run }}"
+          write_gsheet: "{{ inputs.write_gsheet }}"
+          send_telegram: "{{ inputs.send_telegram }}"

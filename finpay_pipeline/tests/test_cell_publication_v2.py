@@ -21,6 +21,7 @@ class MultiTabStore:
         self.dirty = {}
         self.fail_audit = False
         self.adapters = {}
+        self.source_commits = 0
 
     def assert_alive(self):
         if not self.alive:
@@ -62,6 +63,7 @@ class MultiTabStore:
         self.operation_error = unknown_error or known_error
 
     def commit_and_stage(self, batch, expected_cells, render, *, write_gsheet, additional_batches=()):
+        self.source_commits += 1
         previous = copy.deepcopy(self.facts)
         previous_dirty = self.dirty.copy()
         try:
@@ -90,6 +92,20 @@ class MultiTabStore:
         except Exception:
             self.facts, self.dirty = previous, previous_dirty
             raise
+
+    def stage_publication(self, start, end, snapshot, *, write_gsheet, refresh_audit_required=False):
+        assert write_gsheet
+        from finpay_pipeline.cell_contracts import fingerprint
+        digest = fingerprint({"cluster_id": self.cluster_id, "target_id": self.target_id,
+                              "range_start": start, "range_end": end, "snapshot": snapshot})
+        prior = self.latest_publication()
+        if prior and prior["fingerprint"] == digest and not refresh_audit_required:
+            return {"epoch": prior["epoch"], "fingerprint": digest, "status": prior["status"]}
+        epoch = max(self.publications, default=0) + 1
+        self.publications[epoch] = {"snapshot": copy.deepcopy(snapshot), "status": "PENDING",
+                                    "fingerprint": digest}
+        self.events.append("db_stage")
+        return {"epoch": epoch, "fingerprint": digest, "status": "PENDING"}
 
     def publication_snapshot(self, epoch):
         return copy.deepcopy(self.publications[epoch])
@@ -345,6 +361,35 @@ class CellPublicationV2Tests(unittest.TestCase):
         self.assertEqual(self.publish()["status"], "COMPLETE")
         self.assertEqual(self.adapters["summary"].title, "PKY")
 
+    def test_committed_code_tabs_can_migrate_to_the_exact_cluster_alias_without_resetting_manual_inputs(self):
+        from dataclasses import replace
+        from finpay_pipeline.cell_publication_v2 import cell_worksheet_title
+
+        first = self.publish()
+        old_ids = {role: target.worksheet_id for role, target in self.roles.items()}
+        editable = self.store.publications[1]["snapshot"]["worksheets"]["summary"]["matrix"]["editable_inputs"][0]
+        manual_row, manual_column = editable["row"] - 1, editable["column"] - 1
+        self.adapters["summary"].values[manual_row][manual_column] = 333
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        alias_roles = {role: replace(target,
+            title=cell_worksheet_title(self.config.account, role, "cluster_alias"),
+            naming_scheme="cluster_alias") for role, target in self.roles.items()}
+        for role, target in alias_roles.items():
+            self.adapters[role].title = target.title
+        migrated = publish_cell_cluster_v2(
+            self.store, self.store.target_id, alias_roles, self.adapters, None,
+            self.config, publication_only=True, preserve_manual_inputs=True,
+        )
+        self.assertEqual(first["epoch"], 1)
+        self.assertEqual(migrated["epoch"], 2)
+        self.assertEqual(migrated["status"], "COMPLETE")
+        self.assertEqual({role: target.worksheet_id for role, target in alias_roles.items()}, old_ids)
+        self.assertEqual(self.adapters["summary"].title, "PKY")
+        self.assertEqual(self.adapters["summary"].values[manual_row][manual_column], 333)
+
     def setUp(self):
         from finpay_pipeline.tests.test_cell_calculation import CellCalculationTests
         fixture = CellCalculationTests()
@@ -375,6 +420,66 @@ class CellPublicationV2Tests(unittest.TestCase):
         self.assertEqual(self.adapters["unusual"].values[0][1], "CELL")
         self.assertEqual(self.adapters["reversal"].values[0][1], "CELL")
         self.assertNotIn("LINKAJA", str(self.adapters["invoice"].values))
+
+    def test_publication_only_stages_without_source_reimport(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        result = publish_cell_cluster_v2(
+            self.store, self.store.target_id, self.roles, self.adapters, None, self.config,
+            publication_only=True, preserve_manual_inputs=True,
+        )
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertEqual(self.store.source_commits, 0)
+        self.assertIn("db_stage", self.store.events)
+        self.assertNotIn("db_commit", self.store.events)
+        self.assertNotIn("manual_audit", self.store.events)
+
+    def test_publication_only_preserves_unchanged_manual_inputs_and_audits_dirty_scope(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+
+        def publish_only():
+            return publish_cell_cluster_v2(
+                self.store, self.store.target_id, self.roles, self.adapters, None, self.config,
+                publication_only=True, preserve_manual_inputs=True,
+            )
+
+        publish_only()
+        editable = self.store.publications[1]["snapshot"]["worksheets"]["summary"]["matrix"]["editable_inputs"][0]
+        row, col = editable["row"] - 1, editable["column"] - 1
+        self.adapters["summary"].values[row][col] = 333
+        start = len(self.store.events)
+        publish_only()
+        self.assertEqual(self.adapters["summary"].values[row][col], 333)
+        self.assertNotIn("manual_audit", self.store.events[start:])
+
+        self.store.dirty[self.batch[0]["report_date"]] = True
+        start = len(self.store.events)
+        publish_only()
+        self.assertNotEqual(self.adapters["summary"].values[row][col], 333)
+        events = self.store.events[start:]
+        self.assertLess(events.index("manual_audit"), events.index("sheets:summary"))
+        self.assertEqual(self.store.source_commits, 0)
+
+    def test_publication_only_rejects_ambiguous_prior_epoch_before_sheet_mutation(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        self.store.publications[1] = {
+            "snapshot": {}, "status": "UNKNOWN", "fingerprint": "synthetic-unknown",
+        }
+        with self.assertRaisesRegex(RuntimeError, "unresolved publication state"):
+            publish_cell_cluster_v2(
+                self.store, self.store.target_id, self.roles, self.adapters, None, self.config,
+                publication_only=True, preserve_manual_inputs=True,
+            )
+        self.assertEqual(self.store.source_commits, 0)
+        self.assertFalse(any(adapter.values for adapter in self.adapters.values()))
 
     def test_missing_or_duplicate_role_target_fails_before_db_commit(self):
         bad = dict(self.roles)

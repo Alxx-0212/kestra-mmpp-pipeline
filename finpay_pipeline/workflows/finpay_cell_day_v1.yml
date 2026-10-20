@@ -1,0 +1,158 @@
+id: finpay_cell_day_v1
+namespace: finance.finpay
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: report_date
+    type: STRING
+    required: true
+  - id: cluster_id
+    type: STRING
+    required: true
+  - id: dry_run
+    type: BOOLEAN
+    defaults: true
+  - id: write_gsheet
+    type: BOOLEAN
+    defaults: false
+
+tasks:
+  - id: validate_cell_sheet_targets
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT1M
+    runIf: "{{ inputs.write_gsheet }}"
+    env:
+      REPORT_DATE: "{{ inputs.report_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+    script: |
+      import os
+      from finpay_pipeline.cell_format import validate_sheet_range
+
+      validate_sheet_range(
+          os.environ["REPORT_DATE"], os.environ["REPORT_DATE"],
+          os.environ["CLUSTER_ID"],
+      )
+
+  - id: acquire_cell_cluster_day
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-digipos-cell-scraper:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    timeout: PT6H
+    env:
+      DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+      REPORT_DATE: "{{ inputs.report_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+    outputFiles:
+      - cell_sources_v2.zip
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_format import acquire_cell_day
+
+      try:
+          result = acquire_cell_day(
+              os.environ["REPORT_DATE"], os.environ["CLUSTER_ID"],
+              os.environ["DIGIPOS_PASSWORD"], os.getcwd(),
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell acquisition failed: " + type(exc).__name__) from None
+      Kestra.outputs({key: result[key] for key in (
+          "report_date", "cluster_id", "account", "source_bundle_sha256", "cells",
+      )})
+
+  - id: preprocess_cell_cluster_day
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT3H
+    inputFiles:
+      cell_sources_v2.zip: "{{ outputs.acquire_cell_cluster_day.outputFiles['cell_sources_v2.zip'] }}"
+    env:
+      SOURCE_BUNDLE_SHA256: "{{ outputs.acquire_cell_cluster_day.vars.source_bundle_sha256 }}"
+      REPORT_DATE: "{{ inputs.report_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+    outputFiles:
+      - cell_prepared_v1.json
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_format import preprocess_cell_day
+
+      try:
+          result = preprocess_cell_day(
+              "cell_sources_v2.zip", os.environ["SOURCE_BUNDLE_SHA256"],
+              os.environ["REPORT_DATE"], os.environ["CLUSTER_ID"],
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell preprocessing failed: " + type(exc).__name__) from None
+      Kestra.outputs(result)
+
+  - id: persist_cell_sources_and_calculations
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT3H
+    runIf: "{{ inputs.dry_run == false }}"
+    inputFiles:
+      cell_prepared_v1.json: "{{ outputs.preprocess_cell_cluster_day.outputFiles['cell_prepared_v1.json'] }}"
+    env:
+      PREPARED_SHA256: "{{ outputs.preprocess_cell_cluster_day.vars.prepared_sha256 }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+    outputFiles:
+      - cell_handoff_v1.json
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_format import persist_cell_day
+
+      try:
+          result = persist_cell_day(
+              "cell_prepared_v1.json", os.environ["PREPARED_SHA256"],
+              database_password=os.environ["FINPAY_DB_PASSWORD"],
+              dry_run=os.environ["DRY_RUN"].lower() == "true",
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell database persistence failed: " + type(exc).__name__) from None
+      Kestra.outputs(result)
+
+  - id: publish_cell_four_tabs
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT3H
+    runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
+    inputFiles:
+      cell_handoff_v1.json: "{{ outputs.persist_cell_sources_and_calculations.outputFiles['cell_handoff_v1.json'] }}"
+    env:
+      HANDOFF_SHA256: "{{ outputs.persist_cell_sources_and_calculations.vars.handoff_sha256 }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline import decode_cell_google_credentials
+      from finpay_pipeline.cell_format import publish_cell_sheets
+
+      try:
+          result = publish_cell_sheets(
+              "cell_handoff_v1.json", os.environ["HANDOFF_SHA256"],
+              database_password=os.environ["FINPAY_DB_PASSWORD"],
+              credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
+              cluster_id=os.environ["CLUSTER_ID"],
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell Sheet publication failed: " + type(exc).__name__) from None
+      Kestra.outputs(result)

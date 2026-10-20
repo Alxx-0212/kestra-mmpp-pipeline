@@ -1,7 +1,10 @@
-FROM finpay-pipeline:3.11
+ARG FINPAY_BASE_IMAGE=finpay-pipeline:3.11
+FROM ${FINPAY_BASE_IMAGE}
 
 WORKDIR /app
 COPY finpay_pipeline/*.py ./finpay_pipeline/
+COPY finpay_pipeline/legacy ./finpay_pipeline/legacy
+COPY finpay_pipeline/cell_format ./finpay_pipeline/cell_format
 COPY finpay_pipeline/migrations ./finpay_pipeline/migrations
 COPY finpay_pipeline/queries ./finpay_pipeline/queries
 

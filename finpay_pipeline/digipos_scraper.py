@@ -395,9 +395,13 @@ def _download_via_datatables_xhr(page, report_date: date, expected_total: int, o
         page.unroute(endpoint_glob)
 
 
-def _download_one_cluster(browser, cluster_id: str, report_date: date, password: str, output_dir: Path, max_attempts: int) -> dict:
+def _download_one_cluster(browser, cluster_id: str, report_date: date, password: str,
+                          output_dir: Path, max_attempts: int, *,
+                          max_file_bytes: int | None = None) -> dict:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+    if max_file_bytes is not None and (type(max_file_bytes) is not int or max_file_bytes < 1):
+        raise ValueError("max_file_bytes must be positive")
     username = f"{cluster_id}_A"
     canonical_filename = expected_source_filename(cluster_id, report_date.isoformat())
     artifact_name = f"{cluster_id}.xlsx"
@@ -457,13 +461,15 @@ def _download_one_cluster(browser, cluster_id: str, report_date: date, password:
                     temp_path,
                 )
 
+            if max_file_bytes is not None and temp_path.stat().st_size > max_file_bytes:
+                raise ValueError("DigiPOS export exceeds configured size limit")
             row_count = validate_export_rows(
                 _read_xlsx_rows(temp_path),
                 report_date.isoformat(),
                 table_total,
             )
             os.replace(temp_path, final_path)
-            digest = hashlib.sha256(final_path.read_bytes()).hexdigest()
+            digest = _sha256_file(final_path)
             print(f"DigiPOS validated {cluster_id}: {row_count} rows", flush=True)
             return {
                 "cluster_id": cluster_id,
@@ -490,15 +496,27 @@ def _download_one_cluster(browser, cluster_id: str, report_date: date, password:
     raise RuntimeError(f"DigiPOS failed cluster {cluster_id} after {max_attempts} attempts: {last_error}")
 
 
-def _download_cluster(cluster_id: str, report_date: date, password: str, output_dir: Path, max_attempts: int) -> dict:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download_cluster(cluster_id: str, report_date: date, password: str, output_dir: Path,
+                      max_attempts: int, *, max_file_bytes: int | None = None) -> dict:
+    if max_file_bytes is not None and (type(max_file_bytes) is not int or max_file_bytes < 1):
+        raise ValueError("max_file_bytes must be positive")
     from playwright.sync_api import sync_playwright
 
     # Playwright's sync objects must be created, used, and closed on one thread.
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
+            kwargs = {} if max_file_bytes is None else {"max_file_bytes": max_file_bytes}
             return _download_one_cluster(
-                browser, cluster_id, report_date, password, output_dir, max_attempts
+                browser, cluster_id, report_date, password, output_dir, max_attempts, **kwargs,
             )
         finally:
             browser.close()

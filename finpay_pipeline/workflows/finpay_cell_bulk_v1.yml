@@ -1,0 +1,177 @@
+id: finpay_cell_bulk_v1
+namespace: finance.finpay
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: start_date
+    type: STRING
+    required: true
+  - id: end_date
+    type: STRING
+    required: true
+  - id: cluster_id
+    type: STRING
+    required: true
+    description: "One configured cell cluster or ALL. Dates are inclusive."
+  - id: scrape_workers
+    type: INT
+    defaults: 2
+    min: 1
+    max: 4
+  - id: dry_run
+    type: BOOLEAN
+    defaults: true
+  - id: write_gsheet
+    type: BOOLEAN
+    defaults: false
+
+tasks:
+  - id: preflight_cell_bulk_targets
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT1M
+    env:
+      START_DATE: "{{ inputs.start_date }}"
+      END_DATE: "{{ inputs.end_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_format import expand_cell_range
+      from finpay_pipeline.cell_format.bulk_pipeline import validate_cell_bulk_sheet_range
+
+      runs = expand_cell_range(
+          os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
+      )
+      if os.environ["WRITE_GSHEET"].lower() == "true":
+          validate_cell_bulk_sheet_range(
+              os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
+          )
+      Kestra.outputs({"clusters": len({run["cluster_id"] for run in runs}), "runs": len(runs)})
+
+  - id: acquire_cell_bulk
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-digipos-cell-scraper:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: host
+    timeout: PT24H
+    env:
+      DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+      START_DATE: "{{ inputs.start_date }}"
+      END_DATE: "{{ inputs.end_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      SCRAPE_WORKERS: "{{ inputs.scrape_workers }}"
+    outputFiles:
+      - cell_bulk_sources_v1.zip
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_format.bulk_acquisition import acquire_cell_range
+
+      try:
+          result = acquire_cell_range(
+              os.environ["START_DATE"], os.environ["END_DATE"],
+              os.environ["CLUSTER_ID"], os.environ["DIGIPOS_PASSWORD"], os.getcwd(),
+               workers=int(os.environ["SCRAPE_WORKERS"]), max_attempts=3,
+               cache_dir=os.environ.get("FINPAY_BULK_CACHE_DIR"),
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell bulk acquisition failed: " + type(exc).__name__) from None
+      Kestra.outputs({key: result[key] for key in (
+          "start_date", "end_date", "clusters", "cohorts", "cells",
+           "workers", "source_bundle_sha256", "elapsed_seconds",
+      )})
+
+  - id: preprocess_cell_bulk
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT6H
+    inputFiles:
+      cell_bulk_sources_v1.zip: "{{ outputs.acquire_cell_bulk.outputFiles['cell_bulk_sources_v1.zip'] }}"
+    env:
+      SOURCE_BUNDLE_SHA256: "{{ outputs.acquire_cell_bulk.vars.source_bundle_sha256 }}"
+      START_DATE: "{{ inputs.start_date }}"
+      END_DATE: "{{ inputs.end_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+    outputFiles:
+      - cell_bulk_prepared_v1.zip
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_format.bulk_pipeline import preprocess_cell_range
+
+      try:
+          result = preprocess_cell_range(
+              "cell_bulk_sources_v1.zip", os.environ["SOURCE_BUNDLE_SHA256"],
+              os.environ["START_DATE"], os.environ["END_DATE"],
+              os.environ["CLUSTER_ID"],
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell bulk preprocessing failed: " + type(exc).__name__) from None
+      Kestra.outputs(result)
+
+  - id: persist_cell_bulk
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT6H
+    runIf: "{{ inputs.dry_run == false }}"
+    inputFiles:
+      cell_bulk_prepared_v1.zip: "{{ outputs.preprocess_cell_bulk.outputFiles['cell_bulk_prepared_v1.zip'] }}"
+    env:
+      PREPARED_BUNDLE_SHA256: "{{ outputs.preprocess_cell_bulk.vars.prepared_bundle_sha256 }}"
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+    outputFiles:
+      - cell_bulk_handoffs_v1.zip
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_format.bulk_pipeline import persist_cell_range
+
+      try:
+          result = persist_cell_range(
+              "cell_bulk_prepared_v1.zip", os.environ["PREPARED_BUNDLE_SHA256"],
+              database_password=os.environ["FINPAY_DB_PASSWORD"],
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell bulk database persistence failed: " + type(exc).__name__) from None
+      Kestra.outputs(result)
+
+  - id: publish_cell_bulk
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    timeout: PT6H
+    runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
+    inputFiles:
+      cell_bulk_handoffs_v1.zip: "{{ outputs.persist_cell_bulk.outputFiles['cell_bulk_handoffs_v1.zip'] }}"
+    env:
+      HANDOFF_BUNDLE_SHA256: "{{ outputs.persist_cell_bulk.vars.handoff_bundle_sha256 }}"
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline import decode_cell_google_credentials
+      from finpay_pipeline.cell_format.bulk_pipeline import publish_cell_range
+
+      try:
+          result = publish_cell_range(
+              "cell_bulk_handoffs_v1.zip", os.environ["HANDOFF_BUNDLE_SHA256"],
+              database_password=os.environ["FINPAY_DB_PASSWORD"],
+              credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
+          )
+      except Exception as exc:
+          raise RuntimeError("Cell bulk Sheet publication failed: " + type(exc).__name__) from None
+      Kestra.outputs(result)

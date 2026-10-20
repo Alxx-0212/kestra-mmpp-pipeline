@@ -1,7 +1,8 @@
 """Versioned identifiers and source contracts for the separate cell path.
 
-All live mappings and starting balances must come from explicit configuration.
-The observed roster below is available for synthetic tests, not cutover approval.
+The observed roster is promoted for cell-format acquisition and checked against
+the live portal. This does not commission database, workbook, editor, or credential
+targets; the new report path seeds its running balance internally at zero.
 """
 from __future__ import annotations
 

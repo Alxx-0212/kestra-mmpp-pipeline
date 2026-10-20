@@ -10,6 +10,9 @@ COPY finpay_pipeline/requirements.txt ./requirements-finpay.txt
 COPY finpay_pipeline/requirements-digipos-scraper.txt ./requirements-browser.txt
 RUN pip install --no-cache-dir -r requirements-finpay.txt -r requirements-browser.txt
 COPY finpay_pipeline/*.py ./finpay_pipeline/
+COPY finpay_pipeline/cell_format ./finpay_pipeline/cell_format
 COPY finpay_pipeline/migrations ./finpay_pipeline/migrations
 COPY finpay_pipeline/queries ./finpay_pipeline/queries
+
+ENV PYTHONPATH=/app
 CMD ["python", "-c", "from finpay_pipeline import acquire_cell_bundle, acquire_cell_bundle_v3; print('cell scraper APIs ready')"]
