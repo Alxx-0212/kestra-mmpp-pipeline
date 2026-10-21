@@ -5,6 +5,14 @@ concurrency:
   limit: 1
   behavior: QUEUE
 
+variables:
+  cell_spreadsheet_id: ""
+  cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
+  legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"
+  cell_worksheet_ids_json: ""
+  create_spreadsheet_if_missing: true
+  create_worksheets_if_missing: true
+
 inputs:
   - id: report_date
     type: STRING
@@ -18,6 +26,24 @@ inputs:
   - id: write_gsheet
     type: BOOLEAN
     defaults: false
+  - id: cell_spreadsheet_id
+    type: STRING
+    defaults: "{{ vars.cell_spreadsheet_id }}"
+  - id: cell_spreadsheet_name
+    type: STRING
+    defaults: "{{ vars.cell_spreadsheet_name }}"
+  - id: legacy_spreadsheet_id
+    type: STRING
+    defaults: "{{ vars.legacy_spreadsheet_id }}"
+  - id: cell_worksheet_ids_json
+    type: STRING
+    defaults: "{{ vars.cell_worksheet_ids_json }}"
+  - id: create_spreadsheet_if_missing
+    type: BOOLEAN
+    defaults: "{{ vars.create_spreadsheet_if_missing }}"
+  - id: create_worksheets_if_missing
+    type: BOOLEAN
+    defaults: "{{ vars.create_worksheets_if_missing }}"
 
 tasks:
   - id: validate_cell_sheet_targets
@@ -28,6 +54,14 @@ tasks:
     env:
       REPORT_DATE: "{{ inputs.report_date }}"
       CLUSTER_ID: "{{ inputs.cluster_id }}"
+      CELL_FORMAT_SPREADSHEET_ID: "{{ inputs.cell_spreadsheet_id }}"
+      CELL_FORMAT_SPREADSHEET_NAME: "{{ inputs.cell_spreadsheet_name }}"
+      CELL_FORMAT_LEGACY_SPREADSHEET_ID: "{{ inputs.legacy_spreadsheet_id }}"
+      CELL_FORMAT_WRITER_EMAIL: "{{ secret('FINPAY_CELL_WRITER_EMAIL') }}"
+      CELL_FORMAT_FINANCE_EMAILS: "{{ secret('FINPAY_CELL_FINANCE_EMAILS') }}"
+      CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: "{{ inputs.create_spreadsheet_if_missing }}"
+      CELL_FORMAT_WORKSHEET_IDS: "{{ inputs.cell_worksheet_ids_json }}"
+      CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ inputs.create_worksheets_if_missing }}"
     script: |
       import os
       from finpay_pipeline.cell_format import validate_sheet_range
@@ -140,6 +174,14 @@ tasks:
       FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
       FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
       GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
+      CELL_FORMAT_SPREADSHEET_ID: "{{ inputs.cell_spreadsheet_id }}"
+      CELL_FORMAT_SPREADSHEET_NAME: "{{ inputs.cell_spreadsheet_name }}"
+      CELL_FORMAT_LEGACY_SPREADSHEET_ID: "{{ inputs.legacy_spreadsheet_id }}"
+      CELL_FORMAT_WRITER_EMAIL: "{{ secret('FINPAY_CELL_WRITER_EMAIL') }}"
+      CELL_FORMAT_FINANCE_EMAILS: "{{ secret('FINPAY_CELL_FINANCE_EMAILS') }}"
+      CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: "{{ inputs.create_spreadsheet_if_missing }}"
+      CELL_FORMAT_WORKSHEET_IDS: "{{ inputs.cell_worksheet_ids_json }}"
+      CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ inputs.create_worksheets_if_missing }}"
     script: |
       import os
       from kestra import Kestra

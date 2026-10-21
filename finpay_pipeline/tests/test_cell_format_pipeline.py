@@ -19,6 +19,7 @@ from finpay_pipeline.cell_format import (
     publish_cell_sheets, validate_sheet_range,
 )
 from finpay_pipeline.cell_format import settings
+from finpay_pipeline.cell_format import pipeline as cell_pipeline
 from finpay_pipeline.cell_format.pipeline import _load_prepared
 from finpay_pipeline.cell_calculation import build_cluster_report
 from finpay_pipeline.cell_publication_v2 import ROLES, build_cell_cluster_matrices_v2
@@ -167,11 +168,16 @@ class CellFormatPipelineTests(unittest.TestCase):
         self.assertEqual(len(all_runs), len(OBSERVED_CELL_ROSTER))
         self.assertEqual({item["cluster_id"] for item in all_runs},
                          {account[:-2] for account in OBSERVED_CELL_ROSTER})
+        grouped = expand_cell_range(CELL_START, CELL_START, " 422010, 412110 ")
+        self.assertEqual({item["cluster_id"] for item in grouped}, {"412110", "422010"})
+        self.assertEqual(len(grouped), 2)
         self.assertEqual(len(expand_legacy_range("2026-10-13", "2026-10-13", "ALL")), 6)
         with self.assertRaisesRegex(ValueError, "on or before"):
             expand_cell_range(CELL_NEXT, CELL_START, self.cluster_id)
-        with self.assertRaisesRegex(ValueError, "configured cell cluster"):
+        with self.assertRaisesRegex(ValueError, "configured clusters"):
             expand_cell_range(CELL_START, CELL_START, "999999")
+        with self.assertRaisesRegex(ValueError, "distinct configured clusters"):
+            expand_cell_range(CELL_START, CELL_START, "412110,412110")
 
     def test_pre_start_range_and_acquisition_fail_before_portal_io(self):
         with self.assertRaisesRegex(ValueError, "starts on 2026-10-01"):
@@ -415,9 +421,51 @@ class CellFormatPipelineTests(unittest.TestCase):
             sheet_client.assert_not_called()
             with patch.object(settings, "CELL_FORMAT_SPREADSHEET_ID", ""), \
                     patch.object(settings, "LEGACY_SPREADSHEET_ID", ""):
-                with self.assertRaisesRegex(ValueError, "settings are incomplete"):
+                with self.assertRaisesRegex(ValueError, "CELL_FORMAT_SPREADSHEET_ID or CELL_FORMAT_SPREADSHEET_NAME"):
                     validate_sheet_range(CELL_START, CELL_START, self.cluster_id)
             sheet_client.assert_not_called()
+
+    def test_named_workbook_history_guard_precedes_workbook_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle, bundle_sha = source_bundle(directory, CELL_START)
+            prepared_path = Path(directory) / "prepared.json"
+            prepared = preprocess_cell_day(
+                str(bundle), bundle_sha, CELL_START, self.cluster_id, str(prepared_path),
+            )
+            store = MemoryCellStore()
+            persisted, _ = self.persist_with_store(prepared_path, prepared["prepared_sha256"], store)
+            configuration = settings.CellSheetConfiguration(
+                None, "Cell Reports", "legacy-workbook", "writer@example.test",
+                ("finance@example.test",), True, True, None,
+            )
+            client = Mock()
+            client.http_client.request.return_value.json.return_value = {
+                "files": [], "incompleteSearch": False,
+            }
+
+            class HistoryStore:
+                def assert_cluster_target(self, target_id):
+                    if target_id is None:
+                        raise ValueError("cluster already has publication history in another workbook")
+
+            @contextmanager
+            def session(*args, **kwargs):
+                yield HistoryStore()
+
+            with patch.object(cell_pipeline, "sheet_configuration", return_value=configuration), \
+                    patch.object(cell_pipeline, "_verify_handoff_history", return_value=None), \
+                    patch.object(cell_pipeline, "resolve_cell_workbook", wraps=cell_pipeline.resolve_cell_workbook) as resolve:
+                with self.assertRaisesRegex(ValueError, "another workbook"):
+                    publish_cell_sheets(
+                        str(Path(directory) / "cell_handoff_v1.json"), persisted["handoff_sha256"],
+                        database_password="synthetic-password",
+                        credentials_info={"client_email": "writer@example.test"},
+                        cluster_id=self.cluster_id, target=self.target,
+                        session_factory=session,
+                        sheet_client_factory=lambda *args, **kwargs: client,
+                    )
+            self.assertEqual(resolve.call_args.kwargs["cluster_id"], self.cluster_id)
+            client.create.assert_not_called()
 
     def test_all_range_preflight_rejects_cross_cluster_worksheet_id_aliases(self):
         accounts = sorted(OBSERVED_CELL_ROSTER)

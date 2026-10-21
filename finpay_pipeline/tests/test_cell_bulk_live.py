@@ -117,6 +117,7 @@ class BulkLiveBoundaryTests(unittest.TestCase):
         self.assertNotIn(f'{self.root}:/evidence"', text)
         self.assertNotIn("/opt/finpay-ops", text)
         self.assertIn("_settings.CELL_FORMAT_WORKSHEET_IDS =", text)
+        self.assertIn("create_worksheets_if_missing: false", text)
         self.assertIn("defaults: false", text)
         scripts = re.findall(r"(?m)^    script: \|\n((?:^      .*\n|^\n)*)", text)
         self.assertEqual(len(scripts), 5)

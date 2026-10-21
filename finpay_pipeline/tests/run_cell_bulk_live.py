@@ -344,6 +344,29 @@ def render_flow():
     text = text.replace("namespace: finance.finpay\n", f"namespace: {NAMESPACE}\n", 1)
     text = text.replace("finpay-cell-reporting:2.0", REPORT_IMAGE).replace("finpay-digipos-cell-scraper:2.0", SCRAPER_IMAGE)
     profile = ops.read_json(root / "profile.json")
+    variables = (
+        "variables:\n"
+        "  cell_cluster_group: \"ALL\"\n"
+        f"  cell_spreadsheet_id: {json.dumps(WORKBOOK)}\n"
+        f"  cell_spreadsheet_name: {json.dumps(TITLE)}\n"
+        f"  legacy_spreadsheet_id: {json.dumps(ops.LEGACY_WORKBOOK_ID)}\n"
+        f"  cell_worksheet_ids_json: {json.dumps(json.dumps(profile['targets'], separators=(',', ':')))}\n"
+        "  create_spreadsheet_if_missing: false\n"
+        "  create_worksheets_if_missing: false\n"
+    )
+    text, variable_count = re.subn(r"(?m)^variables:\n(?:^  [^\n]*\n)+", variables, text, count=1)
+    if variable_count != 1:
+        raise ops.Blocked("isolated_flow_target_variable_block_missing")
+    replacements = {
+        'CELL_FORMAT_WRITER_EMAIL: "{{ secret(\'FINPAY_CELL_WRITER_EMAIL\') }}"':
+            "CELL_FORMAT_WRITER_EMAIL: " + json.dumps(profile["writer_email"]),
+        'CELL_FORMAT_FINANCE_EMAILS: "{{ secret(\'FINPAY_CELL_FINANCE_EMAILS\') }}"':
+            "CELL_FORMAT_FINANCE_EMAILS: '" + json.dumps(profile["finance_emails"], separators=(",", ":")) + "'",
+    }
+    for old, new in replacements.items():
+        if old not in text:
+            raise ops.Blocked("isolated_flow_private_target_env_marker_missing")
+        text = text.replace(old, new)
     prefix = ["from finpay_pipeline.cell_format import settings as _settings",
               "_settings.CELL_FORMAT_NAMING_SCHEME = 'cluster_alias'",
               f"_settings.CELL_FORMAT_SPREADSHEET_ID = {WORKBOOK!r}",

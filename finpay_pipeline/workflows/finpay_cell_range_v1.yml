@@ -5,6 +5,15 @@ concurrency:
   limit: 1
   behavior: QUEUE
 
+variables:
+  cell_cluster_group: "ALL"
+  cell_spreadsheet_id: ""
+  cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
+  legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"
+  cell_worksheet_ids_json: ""
+  create_spreadsheet_if_missing: true
+  create_worksheets_if_missing: true
+
 inputs:
   - id: start_date
     type: STRING
@@ -14,8 +23,8 @@ inputs:
     required: true
   - id: cluster_id
     type: STRING
-    required: true
-    description: "One configured cell cluster or ALL. Dates are inclusive."
+    defaults: "{{ vars.cell_cluster_group }}"
+    description: "One configured cluster, comma-separated cluster group, or ALL. Dates are inclusive."
   - id: dry_run
     type: BOOLEAN
     defaults: true
@@ -33,6 +42,14 @@ tasks:
       END_DATE: "{{ inputs.end_date }}"
       CLUSTER_ID: "{{ inputs.cluster_id }}"
       WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+      CELL_FORMAT_SPREADSHEET_ID: "{{ vars.cell_spreadsheet_id }}"
+      CELL_FORMAT_SPREADSHEET_NAME: "{{ vars.cell_spreadsheet_name }}"
+      CELL_FORMAT_LEGACY_SPREADSHEET_ID: "{{ vars.legacy_spreadsheet_id }}"
+      CELL_FORMAT_WRITER_EMAIL: "{{ secret('FINPAY_CELL_WRITER_EMAIL') }}"
+      CELL_FORMAT_FINANCE_EMAILS: "{{ secret('FINPAY_CELL_FINANCE_EMAILS') }}"
+      CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: "{{ vars.create_spreadsheet_if_missing }}"
+      CELL_FORMAT_WORKSHEET_IDS: "{{ vars.cell_worksheet_ids_json }}"
+      CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ vars.create_worksheets_if_missing }}"
     script: |
       import os
       from kestra import Kestra
@@ -63,3 +80,9 @@ tasks:
           cluster_id: "{{ fromJson(taskrun.value).cluster_id }}"
           dry_run: "{{ inputs.dry_run }}"
           write_gsheet: "{{ inputs.write_gsheet }}"
+          cell_spreadsheet_id: "{{ vars.cell_spreadsheet_id }}"
+          cell_spreadsheet_name: "{{ vars.cell_spreadsheet_name }}"
+          legacy_spreadsheet_id: "{{ vars.legacy_spreadsheet_id }}"
+          cell_worksheet_ids_json: "{{ vars.cell_worksheet_ids_json }}"
+          create_spreadsheet_if_missing: "{{ vars.create_spreadsheet_if_missing }}"
+          create_worksheets_if_missing: "{{ vars.create_worksheets_if_missing }}"

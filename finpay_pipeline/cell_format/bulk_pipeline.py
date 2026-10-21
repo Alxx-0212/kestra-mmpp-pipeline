@@ -21,7 +21,8 @@ from ..cell_workflow import MAX_BUNDLE_BYTES, make_cell_sheet_client
 from . import pipeline as daily
 from .settings import (
     CELL_ROSTER, MAX_CELL_RUNS, REPORTING_START_DATE, ROSTER_VERSION, account_settings,
-    database_target, selected_clusters, sheet_targets, validate_reporting_date,
+    database_target, selected_clusters, sheet_configuration, validate_reporting_date,
+    validate_sheet_target_group,
 )
 
 MAX_BULK_BYTES = 1024 * 1024 * 1024
@@ -436,21 +437,9 @@ def _write_handoff_bundle(output_path, start, end, cluster_id, clusters, handoff
 
 
 def validate_cell_bulk_sheet_range(start_date: str, end_date: str, cluster_id: str) -> dict:
-    """Validate every selected cluster's distinct code-owned worksheet targets."""
+    """Validate target settings and selected clusters without opening clients."""
     start, end, clusters, days = _range(start_date, end_date, cluster_id)
-    accounts, targets_by_account = {}, {}
-    workbook_id = legacy_workbook_id = None
-    for cluster in clusters:
-        config = daily._cell_config(cluster, start)
-        workbook, legacy, targets = sheet_targets(cluster)
-        if workbook_id is not None and (workbook_id != workbook or legacy_workbook_id != legacy):
-            raise ValueError("cell-format clusters must share the same new and legacy workbook IDs")
-        workbook_id, legacy_workbook_id = workbook, legacy
-        accounts[config.account] = config
-        targets_by_account[config.account] = targets
-    daily.validate_output_targets(
-        workbook_id, legacy_workbook_id, accounts, targets_by_account,
-    )
+    validate_sheet_target_group(clusters)
     return {"clusters": clusters, "dates": days, "runs": days * len(clusters)}
 
 
@@ -559,13 +548,13 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
 
 def _validate_publication_targets(clusters, start, end, cluster_id, credentials_info):
     validate_cell_bulk_sheet_range(start, end, cluster_id)
-    if not isinstance(credentials_info, dict) or not credentials_info.get("client_email"):
+    if (not isinstance(credentials_info, dict)
+            or not isinstance(credentials_info.get("client_email"), str)
+            or not credentials_info["client_email"]):
         raise ValueError("Google service-account credentials are required")
-    for cluster in clusters:
-        _, _, targets = sheet_targets(cluster)
-        writer = next(iter(targets.values())).writer_email
-        if credentials_info["client_email"] != writer:
-            raise ValueError("Google credential identity differs from the code-owned cell writer")
+    configuration = sheet_configuration()
+    if credentials_info["client_email"].casefold() != configuration.writer_email.casefold():
+        raise ValueError("Google credential identity differs from the configured cell writer")
 
 
 def publish_cell_range(handoff_path: str, handoff_sha256: str, *,

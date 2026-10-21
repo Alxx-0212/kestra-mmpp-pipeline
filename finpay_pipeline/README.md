@@ -15,7 +15,7 @@ Build, CI/CD, commissioning, and recovery steps are in
 | Cell acquisition and four-tab reporting | Implemented through the compatibility flows below. |
 | Independent subpackages, date-range acquisition, and staged cell tasks | Implemented; range inputs and task boundaries below. |
 | Cell running SALDO | Starts at zero on October 1, 2026, then carries forward; no opening transaction or separate balance table is created. |
-| Cell publication targets | Workbook/tab IDs and editor identities remain unset in the package; production writes fail closed until its approved deployment profile supplies them. The local canary used a private profile. |
+| Cell publication targets | Package defaults fail closed. Configure a destination name (optionally pin its ID), legacy ID, writer and Finance editors through Kestra environment secrets or per-flow variables. Missing spreadsheet files/tabs can be created on a non-dry publish when enabled. |
 | Monthly settlement | Preview and gated publication implemented; Finance release requirements remain separate. |
 | Production commissioning and schedules | Not authorized by a local test or this refactor; acquisition schedules remain disabled. |
 
@@ -48,9 +48,25 @@ The cell Sheet title scheme is `cluster_alias`, not the DigiPOS account code:
 | `422040_B` | `BOLMONG` |
 
 Each prefix has `Summary`, `Invoice`, `Unusual`, and `Reversal` tabs (for example
-`PKY`, `PKY Invoice`, `PKY Unusual`, `PKY Reversal`). Keep target worksheet IDs
-stable when changing titles; arbitrary retargeting to another workbook/tab is
-rejected. Code-owned production IDs remain an explicit deployment prerequisite.
+`PKY`, `PKY Invoice`, `PKY Unusual`, `PKY Reversal`). Configure a copied
+`finpay_cell_bulk_v1` flow's `cell_spreadsheet_name` and `cell_cluster_group`;
+the group accepts one code, comma-separated codes, or `ALL`. The workbook ID is
+optional if the exact name resolves to one file; duplicate names fail closed. A
+pinned ID must already exist; name-only targets can create a missing workbook.
+On non-dry publication, `create_spreadsheet_if_missing=true` creates a missing
+workbook and `create_worksheets_if_missing=true` creates missing alias tabs. Only
+a newly created workbook is shared with configured Finance editors; sharing on
+existing files is unchanged. Keep
+tab IDs stable across title-only migrations; arbitrary retargeting to another
+workbook or role is rejected. Assign each cluster to only one destination flow;
+cross-workbook routing for a cluster with publication history is blocked. Give
+each copied flow a unique ID.
+
+Flow defaults read `FINPAY_CELL_SPREADSHEET_NAME` and
+`FINPAY_LEGACY_SPREADSHEET_ID` from Kestra secrets; optional
+`FINPAY_CELL_SPREADSHEET_ID` pins the destination. `FINPAY_CELL_WRITER_EMAIL`
+and `FINPAY_CELL_FINANCE_EMAILS` configure the writer/protection identity.
+A private deployment flow may set these values directly in its `variables` block.
 
 `finpay_cell_bulk_v1` accepts the inclusive date range and cluster selector plus
 optional `scrape_workers` (default 2, maximum 4). It validates the complete
@@ -66,7 +82,7 @@ single-worker speedup.
 Range flows take `start_date`, `end_date` (inclusive `YYYY-MM-DD`,
 `Asia/Makassar`), and `cluster_id` (one configured numeric cluster, a
 comma-separated group, or `ALL`). For example, cell `cluster_id=422180` selects
-DigiPOS account `422180_B`; a cloned flow can default it to `412110,422010`.
+DigiPOS account `422180_B`; a cloned bulk flow can default it to `412110,422010`.
 They process date/cluster work sequentially through awaited child flows and stop
 on failure. Submit large backfills in smaller consecutive ranges: sequential
 iteration limits active work, not the total Kestra task-run count.
@@ -85,9 +101,10 @@ publish_cell_four_tabs -> guarded Summary/Invoice/Unusual/Reversal publication
 
 Artifacts are bounded and checksummed. Persistence does not create a Google
 client; publication reacquires locks and rejects changed selected history before
-writing, without re-importing sources. Code-owned Sheet identities are deliberately
-unset; requesting Sheet writes fails preflight before acquisition or DB writes.
-Keep `write_gsheet=false` until those identities are supplied and commissioned.
+writing, without re-importing sources. Spreadsheet name/optional ID, distinct
+legacy ID, writer, and Finance editors must be configured; missing configuration
+fails preflight before acquisition or DB writes. `write_gsheet=false` keeps the
+bulk acquisition/preprocessing/DB path independent from Google writes.
 Persisted cell history must stay contiguous; a range separated from existing
 coverage by missing dates fails rather than assuming zero activity in the gap.
 The new cell history starts on `2026-10-01`; later first persistence without
@@ -170,6 +187,12 @@ Each prefix has `Summary`, `Invoice`, `Unusual`, and `Reversal` worksheets.
 Tab-title migration is allowed only for the same worksheet IDs and the exact
 code-to-alias mapping; it creates a new publication epoch and retains prior
 history. Arbitrary workbook, worksheet ID, role, or account changes remain blocked.
+Workflows may be copied per destination: set the copied flow's `cell_spreadsheet_name`
+and `cell_cluster_group` (a single code, comma-separated group, or `ALL`).
+If a file name resolves to no spreadsheet and creation is enabled, publication
+creates it and shares the new file with configured Finance editors. Existing
+file sharing is unchanged. Missing role tabs are added by alias; populated
+unmanaged tabs or missing tabs with prior publication history fail closed.
 
 The existing v3/v2 compatibility pair requires a schema-v2 configuration FILE,
 its checksum, and the independent `FINPAY_CELL_CONFIG_SHA256` deployment pin.

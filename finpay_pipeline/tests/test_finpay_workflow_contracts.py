@@ -295,6 +295,56 @@ class FinPayWorkflowContractTest(unittest.TestCase):
 
         self.assertIn("Legacy `.xls` is explicitly rejected", normalized_readme)
 
+    def test_bulk_cell_flow_exposes_copyable_destination_and_cluster_group(self):
+        flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_bulk_v1.yml").read_text()
+        for setting in (
+            "cell_cluster_group", "cell_spreadsheet_id", "cell_spreadsheet_name",
+            "legacy_spreadsheet_id", "cell_worksheet_ids_json",
+            "create_spreadsheet_if_missing", "create_worksheets_if_missing",
+        ):
+            self.assertIn(f"{setting}:", flow)
+        self.assertIn("cell_spreadsheet_name: \"{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}\"", flow)
+        self.assertIn("legacy_spreadsheet_id: \"{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}\"", flow)
+        self.assertIn("create_spreadsheet_if_missing: true", flow)
+        self.assertIn("create_worksheets_if_missing: true", flow)
+        self.assertIn('defaults: "{{ vars.cell_cluster_group }}"', flow)
+        self.assertIn("comma-separated cluster group", flow)
+        self.assertIn("CELL_FORMAT_SPREADSHEET_NAME: \"{{ vars.cell_spreadsheet_name }}\"", flow)
+        self.assertIn("CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING", flow)
+        self.assertIn("CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING", flow)
+        for task_id in ("preflight_cell_bulk_targets", "publish_cell_bulk"):
+            task = flow.split(f"  - id: {task_id}\n", 1)[1].split("\n  - id:", 1)[0]
+            for env_name in (
+                "CELL_FORMAT_SPREADSHEET_ID", "CELL_FORMAT_SPREADSHEET_NAME",
+                "CELL_FORMAT_LEGACY_SPREADSHEET_ID", "CELL_FORMAT_WRITER_EMAIL",
+                "CELL_FORMAT_FINANCE_EMAILS", "CELL_FORMAT_WORKSHEET_IDS",
+            ):
+                with self.subTest(task=task_id, env=env_name):
+                    self.assertIn(env_name + ":", task)
+
+    def test_cell_range_forwards_destination_settings_to_day_subflow(self):
+        range_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
+        day_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
+        subflow = range_flow.split("flowId: finpay_cell_day_v1", 1)[1]
+        settings = {
+            "cell_spreadsheet_id": ("STRING", "CELL_FORMAT_SPREADSHEET_ID"),
+            "cell_spreadsheet_name": ("STRING", "CELL_FORMAT_SPREADSHEET_NAME"),
+            "legacy_spreadsheet_id": ("STRING", "CELL_FORMAT_LEGACY_SPREADSHEET_ID"),
+            "cell_worksheet_ids_json": ("STRING", "CELL_FORMAT_WORKSHEET_IDS"),
+            "create_spreadsheet_if_missing": ("BOOLEAN", "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING"),
+            "create_worksheets_if_missing": ("BOOLEAN", "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING"),
+        }
+        for name, (input_type, environment_name) in settings.items():
+            with self.subTest(setting=name):
+                self.assertIn(f'{name}: "{{{{ vars.{name} }}}}"', subflow)
+                self.assertIn(
+                    f'- id: {name}\n    type: {input_type}\n    defaults: "{{{{ vars.{name} }}}}"',
+                    day_flow,
+                )
+                for task_id in ("validate_cell_sheet_targets", "publish_cell_four_tabs"):
+                    task = _task_block(day_flow, task_id)
+                    self.assertIn(f'{environment_name}: "{{{{ inputs.{name} }}}}"', task)
+
 
 class FinPayMonthlyWorkflowContractTest(unittest.TestCase):
     def test_monthly_flow_identity_and_inputs(self):

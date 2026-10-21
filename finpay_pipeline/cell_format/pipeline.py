@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from ..cell_calculation import recalculate_stale_history
@@ -13,12 +15,15 @@ from ..cell_contracts import (
 from ..cell_database import cell_publication_session, prepare_cell_day, validate_cluster_batch
 from ..cell_publication import ExistingSheetAdapter
 from ..cell_publication_v2 import (
-    build_cell_cluster_matrices_v2, publish_cell_cluster_v2, validate_output_targets,
+    ROLES, build_cell_cluster_matrices_v2, cell_worksheet_title,
+    preflight_unpublished_v2_sheet, publish_cell_cluster_v2, validate_output_targets,
 )
 from ..cell_workflow import MAX_BUNDLE_BYTES, _prepare_cell_bundle_with_configs, make_cell_sheet_client
 from .settings import (
-    CELL_ROSTER, REPORTING_START_DATE, database_target, expand_cell_range,
-    report_config, sheet_targets, validate_reporting_date,
+    CELL_FORMAT_NAMING_SCHEME, CELL_ROSTER, REPORTING_START_DATE,
+    CellSheetConfiguration, database_target,
+    expand_cell_range, report_config, selected_clusters, sheet_configuration,
+    sheet_targets, validate_reporting_date, validate_sheet_target_group,
 )
 
 MAX_PREPARED_BYTES = MAX_BUNDLE_BYTES
@@ -65,20 +70,297 @@ def _cell_config(cluster_id: str, first_report_date: str):
 
 
 def validate_sheet_range(start_date: str, end_date: str, cluster_id: str) -> dict:
-    """Check every selected code-owned worksheet target without opening clients."""
+    """Validate target settings and selected clusters without opening clients."""
     runs = expand_cell_range(start_date, end_date, cluster_id)
-    accounts, targets = {}, {}
-    workbook_id = legacy_id = None
-    for selected in sorted({run["cluster_id"] for run in runs}):
-        config = _cell_config(selected, start_date)
-        selected_workbook, selected_legacy, selected_targets = sheet_targets(selected)
-        if workbook_id is not None and (workbook_id != selected_workbook or legacy_id != selected_legacy):
-            raise ValueError("cell-format clusters must share the same new and legacy workbook IDs")
-        workbook_id, legacy_id = selected_workbook, selected_legacy
-        accounts[config.account] = config
-        targets[config.account] = selected_targets
-    validate_output_targets(workbook_id, legacy_id, accounts, targets)
-    return {"clusters": sorted({run["cluster_id"] for run in runs}), "runs": len(runs)}
+    clusters = selected_clusters(cluster_id)
+    validate_sheet_target_group(clusters)
+    return {"clusters": list(clusters), "runs": len(runs)}
+
+
+def _spreadsheet_files(client, title):
+    """List exact-name spreadsheets through Drive metadata-read-only."""
+    escaped = title.replace("\\", "\\\\").replace("'", "\\'")
+    params = {
+        "q": ("name = '" + escaped + "' and mimeType = "
+              "'application/vnd.google-apps.spreadsheet' and trashed = false"),
+        "corpora": "allDrives", "includeItemsFromAllDrives": "true",
+        "supportsAllDrives": "true", "spaces": "drive", "pageSize": 1000,
+        "fields": "nextPageToken,incompleteSearch,files(id,name,mimeType)",
+    }
+    files = []
+    while True:
+        response = client.http_client.request(
+            "get", "https://www.googleapis.com/drive/v3/files", params=params,
+        )
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, dict) or page.get("incompleteSearch"):
+            raise RuntimeError("Google Drive exact-title search was incomplete")
+        entries = page.get("files")
+        if not isinstance(entries, list):
+            raise RuntimeError("Google Drive returned an invalid spreadsheet listing")
+        files.extend(
+            item for item in entries
+            if isinstance(item, dict) and item.get("name") == title
+            and item.get("mimeType") == "application/vnd.google-apps.spreadsheet"
+        )
+        token = page.get("nextPageToken")
+        if not token:
+            return files
+        params["pageToken"] = token
+
+
+def _verify_workbook(workbook, spreadsheet_id, spreadsheet_name):
+    if getattr(workbook, "id", None) != spreadsheet_id:
+        raise ValueError("opened cell-format workbook ID differs from the resolved target")
+    metadata = workbook.fetch_sheet_metadata()
+    if metadata.get("spreadsheetId") != spreadsheet_id:
+        raise ValueError("opened cell-format workbook metadata ID differs from the resolved target")
+    title = metadata.get("properties", {}).get("title")
+    if spreadsheet_name and title != spreadsheet_name:
+        raise ValueError("opened cell-format workbook title differs from the configured exact title")
+    return metadata
+
+
+def _verify_workbook_access(workbook, configuration):
+    try:
+        permissions = workbook.list_permissions()
+    except Exception as exc:
+        raise RuntimeError(
+            "cannot verify existing cell-format workbook editor access; grant writer and Finance editor access manually"
+        ) from exc
+    if not isinstance(permissions, list) or any(not isinstance(item, dict) for item in permissions):
+        raise RuntimeError("Google Drive returned malformed workbook permission metadata")
+    editors = {
+        item["emailAddress"].casefold()
+        for item in permissions
+        if item.get("role") in {"owner", "writer", "organizer", "fileOrganizer"}
+        and isinstance(item.get("emailAddress"), str)
+    }
+    required = {configuration.writer_email, *configuration.finance_emails}
+    if not {email.casefold() for email in required} <= editors:
+        raise PermissionError(
+            "existing cell-format workbook must already grant editor access to the configured writer and Finance; "
+            "sharing was not changed"
+        )
+
+
+def _name_lock_id(title):
+    return "cell-format-name:" + hashlib.sha256(title.encode("utf-8")).hexdigest()
+
+
+def _spreadsheet_by_name(client, title):
+    matches = _spreadsheet_files(client, title)
+    if len(matches) > 1:
+        raise ValueError("multiple Google spreadsheets have the configured exact title")
+    if not matches:
+        return None
+    spreadsheet_id = matches[0].get("id")
+    if not isinstance(spreadsheet_id, str) or not spreadsheet_id:
+        raise RuntimeError("Google Drive listing did not return the spreadsheet ID")
+    workbook = client.open_by_key(spreadsheet_id)
+    _verify_workbook(workbook, spreadsheet_id, title)
+    return workbook, spreadsheet_id
+
+
+def _journaled_create_spreadsheet(store, client, configuration):
+    operation_id = uuid.uuid4().hex
+    store.begin_target_operation(operation_id)
+    try:
+        store.assert_alive()
+        try:
+            created = client.create(configuration.spreadsheet_name)
+        except Exception as exc:
+            # A matching title after a lost create response may belong to another flow.
+            raise RuntimeError(
+                "spreadsheet create response was ambiguous; no sharing or writes were attempted"
+            ) from exc
+        created_id = getattr(created, "id", None)
+        matches = _spreadsheet_files(client, configuration.spreadsheet_name)
+        if (len(matches) != 1 or not isinstance(created_id, str) or not created_id
+                or matches[0].get("id") != created_id):
+            raise RuntimeError("spreadsheet creation response did not uniquely identify the new file")
+        spreadsheet_id = created_id
+        workbook = client.open_by_key(spreadsheet_id)
+        _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
+        for email in configuration.finance_emails:
+            if email.casefold() != configuration.writer_email.casefold():
+                workbook.share(email, perm_type="user", role="writer", notify=False)
+        _verify_workbook_access(workbook, configuration)
+        store.finish_target_operation(operation_id)
+        return workbook, spreadsheet_id
+    except Exception as exc:
+        try:
+            store.finish_target_operation(operation_id, unknown_error=type(exc).__name__)
+        except Exception:
+            pass
+        raise RuntimeError(
+            "spreadsheet creation/sharing outcome is unknown; target is blocked for operator reconciliation"
+        ) from exc
+
+
+def resolve_cell_workbook(client, configuration: CellSheetConfiguration, store=None, *, cluster_id=None):
+    """Open by explicit ID or exact Drive title; only a missing name can create."""
+    if configuration.spreadsheet_id:
+        spreadsheet_id = configuration.spreadsheet_id
+        if store is not None and cluster_id is not None:
+            store.assert_cluster_target(spreadsheet_id)
+        workbook = client.open_by_key(spreadsheet_id)
+        _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
+        return workbook, spreadsheet_id, False
+
+    workbook_match = _spreadsheet_by_name(client, configuration.spreadsheet_name)
+    if workbook_match:
+        if store is not None and cluster_id is not None:
+            store.assert_cluster_target(workbook_match[1])
+        return workbook_match[0], workbook_match[1], False
+    if not configuration.create_spreadsheet_if_missing:
+        raise FileNotFoundError(
+            "configured cell-format spreadsheet was not found and spreadsheet creation is disabled"
+        )
+    if store is None:
+        raise RuntimeError("workbook creation requires the locked database target-operation journal")
+    if cluster_id is not None:
+        store.assert_cluster_target(None)
+    workbook, spreadsheet_id = _journaled_create_spreadsheet(store, client, configuration)
+    return workbook, spreadsheet_id, True
+
+
+def _journaled_add_worksheet(store, workbook, title, worksheet_id=None):
+    operation_id = uuid.uuid4().hex
+    store.begin_target_operation(operation_id)
+    try:
+        store.assert_alive()
+        properties = {"title": title, "gridProperties": {"rowCount": 1000, "columnCount": 26}}
+        if worksheet_id is not None:
+            properties["sheetId"] = worksheet_id
+        response_error = None
+        response_id = None
+        try:
+            response = workbook.batch_update({"requests": [{"addSheet": {"properties": properties}}]})
+            replies = response.get("replies", []) if isinstance(response, dict) else []
+            if replies:
+                add_reply = replies[0].get("addSheet") if isinstance(replies[0], dict) else None
+                if not isinstance(add_reply, dict):
+                    raise RuntimeError("addSheet response did not include its result")
+                response_id = add_reply.get("properties", {}).get("sheetId")
+        except Exception as exc:
+            response_error = exc
+        matches = [item for item in workbook.worksheets() if item.title == title]
+        if (len(matches) != 1 or type(getattr(matches[0], "id", None)) is not int
+                or (worksheet_id is not None and matches[0].id != worksheet_id)
+                or (response_id is not None and matches[0].id != response_id)):
+            if response_error:
+                raise RuntimeError("addSheet outcome could not be reconciled by exact title/ID readback") from response_error
+            raise RuntimeError("addSheet response and exact title/ID readback differ")
+        store.assert_alive()
+        store.finish_target_operation(operation_id)
+        return matches[0]
+    except Exception as exc:
+        try:
+            store.finish_target_operation(operation_id, unknown_error=type(exc).__name__)
+        except Exception:
+            pass
+        raise RuntimeError(
+            "cell worksheet creation outcome is unknown; target is blocked for operator reconciliation"
+        ) from exc
+
+
+def _resolve_cell_targets(store, workbook, cluster_id, configuration, publication):
+    store.assert_cluster_target(workbook.id)
+    if publication and publication["status"] != "COMPLETE":
+        raise RuntimeError("cell-format target has unresolved publication state")
+    spreadsheet_id = workbook.id
+    runtime_configuration = replace(configuration, spreadsheet_id=spreadsheet_id)
+    account = cluster_id + "_B"
+    worksheets = workbook.worksheets()
+    by_id = {}
+    by_title = {}
+    for worksheet in worksheets:
+        if type(worksheet.id) is not int or not isinstance(worksheet.title, str) or not worksheet.title:
+            raise RuntimeError("Google Sheets returned malformed worksheet identity metadata")
+        if worksheet.id in by_id:
+            raise RuntimeError("Google Sheets returned duplicate worksheet IDs")
+        by_id[worksheet.id] = worksheet
+        by_title.setdefault(worksheet.title, []).append(worksheet)
+    configured_ids = (configuration.worksheet_ids or {}).get(account)
+    if configuration.worksheet_ids is not None and configured_ids is None:
+        raise ValueError("CELL_FORMAT_WORKSHEET_IDS is missing the selected account")
+    worksheet_ids = {}
+    existing_worksheets = {}
+
+    if publication:
+        snapshot = publication.get("snapshot") or {}
+        prior = snapshot.get("worksheets")
+        if ((snapshot.get("schema_version"), snapshot.get("spreadsheet_id")) != (2, spreadsheet_id)
+                or not isinstance(prior, dict) or set(prior) != set(ROLES)):
+            raise ValueError("prior cell publication target snapshot is incompatible; reconcile before publishing")
+        for role in ROLES:
+            item = prior[role]
+            worksheet_id, title = item.get("worksheet_id"), item.get("title")
+            expected_title = cell_worksheet_title(account, role, CELL_FORMAT_NAMING_SCHEME)
+            worksheet = by_id.get(worksheet_id)
+            if (title != expected_title or worksheet is None or worksheet.title != title
+                    or (configured_ids and configured_ids.get(role) != worksheet_id)):
+                raise ValueError(
+                    "committed cell publication worksheet is missing or mismatched; operator reconciliation required"
+                )
+            worksheet_ids[role] = worksheet_id
+    else:
+        missing = []
+        for role in ROLES:
+            title = cell_worksheet_title(account, role, CELL_FORMAT_NAMING_SCHEME)
+            matches = by_title.get(title, [])
+            if len(matches) > 1:
+                raise ValueError("multiple worksheets have the same exact cell alias title")
+            requested_id = configured_ids.get(role) if configured_ids else None
+            if requested_id is not None:
+                existing_by_id = by_id.get(requested_id)
+                if existing_by_id and existing_by_id.title != title:
+                    raise ValueError("configured worksheet ID resolves to a different title")
+                if matches and matches[0].id != requested_id:
+                    raise ValueError("configured worksheet title resolves to a different ID")
+                if existing_by_id:
+                    worksheet_ids[role] = requested_id
+                    existing_worksheets[role] = existing_by_id
+                elif matches:
+                    raise ValueError("configured worksheet ID/title identity differs")
+                else:
+                    missing.append((role, title, requested_id))
+            elif matches:
+                worksheet_ids[role] = matches[0].id
+                existing_worksheets[role] = matches[0]
+            else:
+                missing.append((role, title, None))
+        if len(set(worksheet_ids.values())) != len(worksheet_ids):
+            raise ValueError("resolved cell worksheet IDs must be unique")
+        if missing and not configuration.create_worksheets_if_missing:
+            raise FileNotFoundError("one or more alias worksheets are missing and worksheet creation is disabled")
+        for role, worksheet in existing_worksheets.items():
+            preflight_unpublished_v2_sheet(
+                ExistingSheetAdapter(workbook, worksheet),
+                cell_worksheet_title(account, role, CELL_FORMAT_NAMING_SCHEME),
+            )
+        for role, title, requested_id in missing:
+            worksheet = _journaled_add_worksheet(store, workbook, title, requested_id)
+            worksheet_ids[role] = worksheet.id
+
+    targets = sheet_targets(
+        cluster_id, spreadsheet_id=spreadsheet_id,
+        worksheet_ids=worksheet_ids, configuration=runtime_configuration,
+    )[2]
+    report = _cell_config(cluster_id, REPORTING_START_DATE)
+    validate_output_targets(
+        spreadsheet_id, configuration.legacy_spreadsheet_id,
+        {account: report}, {account: targets},
+    )
+    adapters = {}
+    for role, target in targets.items():
+        worksheet = workbook.get_worksheet_by_id(target.worksheet_id)
+        if worksheet is None or worksheet.id != target.worksheet_id or worksheet.title != target.title:
+            raise ValueError("resolved cell worksheet workbook/ID/title identity changed")
+        adapters[role] = ExistingSheetAdapter(workbook, worksheet)
+    return targets, adapters
 
 
 def preprocess_cell_day(source_bundle: str, source_bundle_sha256: str, report_date: str,
@@ -213,6 +495,19 @@ def _current_history(store, config):
     return _facts(config, store.current_results(first, latest))
 
 
+def _verify_handoff_history(store, handoff, config):
+    earliest = store.earliest_report_date()
+    if earliest != handoff["first_report_date"]:
+        raise ValueError("stale cell Sheet handoff: persisted history start changed")
+    committed = _current_history(store, config)
+    selected = _selection(committed)
+    if (selected != handoff["selected"]
+            or fingerprint(selected) != handoff["history_fingerprint"]
+            or store.latest_report_date() != handoff["last_report_date"]):
+        raise ValueError("stale cell Sheet handoff: persisted source/calculation history changed")
+    return committed
+
+
 def persist_cell_day(prepared_path: str, prepared_sha256: str, *, database_password: str | None,
                      output_path: str = "cell_handoff_v1.json", dry_run: bool = False,
                      target=None, session_factory=cell_publication_session) -> dict:
@@ -302,38 +597,52 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
                 "history_fingerprint": handoff["history_fingerprint"]}
     if not database_password or not credentials_info:
         raise ValueError("FINPAY_DB_PASSWORD and GCP_SA_KEY Kestra secrets are required")
-    workbook_id, legacy_workbook_id, targets = sheet_targets(actual_cluster)
-    validate_output_targets(
-        workbook_id, legacy_workbook_id, {config.account: config}, {config.account: targets},
-    )
-    if credentials_info.get("client_email") != next(iter(targets.values())).writer_email:
+    configuration = sheet_configuration()
+    if not isinstance(credentials_info, dict) or not isinstance(credentials_info.get("client_email"), str):
+        raise ValueError("Google service-account credentials are required")
+    if credentials_info["client_email"].casefold() != configuration.writer_email.casefold():
         raise ValueError("Google credential identity differs from the code-owned cell writer")
     target = database_target() if target is None else target
+    client = None
+    workbook_id = configuration.spreadsheet_id
+    if configuration.spreadsheet_name:
+        include_drive_file = not workbook_id and configuration.create_spreadsheet_if_missing
+        client = (sheet_client_factory(credentials_info, include_drive_file=True)
+                  if include_drive_file else sheet_client_factory(credentials_info))
+        name_lock = _name_lock_id(configuration.spreadsheet_name)
+        with session_factory(
+            target, {target}, actual_cluster, name_lock, password=database_password,
+            approved_sheet_ids={name_lock}, write_gsheet=True,
+        ) as name_store:
+            _verify_handoff_history(name_store, handoff, config)
+            _, workbook_id, _ = resolve_cell_workbook(
+                client, configuration, name_store, cluster_id=actual_cluster,
+            )
+    if not workbook_id:
+        raise ValueError("cell-format workbook ID could not be resolved")
+    if workbook_id == configuration.legacy_spreadsheet_id:
+        raise ValueError("cell-format workbook must be distinct from the legacy workbook")
     approved_db = {target}
     with session_factory(
         target, approved_db, actual_cluster, workbook_id, password=database_password,
         approved_sheet_ids={workbook_id}, write_gsheet=True,
     ) as store:
-        earliest = store.earliest_report_date()
-        if earliest != handoff["first_report_date"]:
-            raise ValueError("stale cell Sheet handoff: persisted history start changed")
-        committed = _current_history(store, config)
-        selected = _selection(committed)
-        if (selected != handoff["selected"]
-                or fingerprint(selected) != handoff["history_fingerprint"]
-                or store.latest_report_date() != handoff["last_report_date"]):
-            raise ValueError("stale cell Sheet handoff: persisted source/calculation history changed")
+        committed = _verify_handoff_history(store, handoff, config)
+        publication = store.latest_publication(sheet_only=True)
+        if publication and publication["status"] != "COMPLETE":
+            raise RuntimeError("cell-format target has unresolved publication state")
         build_cell_cluster_matrices_v2(
             config, committed, handoff["last_report_date"], dummy=True,
         )
 
-        client = sheet_client_factory(credentials_info)
+        if client is None:
+            client = sheet_client_factory(credentials_info)
         workbook = client.open_by_key(workbook_id)
-        adapters = {
-            role: ExistingSheetAdapter(
-                workbook, workbook.get_worksheet_by_id(item.worksheet_id),
-            ) for role, item in targets.items()
-        }
+        _verify_workbook(workbook, workbook_id, configuration.spreadsheet_name)
+        _verify_workbook_access(workbook, configuration)
+        targets, adapters = _resolve_cell_targets(
+            store, workbook, actual_cluster, configuration, publication,
+        )
         result = publish_cell_cluster_v2(
             store, workbook_id, targets, adapters, None, config,
             publication_only=True, preserve_manual_inputs=True,

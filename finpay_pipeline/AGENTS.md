@@ -19,8 +19,8 @@ existing pure utilities rather than duplicating financial rules.
 - Queue or reject overlapping legacy writes to the same spreadsheet/worksheet/date across entry points until a shared exclusion policy is tested. A green cell tab is not database completion confirmation.
 - Keep cell publication separate from legacy targets and LinkAja calculations. Legacy invoice writing must repair the stable `LinkAja` reference worksheet before formulas use it.
 - Preserve monthly cutoff, source coverage/fingerprint, exact-ID reversal, approval, and frozen-snapshot gates. A daily backfill is not monthly/Odoo publication approval.
-- Keep nested runtime packages included explicitly in their owning Dockerfiles. Credentials remain Kestra secrets; target setup does not authorize live writes, sharing changes, or deployment.
-- Leave the new cell Sheet targets unconfigured until supplied explicitly; missing workbook/tab/editor identities must fail closed before Google writes.
+- Keep nested runtime packages included explicitly in their owning Dockerfiles. Credentials remain Kestra secrets. Existing-workbook sharing is never changed; first-time spreadsheet creation may share only with the explicitly configured Finance editor list when `create_spreadsheet_if_missing` is enabled. Deployment remains a separate approval.
+- Keep cell target defaults empty. Resolve a destination from explicit flow variables/Kestra secrets; require the legacy workbook, writer, and Finance editor list. On a non-dry publish, create a missing workbook only when `create_spreadsheet_if_missing` is enabled and create missing alias tabs only when `create_worksheets_if_missing` is enabled, under the target-operation journal. Share Finance editors only on a newly created workbook; existing workbook sharing remains unchanged. Missing tabs with prior publication history block rather than rebind.
 
 ## Checks
 
@@ -40,4 +40,5 @@ root/shared infrastructure changes with the integrating owner.
 
 For image release, CI/CD, or production commissioning, follow
 [production replication](PRODUCTION_REPLICATION.md). Its procedure does not grant
-authorization for live changes, deployment, resets, or sharing mutations.
+authorization beyond its stated scope for deployment, resets, or sharing changes
+to an existing workbook.

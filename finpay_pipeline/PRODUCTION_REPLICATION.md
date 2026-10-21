@@ -6,9 +6,11 @@ Agent-readable build, CI/CD, commissioning, and recovery procedure. Read
 [validation](../docs/validation.md) rules before acting.
 
 This procedure does not authorize deployment, infrastructure creation, sharing
-changes, resets, credential rotation, commits, or registry publication. Obtain
-current approval for the actual targets and operations. No hosted CI workflow
-is installed by this document; the gates below define what CI/CD must execute.
+changes to existing workbooks, resets, credential rotation, commits, or registry
+publication. The configured auto-create option may share a newly created workbook
+only with its explicit Finance editor list. Obtain current approval for all other
+targets and operations. No hosted CI workflow is installed here; the gates below
+define what CI/CD must execute.
 
 ## 1. Freeze And Configure
 
@@ -16,24 +18,40 @@ is installed by this document; the gates below define what CI/CD must execute.
    SHA does not identify uncommitted code. Do not commit without authorization.
 2. Inventory the active writers, schedules, DB identities, workbook ID, worksheet
    IDs, and backups. A workbook title alone is not a unique identity.
-3. Configure code-owned cell destination identities in `cell_format/settings.py`
-   before building: new workbook ID, different legacy workbook ID, writer email,
-   Finance editor emails, and four role/tab IDs per enabled cluster. The title
-   scheme is `cluster_alias`; missing identities remain fail-closed. Credentials
-   remain secrets, not source.
-4. Resolve aliases from `CLUSTER_ALIASES` and verify exact titles `<alias>`,
+3. For multi-destination routing, configure each copy of
+   `finpay_cell_bulk_v1` with one destination and cluster group. Set
+   `cell_spreadsheet_name` from Kestra secret `FINPAY_CELL_SPREADSHEET_NAME` or
+   directly in a private flow copy. Leave `cell_spreadsheet_id` empty for
+   exact-name lookup/creation; an optional pinned ID must refer to an existing
+   workbook (reference `FINPAY_CELL_SPREADSHEET_ID` from that copied flow if desired).
+    Set the distinct `legacy_spreadsheet_id`, `cell_cluster_group`,
+    `create_spreadsheet_if_missing`, and `create_worksheets_if_missing` variables.
+    The group accepts one numeric
+   cluster, a comma-separated list, or `ALL`; it may be literal in the cloned
+    flow or read from `secret('FINPAY_CELL_CLUSTER_GROUP')`. Give each cloned flow
+    a unique ID and keep groups disjoint: a cluster with publication history
+    cannot silently be routed to another workbook. The daily/range wrappers use the deployment's
+   shared target secrets. Do not commit production workbook IDs, Finance emails,
+   or credentials.
+4. Configure the writer service-account email and Finance editor emails as Kestra
+   secrets. The package title scheme is `cluster_alias`; worksheet IDs are
+   discovered by exact alias title unless an explicit ID map is provided.
+5. Resolve aliases from `CLUSTER_ALIASES` and verify exact titles `<alias>`,
    `<alias> Invoice`, `<alias> Unusual`, and `<alias> Reversal`. Current aliases
    are `412110_B=PKY`, `422090_B=MRT`, `422100_B=TDR`, `422010_B=BGI`,
    `422180_B=MRW`, `422220_B=TNT`, `422140_B=KOTAMOB`, and `422040_B=BOLMONG`.
-    Keep worksheet IDs stable during a code-to-alias rename; changing IDs, workbook,
-    account ownership, or editors is not a title migration. Before provisioning,
-    read workbook metadata and take the approved backup. For each missing role only,
-    create an empty tab with the configured ID and exact alias title (`addSheet`),
-    then re-read all IDs/titles before enabling writes. Never delete or clear an
-    existing tab as an initialization shortcut. First publication requires empty,
-    unmanaged targets; existing managed tabs require their matching DB publication
-    history. Never silently adopt them into a fresh DB or borrow synthetic fixture IDs.
-5. Agree whether this release includes cell, legacy, or monthly reporting.
+   Keep worksheet IDs stable during a code-to-alias rename; changing IDs, workbook,
+   account ownership, or editors is not a title migration. Before provisioning,
+   read workbook metadata and take the approved backup. When a configured exact
+    spreadsheet name is absent and creation is enabled, the service account creates
+    the Drive file and grants access only to configured Finance editors. Existing
+    workbook sharing is never changed. New files are created in the service
+    account's My Drive root; pre-create the file if a specific Drive folder/shared
+    drive is required. Missing alias tabs are created on publish;
+   existing tabs are reused by exact title/ID. If a published tab is missing or an
+   existing tab is unmanaged/nonempty without matching DB history, fail closed.
+   Never delete or clear data to initialize a destination.
+6. Agree whether this release includes cell, legacy, or monthly reporting.
    A cell canary does not verify legacy/monthly live behavior or other domains.
 
 ### October 1 And SALDO
@@ -158,14 +176,28 @@ publication and production promotion require explicit approval.
 5. Verify runtime-role table/schema privileges; do not use a superuser. Use
    secret-file/service-based DB authentication, not passwords in CLI arguments.
 6. Supply Kestra secrets `DIGIPOS_PASSWORD`, `FINPAY_DB_HOST`, `FINPAY_DB_PORT`,
-   `FINPAY_DB_NAME`, `FINPAY_DB_USER`, `FINPAY_DB_PASSWORD`, and `GCP_SA_KEY`.
-   The environment provider uses base64 `SECRET_*` values; this is encoding,
-   not encryption. Load only required keys from protected files/CI storage.
-   Never put `.env_encoded` in an image or log.
-7. Keep Kestra authenticated and internal/loopback or behind the approved TLS
+   `FINPAY_DB_NAME`, `FINPAY_DB_USER`, `FINPAY_DB_PASSWORD`, `GCP_SA_KEY`,
+   `FINPAY_CELL_SPREADSHEET_NAME`, `FINPAY_LEGACY_SPREADSHEET_ID`,
+    `FINPAY_CELL_WRITER_EMAIL`, and `FINPAY_CELL_FINANCE_EMAILS`. An optional
+    `FINPAY_CELL_WORKSHEET_IDS` JSON map can pin role IDs; to use that secret, set
+    the copied flow variable `cell_worksheet_ids_json` to
+    `{{ secret('FINPAY_CELL_WORKSHEET_IDS') }}`. Otherwise the package resolves
+    alias worksheet IDs by title. A spreadsheet ID secret is only needed when the
+    copied flow references it; name-only resolution requires one exact matching
+    Drive title. `FINPAY_CELL_CLUSTER_GROUP` may set the cloned flow's default
+    group by referencing it from `cell_cluster_group`.
+   The environment provider uses base64 `SECRET_*` values; this is encoding, not
+   encryption. Load only required keys from protected files/CI storage. Never
+   put `.env_encoded` in an image or log.
+7. Grant the cell service account only Sheets and `drive.file` scopes for Sheets
+   writes and new-file creation, plus Drive metadata-read scope for unique-name
+   lookup. A newly created workbook is owned by that service account and shared
+   only with the configured Finance editors. Existing workbook sharing is never
+   changed automatically; missing permissions fail closed.
+8. Keep Kestra authenticated and internal/loopback or behind the approved TLS
    proxy. Restrict source-import/execution rights and artifact storage: source
    ZIPs and prepared JSON contain private financial evidence.
-8. Mount `KESTRA_TASK_WORKDIR` at the same absolute host/container path and set
+9. Mount `KESTRA_TASK_WORKDIR` at the same absolute host/container path and set
    the temporary directory to its `tmp/` child. Enable Docker-runner volumes.
    Reporting tasks need the approved finance network, DB access, and Google
    HTTPS; acquisition retains host-network DigiPOS HTTPS egress. Docker socket
@@ -221,6 +253,23 @@ acquisition stage still retains per-cell/day browser/login overhead. Use an
 execution-specific private cache mount for validated downloads, never a shared
 cross-run cache that could silently reuse old source data. Bulk persistence and
 publication remain serial, with one four-tab publication per selected cluster.
+
+For two destination workbooks, clone `finpay_cell_bulk_v1` twice, assign unique
+flow IDs, and change the clone variables (or their `secret()` names). Example:
+
+```yaml
+variables:
+  cell_spreadsheet_name: "{{ secret('FINPAY_CELL_GROUP_A_SPREADSHEET_NAME') }}"
+  cell_spreadsheet_id: "" # Optional; pin when the exact file ID is known.
+  cell_cluster_group: "412110,422010"
+  create_spreadsheet_if_missing: true
+  create_worksheets_if_missing: true
+```
+
+The second clone uses its own destination name and cluster list. The execution
+input `cluster_id` defaults to the group but can still be overridden per run.
+Each destination file reuses/creates the constant alias role tabs; a missing file
+is created on publish when enabled, and an existing file's sharing is not changed.
 Read back definitions/image references. If releasing legacy too, register daily
 v5 before legacy day, then legacy range. Keep compatibility IDs for their callers.
 Do not enable monthly publication or schedules as an incidental deployment step.

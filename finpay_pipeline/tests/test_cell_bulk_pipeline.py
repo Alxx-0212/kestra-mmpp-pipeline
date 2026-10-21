@@ -16,7 +16,6 @@ from finpay_pipeline.cell_contracts import (
     OBSERVED_CELL_ROSTER, configured_cells, fingerprint, roster_fingerprint,
 )
 from finpay_pipeline.cell_database import CellDatabaseTarget, validate_cluster_batch
-from finpay_pipeline.cell_publication import CellWorksheetTarget
 from finpay_pipeline.cell_format import bulk_pipeline
 from finpay_pipeline.cell_format.bulk_pipeline import (
     persist_cell_range, preprocess_cell_range, publish_cell_range,
@@ -24,7 +23,7 @@ from finpay_pipeline.cell_format.bulk_pipeline import (
 from finpay_pipeline.cell_format.settings import (
     REPORTING_START_DATE, ROSTER_VERSION, account_settings, report_config, selected_clusters,
 )
-from finpay_pipeline.cell_publication_v2 import ROLES, cell_worksheet_title
+from finpay_pipeline.cell_publication_v2 import ROLES
 from finpay_pipeline.digipos_scraper import _write_xhr_export
 
 START = "2026-10-01"
@@ -412,15 +411,14 @@ class CellBulkPipelineTests(unittest.TestCase):
             sheet_factory = Mock()
             database_factory = Mock()
 
-            def fake_targets(cluster):
-                targets = {role: SimpleNamespace(writer_email="writer@example.test") for role in ROLES}
-                return "workbook", "legacy", targets
-
             def fake_publish(path, sha256, **kwargs):
                 return {"status": "COMPLETE", "cluster_id": kwargs["cluster_id"]}
 
             with patch.object(bulk_pipeline, "validate_cell_bulk_sheet_range"), \
-                    patch.object(bulk_pipeline, "sheet_targets", side_effect=fake_targets), \
+                    patch.object(
+                        bulk_pipeline, "sheet_configuration",
+                        return_value=SimpleNamespace(writer_email="writer@example.test"),
+                    ), \
                     patch.object(bulk_pipeline.daily, "publish_cell_sheets", side_effect=fake_publish) as publish:
                 result = publish_cell_range(
                     str(handoffs), digest, database_password="synthetic",
@@ -442,11 +440,6 @@ class CellBulkPipelineTests(unittest.TestCase):
             handoffs, digest = _make_handoff_bundle(root)
             calls = []
 
-            def fake_targets(cluster):
-                return "workbook", "legacy", {
-                    role: SimpleNamespace(writer_email="writer@example.test") for role in ROLES
-                }
-
             def fake_publish(path, sha256, **kwargs):
                 calls.append(kwargs["cluster_id"])
                 if kwargs["cluster_id"] == "422140":
@@ -454,7 +447,10 @@ class CellBulkPipelineTests(unittest.TestCase):
                 return {"status": "COMPLETE", "cluster_id": kwargs["cluster_id"]}
 
             with patch.object(bulk_pipeline, "validate_cell_bulk_sheet_range"), \
-                    patch.object(bulk_pipeline, "sheet_targets", side_effect=fake_targets), \
+                    patch.object(
+                        bulk_pipeline, "sheet_configuration",
+                        return_value=SimpleNamespace(writer_email="writer@example.test"),
+                    ), \
                     patch.object(bulk_pipeline.daily, "publish_cell_sheets", side_effect=fake_publish):
                 with self.assertRaisesRegex(RuntimeError, "stale cell Sheet handoff"):
                     publish_cell_range(
@@ -464,18 +460,23 @@ class CellBulkPipelineTests(unittest.TestCase):
             self.assertEqual(calls, list(selected_clusters("ALL"))[:6])
 
     def test_bulk_target_preflight_rejects_cross_cluster_worksheet_id_collisions(self):
-        def duplicate_targets(cluster):
-            account, _ = account_settings(cluster)
-            targets = {
-                role: CellWorksheetTarget(
-                    role, "cell-workbook", position, cell_worksheet_title(account, role),
-                    "writer@example.test", ("finance@example.test",),
-                )
-                for position, role in enumerate(ROLES, 101)
+        accounts = sorted(OBSERVED_CELL_ROSTER)
+        worksheet_ids = {
+            account: {
+                role: 1000 + account_index * 10 + role_index
+                for role_index, role in enumerate(ROLES)
             }
-            return "cell-workbook", "legacy-workbook", targets
-
-        with patch.object(bulk_pipeline, "sheet_targets", side_effect=duplicate_targets):
+            for account_index, account in enumerate(accounts)
+        }
+        worksheet_ids[accounts[1]][ROLES[0]] = worksheet_ids[accounts[0]][ROLES[0]]
+        environment = {
+            "CELL_FORMAT_SPREADSHEET_ID": "cell-workbook",
+            "CELL_FORMAT_LEGACY_SPREADSHEET_ID": "legacy-workbook",
+            "CELL_FORMAT_WRITER_EMAIL": "writer@example.test",
+            "CELL_FORMAT_FINANCE_EMAILS": "finance@example.test",
+            "CELL_FORMAT_WORKSHEET_IDS": json.dumps(worksheet_ids),
+        }
+        with patch.dict("os.environ", environment, clear=True):
             with self.assertRaisesRegex(ValueError, "IDs/titles must be unique"):
                 bulk_pipeline.validate_cell_bulk_sheet_range(START, END, "ALL")
 

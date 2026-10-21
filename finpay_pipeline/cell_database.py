@@ -148,6 +148,19 @@ class CellStore:
             raise RuntimeError("cell workflow session lock is not available")
         self._execute("SELECT 1")
 
+    def assert_cluster_target(self, target_id: str | None) -> None:
+        """Keep a cluster's cell history on one workbook unless explicitly migrated."""
+        self.assert_alive()
+        rows = self._execute(self._query(
+            "SELECT DISTINCT target_id FROM {} WHERE cluster_id=%s AND status <> 'DB_ONLY'",
+            "finpay_cell_publications_v1",
+        ), (self.cluster_id,)).fetchall()
+        targets = {row[0] for row in rows}
+        if target_id is None and targets:
+            raise ValueError("cluster already has Sheet publication history; cannot create or adopt a second workbook")
+        if target_id is not None and any(existing != target_id for existing in targets):
+            raise ValueError("cluster already has Sheet publication history in another workbook; explicit migration required")
+
     def acquire(self):
         row = self._execute("SELECT current_database(), current_user, current_schema()").fetchone()
         if tuple(row or ()) != (self.target.database, self.target.user, self.target.schema):

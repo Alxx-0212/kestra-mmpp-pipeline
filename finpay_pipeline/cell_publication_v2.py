@@ -405,6 +405,24 @@ def _require_empty(adapter, metadata):
         raise ValueError("unpublished v2 target is not empty")
 
 
+def preflight_unpublished_v2_sheet(adapter, expected_title, metadata=None):
+    """Check an existing fresh target before any missing tabs are added."""
+    metadata = adapter.metadata() if metadata is None else metadata
+    properties = metadata["properties"]
+    if properties["sheetId"] != adapter.worksheet_id:
+        raise ValueError("v2 worksheet identity mismatch")
+    if properties.get("title") != expected_title:
+        raise ValueError("worksheet title does not match exact v2 cluster/role")
+    protections = metadata.get("protectedRanges", [])
+    if any(item.get("description", "").startswith(GUARD_PREFIX) for item in protections):
+        raise RuntimeError("unresolved v2 refresh guard")
+    if any(not item.get("description", "").startswith(MANAGED_PREFIX) for item in protections):
+        raise ValueError("v2 target contains unmanaged protection")
+    if _marker_entries(metadata) or protections:
+        raise ValueError("unpublished v2 sheet has unmanaged generation/protection state")
+    _require_empty(adapter, metadata)
+
+
 def _verify_values(adapter, saved, previous=None):
     values = saved["values"]
     old = previous["values"] if previous else values
@@ -471,9 +489,7 @@ def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_
             _verify_final_protections(target.sheet_target(), prior[role]["matrix"], meta)
             _verify_style(adapter, prior[role]["matrix"], allow_unattested=True)
         else:
-            if _marker_entries(meta) or protections:
-                raise ValueError("unpublished v2 sheet has unmanaged generation/protection state")
-            _require_empty(adapter, meta)
+            preflight_unpublished_v2_sheet(adapter, target.title, meta)
     if prior:
         _read_baseline(adapters, prior)
     return publication

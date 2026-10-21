@@ -279,17 +279,20 @@ def prepare_cell_bundle_v2(bundle_path, configuration_path, expected_configurati
     return _prepare_cell_bundle_with_configs(bundle_path, expected_bundle_sha256, runtime, configs)
 
 
-def make_cell_sheet_client(credentials_info):
+def make_cell_sheet_client(credentials_info, *, include_drive_file=False):
     """A dedicated no-write-retry client; legacy retry policy is not reused."""
     import gspread
     from google.auth.transport.requests import AuthorizedSession
     from google.oauth2.service_account import Credentials
     from requests.adapters import HTTPAdapter
 
-    credentials = Credentials.from_service_account_info(
-        credentials_info, scopes=["https://www.googleapis.com/auth/spreadsheets",
-                                  "https://www.googleapis.com/auth/drive.metadata.readonly"],
-    )
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ]
+    if include_drive_file:
+        scopes.append("https://www.googleapis.com/auth/drive.file")
+    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
     session = AuthorizedSession(credentials, max_refresh_attempts=0)
     session.mount("https://", HTTPAdapter(max_retries=0))
     client = gspread.Client(auth=credentials, session=session)

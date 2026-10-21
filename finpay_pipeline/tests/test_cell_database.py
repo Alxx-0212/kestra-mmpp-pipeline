@@ -11,7 +11,7 @@ from unittest.mock import Mock
 
 from finpay_pipeline.cell_contracts import configured_cells, fingerprint
 from finpay_pipeline.cell_database import (
-    CELL_MIGRATION, CellDatabaseTarget, cell_publication_session,
+    CELL_MIGRATION, CellDatabaseTarget, CellStore, cell_publication_session,
     prepare_cell_day, validate_cluster_batch,
 )
 
@@ -37,7 +37,7 @@ class FakeConnection:
         self.commits = 0
         self.rollbacks = 0
         self.fail_ledger = False
-        self.state = {"sources": {}, "ledger": [], "current": {}, "publications": {}, "dates": [], "operations": {}, "dirty": {}}
+        self.state = {"sources": {}, "ledger": [], "current": {}, "publications": {}, "dates": [], "operations": {}, "dirty": {}, "route_targets": []}
 
     @contextmanager
     def transaction(self):
@@ -55,6 +55,9 @@ class FakeConnection:
         self.calls.append((text, params))
         if "current_database()" in text:
             return Result(self.database_identity)
+        if "SELECT DISTINCT target_id" in text and "finpay_cell_publications_v1" in text:
+            return Result(rows=[(target_id,) for target_id, status in self.state["route_targets"]
+                                if status != "DB_ONLY"])
         if "pg_try_advisory_lock" in text:
             return Result((self.lock_allowed,))
         if text.startswith("SELECT operation_id"):
@@ -156,6 +159,23 @@ class FakeConnection:
 
 
 class CellDatabaseTests(unittest.TestCase):
+    def test_cluster_publication_route_cannot_fork_across_workbooks(self):
+        target = CellDatabaseTarget("dummy.test", 5432, "dummy_finpay", "dummy_schema", "dummy_role")
+        connection = FakeConnection()
+        store = CellStore(connection, target, "412110", "new-workbook")
+        store.locked = store.cluster_locked = True
+
+        connection.state["route_targets"] = [("old-workbook", "COMPLETE")]
+        with self.assertRaisesRegex(ValueError, "another workbook"):
+            store.assert_cluster_target("new-workbook")
+        with self.assertRaisesRegex(ValueError, "second workbook"):
+            store.assert_cluster_target(None)
+
+        connection.state["route_targets"] = [("new-workbook", "COMPLETE")]
+        store.assert_cluster_target("new-workbook")
+        connection.state["route_targets"] = [("database-only:412110", "DB_ONLY")]
+        store.assert_cluster_target(None)
+
     def setUp(self):
         self.target = CellDatabaseTarget("dummy.test", 5432, "dummy_finpay", "dummy_schema", "dummy_role")
         self.cells = configured_cells({"412110_B": ("412111", "412112")})
