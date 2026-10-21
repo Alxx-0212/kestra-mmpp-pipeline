@@ -63,9 +63,10 @@ unchanged. The October 1-19 live canary used two workers; acquisition still has
 per-cell/day portal login overhead, so do not extrapolate an unmeasured
 single-worker speedup.
 
-Both range flows take `start_date`, `end_date` (inclusive `YYYY-MM-DD`,
-`Asia/Makassar`), and `cluster_id` (one configured numeric cluster or `ALL`).
-For example, cell `cluster_id=422180` selects DigiPOS account `422180_B`.
+Range flows take `start_date`, `end_date` (inclusive `YYYY-MM-DD`,
+`Asia/Makassar`), and `cluster_id` (one configured numeric cluster, a
+comma-separated group, or `ALL`). For example, cell `cluster_id=422180` selects
+DigiPOS account `422180_B`; a cloned flow can default it to `412110,422010`.
 They process date/cluster work sequentially through awaited child flows and stop
 on failure. Submit large backfills in smaller consecutive ranges: sequential
 iteration limits active work, not the total Kestra task-run count.
