@@ -339,8 +339,13 @@ production canary, release, or reusable reset authorization.
 This is a controlled disposal of one development test state, not an application
 recovery path. The normal source-generation/ledger append-only and publication
 recovery rules remain unchanged for application behavior and every other target.
-The complete pre-run state must remain in an access-restricted external archive as
-the immutable evidence for the removed development copy.
+The user subsequently explicitly instructed that no new dev data backups be
+created for this disposal. This waives the backup/restore prerequisites in
+Section 4 step 3, the pre-provisioning backup in Section 1 step 5, and the linked
+security guide only for this exact confirmed dev state.
+The discarded state is not guaranteed recoverable. Existing backups made before
+that instruction are not removed by this exception. Production and every other
+reset retain their backup and evidence-retention requirements.
 
 - Database: `finpay`, schema `public`, only after connection preflight proves the
   endpoint is the intended development instance and not production. Every
@@ -360,7 +365,7 @@ the immutable evidence for the removed development copy.
 - Data scope: daily cell reporting for `2026-10-01` through `2026-10-24`
   inclusive, all eight configured clusters (`412110`, `422010`, `422040`,
   `422090`, `422100`, `422140`, `422180`, and `422220`).
-- Before deletion, make a private allowlist of the exact source-generation and
+- Before deletion, make an in-memory allowlist of the exact source-generation and
   calculation IDs, cluster/cell/date keys, source fingerprints, and selected
   current rows. For every selected publication epoch, record its exact
   `(cluster_id, target_id, epoch)`, range, status, error, confirmed chunks,
@@ -368,7 +373,8 @@ the immutable evidence for the removed development copy.
   recorded values must still match this allowlist in the guarded transaction;
   delete only those exact rows and their FK children. Any extra/missing row,
   changed fingerprint/status, unexpected status, or `IN_FLIGHT` state blocks the
-  reset. No date-only predicate may widen the deletion beyond this receipt.
+  reset. Do not persist this dev data as a new receipt or backup. No date-only
+  predicate may widen the deletion beyond this in-memory allowlist.
 - The approved reset may remove the selected cell source generations, ledger,
   calculations, current selections, dirty dates, publication snapshots/date rows,
   and manual-reset records for the selected clusters and inclusive date range.
@@ -376,12 +382,12 @@ the immutable evidence for the removed development copy.
   replaced. Any selected publication epoch that starts before October 1 or ends
   after October 24 blocks the reset; do not partially remove an out-of-range
   publication snapshot.
-- The target-operation table has no date key. Remove a row only if the private
-  preflight receipt proves there is exactly one row for the approved workbook ID,
+- The target-operation table has no date key. Remove a row only if the in-memory
+  preflight proves there is exactly one row for the approved workbook ID,
   with `cluster_id=422180`, `status=UNKNOWN`, `error_class=APIError`, and the exact
   captured `operation_id` and `started_at`. This is the only target-operation row
   authorized for removal. Any mismatch, additional row, or `IN_FLIGHT` state
-  blocks the reset. Record the complete row fingerprint in the private archive.
+  blocks the reset. Compare its complete row fingerprint in memory.
 - The run may create only expected alias-named role tabs confirmed missing at
   preflight, up to 32. It must not delete or rewrite any pre-existing worksheet,
   change workbook sharing, or modify non-cell tables, other schemas, other
@@ -389,25 +395,21 @@ the immutable evidence for the removed development copy.
 
 Before reset, stop and verify all writers and active executions are quiescent;
 verify database, host/instance, role, and schema without printing credentials;
-record exact before-state counts and target identities; and take fresh external,
-checksum-verified database and full workbook backups. Test the database restore
-in an isolated scratch database. Verify the workbook archive by recomputing its
-full-state hashes and exercising its restore instructions against an offline
-fixture; do not test restoration by mutating this approved workbook. Workbook
-evidence must include all existing sheets' grids, metadata, protections, and
-sharing. Because this exception only creates tabs confirmed missing and never
-changes existing sheets, a failed publication is retained and reconciled rather
-than rolled back. Any actual workbook restoration requires separate approval.
-Keep backups access-restricted and outside the repository; retain them as the
-immutable evidence removed from the development database. A missing, inaccessible,
-stale, or unverified backup/recovery path blocks all reset and Sheet writes.
+compare exact before-state counts and target identities in memory. Create no new
+database dump, workbook snapshot, data archive, or backup fixture for this run.
+Retain only the workflow's normal operational records/artifacts and sanitized
+counts/status needed to report execution. Compare pre-existing worksheet state
+and sharing in memory; they remain outside the mutation scope. A failed or
+ambiguous publication is retained for reconciliation, not blindly retried or
+rolled back. Any actual restoration requires separate approval.
 
 Use a transactionally guarded reset with exact target predicates, FK-safe delete
 order, and asserted before/after counts; do not use blanket `TRUNCATE`, delete
 other targets, or continue after unexpected state. Build only uniquely tagged
 local test images from the reviewed source snapshot; do not overwrite release
 tags or publish images. Run the full inclusive range once. Any failed or ambiguous
-stage stops the run; retain its new evidence and obtain fresh approval before
+stage stops the run; retain only normal workflow outputs and sanitized execution
+status, not a new receipt, archive, or backup, and obtain fresh approval before
 another reset or destructive retry. Independently verify all 192 cluster/date
 cohorts and 432 cell-days, database source/current/calculation consistency,
 four-tab values and evaluated formulas, publication markers/fingerprints,
