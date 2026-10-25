@@ -8,8 +8,6 @@ from .cell_calculation import MAX_EXACT_RUPIAH, CellReportConfig
 from .cell_contracts import CellIdentity, business_date, fingerprint
 
 PANEL_HEADERS = ("REPORT DATE", "INVOICE REPORT", "DEBET", "KREDIT")
-SALES_FEE_CUTOFF = business_date("2026-09-01")
-SALES_FEE_RESTORED = business_date("2026-10-01")
 SALES_FEE_LABEL = "BIAYA FEE BAR A ST (HOLD)"
 INVOICE_COLORS = {
     name: {channel: int(value[index:index + 2], 16) / 255
@@ -122,8 +120,8 @@ def _summary_measures(calculation: dict) -> dict[str, dict]:
     return measures
 
 
-def _records_for_day(day, cells):
-    """Make one shared category/date row template for all invoice panels."""
+def _records_for_day(cells):
+    """Make one shared per-day template; cell SLSHOLD is permanent."""
     codes = sorted(cells)
     measures = {code: _summary_measures(cells[code]) for code in codes}
     qrises = {code: _qris_groups(cells[code].get("qris", [])) for code in codes}
@@ -131,12 +129,6 @@ def _records_for_day(day, cells):
         2 if label == "MISSING DISBURSEMENT DATE" else 1 if not _is_invoice_date(label) else 0,
         _invoice_date_key(label), label,
     ))
-    include_sales_fee = (
-        day < SALES_FEE_CUTOFF
-        or (day >= SALES_FEE_RESTORED and any(
-            "SELLTHRUSALESFEE" in measures[code] for code in codes
-        ))
-    )
     records: list[tuple[str, str, dict[str, tuple[int | str, int | str]]]] = []
 
     def add(section, label, values):
@@ -170,7 +162,7 @@ def _records_for_day(day, cells):
                 for label in qris_labels:
                     add(section, "QRISDUWIT - " + label,
                         {code: (qrises[code].get(label, 0), "") for code in codes})
-        if section == "SELLTHRU" and include_sales_fee:
+        if section == "SELLTHRU":
             add(section, SALES_FEE_LABEL, {
                 code: _split(measures[code], "SELLTHRUSALESFEE") for code in codes
             })
@@ -210,7 +202,7 @@ def build_cell_invoice_matrix(config: CellReportConfig, cell_days: list[dict], *
     for date_index, date_string in enumerate(date_strings):
         day = business_date(date_string)
         per_code = {code: facts[(date_string, code)] for code in codes}
-        for section, label, values in _records_for_day(day, per_code):
+        for section, label, values in _records_for_day(per_code):
             if label == "QRISDUWIT":
                 qris_subtitle_rows.append(len(matrix) + 1)
             elif label.startswith("QRISDUWIT - "):

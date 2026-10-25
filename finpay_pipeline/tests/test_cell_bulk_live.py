@@ -103,7 +103,7 @@ class BulkLiveBoundaryTests(unittest.TestCase):
                 {"deleteProtectedRange": {"protectedRangeId": 7002}}]})
         self.assertEqual(len(self.http.writes), 2)
 
-    def test_isolated_render_keeps_five_stages_and_uses_only_fixed_settings_targets(self):
+    def test_isolated_render_keeps_all_stages_and_uses_only_fixed_settings_targets(self):
         source_root = Path(__file__).resolve().parents[2]
         state = {"state": "DATABASE_READY", "resources": {"taskworkdir": str(self.root / "taskworkdir")}}
         live.ops.write_json(self.root / "state.json", state)
@@ -111,7 +111,7 @@ class BulkLiveBoundaryTests(unittest.TestCase):
         with patch.dict(os.environ, {"E2E_WORKFLOW_DIR": str(source_root / "finpay_pipeline/workflows")}):
             live.render_flow()
         text = (self.root / "isolated-bulk-flow.yml").read_text()
-        self.assertEqual(text.count("    taskRunner:"), 5)
+        self.assertEqual(text.count("    taskRunner:"), 6)
         self.assertEqual(text.count("networkMode: host"), 1)
         self.assertNotIn("controller.env", text)
         self.assertNotIn(f'{self.root}:/evidence"', text)
@@ -120,7 +120,7 @@ class BulkLiveBoundaryTests(unittest.TestCase):
         self.assertIn("create_worksheets_if_missing: false", text)
         self.assertIn("defaults: false", text)
         scripts = re.findall(r"(?m)^    script: \|\n((?:^      .*\n|^\n)*)", text)
-        self.assertEqual(len(scripts), 5)
+        self.assertEqual(len(scripts), 6)
         for script in scripts:
             ast.parse(textwrap.dedent(script))
 

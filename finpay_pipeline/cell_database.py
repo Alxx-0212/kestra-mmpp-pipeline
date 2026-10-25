@@ -46,6 +46,84 @@ class CellDatabaseTarget:
             raise ValueError("cell database target is not allowlisted")
 
 
+def safe_cell_database_error(exc: Exception) -> str:
+    """Describe DB failures without returning libpq messages, DSNs, or SQL values."""
+    state = getattr(exc, "sqlstate", None)
+    state = state if isinstance(state, str) and re.fullmatch(r"[A-Z0-9]{5}", state) else "unavailable"
+    message = str(exc).lower()
+    category = next((label for needle, label in (
+        ("password authentication failed", "authentication_failed"),
+        ("could not translate host", "dns_failed"),
+        ("name or service not known", "dns_failed"),
+        ("temporary failure in name resolution", "dns_failed"),
+        ("connection refused", "connection_refused"),
+        ("timeout", "timeout"),
+        ("does not exist", "missing_database_or_relation"),
+        ("no pg_hba.conf", "pg_hba_rejected"),
+        ("permission denied", "permission_denied"),
+        ("preflight identity mismatch", "identity_mismatch"),
+        ("preflight missing relation", "missing_relation"),
+        ("preflight privileges", "permission_denied"),
+    ) if needle in message), "database_operation_failed")
+    return f"{type(exc).__name__}; category={category}; sqlstate={state}"
+
+
+def preflight_cell_database(target: CellDatabaseTarget, approved_targets, *, password: str,
+                            connect=None) -> dict:
+    """Check the configured runtime role read-only, without DDL or advisory locks."""
+    target.validate(approved_targets)
+    if not password:
+        raise ValueError("explicit cell database password is required")
+    if connect is None:
+        if any(word in target.host.lower() for word in ("dummy", "synthetic")):
+            raise ValueError("synthetic database targets require an injected connection")
+        import psycopg
+        connect = psycopg.connect
+    tables = {
+        "finpay_cell_configs_v1": ("SELECT", "INSERT"),
+        "finpay_cell_sources_v1": ("SELECT", "INSERT"),
+        "finpay_cell_ledger_v1": ("SELECT", "INSERT"),
+        "finpay_cell_calculations_v1": ("SELECT", "INSERT"),
+        "finpay_cell_current_v1": ("SELECT", "INSERT", "UPDATE"),
+        "finpay_cell_publications_v1": ("SELECT", "INSERT", "UPDATE"),
+        "finpay_cell_target_operations_v1": ("SELECT", "INSERT", "UPDATE"),
+        "finpay_cell_dirty_dates_v1": ("SELECT", "INSERT", "UPDATE", "DELETE"),
+        "finpay_cell_publication_dates_v1": ("SELECT", "INSERT", "UPDATE"),
+        "finpay_cell_manual_resets_v1": ("SELECT", "INSERT"),
+        "finpay_cell_current_results_v1": ("SELECT",),
+    }
+    connection = None
+    try:
+        connection = connect(
+            host=target.host, port=target.port, dbname=target.database,
+            user=target.user, password=password, autocommit=True, connect_timeout=15,
+            options="-c default_transaction_read_only=on",
+        )
+        connection.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(target.schema)))
+        actual = connection.execute(
+            "SELECT current_database(), current_user, current_schema()",
+        ).fetchone()
+        if tuple(actual or ()) != (target.database, target.user, target.schema):
+            raise ValueError("cell database preflight identity mismatch")
+        if not connection.execute("SELECT has_schema_privilege(%s,'USAGE')", (target.schema,)).fetchone()[0]:
+            raise ValueError("cell database preflight privileges unavailable")
+        for name, privileges in tables.items():
+            relation = f"{target.schema}.{name}"
+            if connection.execute("SELECT to_regclass(%s)", (relation,)).fetchone()[0] is None:
+                raise ValueError("cell database preflight missing relation")
+            for privilege in privileges:
+                if not connection.execute(
+                    "SELECT has_table_privilege(%s,%s)", (relation, privilege),
+                ).fetchone()[0]:
+                    raise ValueError("cell database preflight privileges unavailable")
+        return {"status": "READY", "tables_checked": len(tables) - 1, "views_checked": 1}
+    except Exception as exc:
+        raise RuntimeError("cell database preflight failed: " + safe_cell_database_error(exc)) from None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def prepare_cell_day(identity: CellIdentity, entry: dict, raw_rows: list[dict],
                      calculation: dict, configuration: dict, rules_version: str) -> dict:
     """Produce immutable, content-addressed evidence without opening a database."""
@@ -228,7 +306,17 @@ class CellStore:
                 ), (identity["account"], identity["cluster_id"], identity["cell_code"],
                     item["report_date"])).fetchone()
                 changed = changed or not old or old[1] != item["calculation_id"]
-                reset_required = reset_required or not old or old[0] != item["generation_id"]
+                source_changed = not old
+                if old and old[0] != item["generation_id"]:
+                    old_source = self._execute(self._query(
+                        "SELECT raw_fingerprint,row_count FROM {} WHERE generation_id=%s",
+                        "finpay_cell_sources_v1",
+                    ), (old[0],)).fetchone()
+                    if old_source is None:
+                        raise ValueError("current cell source evidence is missing")
+                    # Retain each artifact generation, but XLSX metadata is not a source correction.
+                    source_changed = tuple(old_source) != (item["raw_fingerprint"], len(item["raw_rows"]))
+                reset_required = reset_required or source_changed
                 self._execute(self._query(
                     "INSERT INTO {} (config_id,configuration) VALUES (%s,%s::jsonb) "
                     "ON CONFLICT (config_id) DO NOTHING", "finpay_cell_configs_v1",

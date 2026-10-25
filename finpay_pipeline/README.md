@@ -75,9 +75,8 @@ acquisition chunks, and publishes once per cluster. Scraping is parallel across
 accounts with dates sequential per account; processing, PostgreSQL, and Sheet
 writes are serial. It consumes validated daily exports, not arbitrary
 unpartitioned multi-date CSV uploads. Existing daily/range workflows remain
-unchanged. The October 1-19 live canary used two workers; acquisition still has
-per-cell/day portal login overhead, so do not extrapolate an unmeasured
-single-worker speedup.
+unchanged. Acquisition retains per-cell/day portal login overhead; worker bounds
+do not remove that cost.
 
 Range flows take `start_date`, `end_date` (inclusive `YYYY-MM-DD`,
 `Asia/Makassar`), and `cluster_id` (one configured numeric cluster, a
@@ -93,11 +92,20 @@ controls default to `dry_run=true`, `write_gsheet=false`; legacy also defaults
 The cell day task graph is:
 
 ```text
+preflight_cell_database (non-dry runs only, before acquisition)
+  -> read-only target/schema/table-privilege check
 acquire_cell_cluster_day -> cell_sources_v2.zip
 preprocess_cell_cluster_day -> cell_prepared_v1.json
 persist_cell_sources_and_calculations -> cell_handoff_v1.json
 publish_cell_four_tabs -> guarded Summary/Invoice/Unusual/Reversal publication
 ```
+
+Both day and bulk workflows run the read-only database preflight before DigiPOS
+acquisition when `dry_run=false`, using the existing `FINPAY_DB_*` secrets. Dry
+runs skip the task and do not connect to PostgreSQL. The preflight checks the
+configured target and runtime role's schema/table privileges; it creates no
+schema or tables and applies no DDL or migration. Cell schema setup remains an
+explicit operation.
 
 Artifacts are bounded and checksummed. Persistence does not create a Google
 client; publication reacquires locks and rejects changed selected history before
@@ -105,10 +113,15 @@ writing, without re-importing sources. Spreadsheet name/optional ID, distinct
 legacy ID, writer, and Finance editors must be configured; missing configuration
 fails preflight before acquisition or DB writes. `write_gsheet=false` keeps the
 bulk acquisition/preprocessing/DB path independent from Google writes.
-Persisted cell history must stay contiguous; a range separated from existing
-coverage by missing dates fails rather than assuming zero activity in the gap.
-The new cell history starts on `2026-10-01`; later first persistence without
-October 1 coverage is rejected. Per-day offline preprocessing remains available.
+Coverage checks validate stored history required for balance calculations; they
+do not require every correction request to continue from the current stored tail.
+For example, with October 1-10 stored, a request for October 10-15 replaces
+October 10 and adds October 11-15 without duplicating dates. Once October 1-19
+are stored, a single October 19 correction is valid. A correction preserves
+dates outside its requested range and recomputes later dependent balances. The
+new cell history still starts on `2026-10-01`; missing required stored dates are
+rejected rather than treated as zero activity. Per-day offline preprocessing
+remains available.
 
 Existing IDs remain compatibility interfaces, including their original inputs
 and artifact contracts:
@@ -216,12 +229,36 @@ visible date with a top border. Source full cell codes remain in evidence.
 
 Four-tab publication uses one epoch, full-history fingerprints, target/cluster
 locks, temporary guards, and value/formula/style/protection readback before
-completion. A green tab/A1 note confirms Sheet verification only; success also
-requires the database completion record. A failed or ambiguous DB confirmation
-requires operator reconciliation even when the tabs look complete.
+completion. Each publication fully renders Summary, Invoice, Unusual, and
+Reversal; it is not a patch-only writer. Missing initial tabs are created only
+when `create_worksheets_if_missing` is enabled. A missing worksheet ID with
+previous publication history fails closed rather than being rebound. A green
+tab/A1 note confirms Sheet verification only; success also requires the database
+completion record. A failed or ambiguous DB confirmation requires operator
+reconciliation even when the tabs look complete.
+Read-only metadata, value, and style fetches retry HTTP 408/429/500/502/503/504,
+Drive 403 rate/quota errors explicitly identified by `usageLimits`, and
+request timeout/connection errors for at most six attempts with 2/4/8/16/32-second
+backoff. Numeric `Retry-After` is honored only when finite and at most 60 seconds;
+invalid or longer values fail closed. Authentication, permission, daily-limit,
+disabled-API, and validation errors propagate immediately,
+and `batch_update` or any other mutation is never retried.
+Worksheet creation is one-shot: bounded exact-title readback confirms only a
+single matching tab with the exact returned ID when present and configured ID
+when pinned. A failed or ambiguous readback leaves the target-operation journal
+`UNKNOWN` for operator reconciliation.
 A checksum proves integrity, not source authority: deployment must
 restrict non-dry source imports to approved callers. Existing managed or design
 preview tabs are not fresh targets and cannot be adopted by inventing a baseline.
+Date, stored-coverage, stale-handoff, and publication-state guards remain in
+force for corrections; missing history is never inferred as zero and ambiguous
+`IN_FLIGHT`/`UNKNOWN` state is never bypassed.
+
+A byte-different source artifact may still append an immutable generation, update
+current rows, and rewrite the snapshot. If the validated raw-row fingerprint is
+identical, that generation change must not reset manual bank inputs. Actual
+validated source-content changes retain the existing audited reset policy for
+the corrected date and its preceding day.
 
 ## Data Contracts
 
@@ -247,15 +284,22 @@ when the new Sheet running SALDO starts at zero.
 - Dedup compares all relevant columns except `No`, with timestamps at minute precision; it does not delete immutable evidence.
 - Raw `RECHARGE` with the complete normalized remark `transaksi sellthru` is the no-companion SELLTHRU exception. Direct SELLTHRU does not inherit it; companions quarantine the standalone family.
 - Recharge and reversal-recharge fee expectation/cap is Rp20. Normal SELLTHRU platform fees total Rp100; missing/incorrect ST fees remain flagged but included, while excess fee rows are excluded.
-- Before `2026-09-01`, normal ST requires `SELLTHRUSALESFEE`. September retires that companion and quarantines incoming SLSFEE families. From `2026-10-01`, it is required again; normalize source `SELLTHRUSALESHOLD` and terminal `SLSHLD` to the existing sales-fee family, preserving raw data and amounts. Cross-policy families quarantine; no inferred hold rate or month-end expiry is added.
+- The previous-format family policy is effective-dated: before `2026-09-01`, normal ST requires `SELLTHRUSALESFEE`; the temporary legacy September rule retires that companion and quarantines incoming SLSFEE families; from `2026-10-01`, the shared classifier recognizes the existing family again. Legacy invoice presentation remains separately governed below.
+- The new cell history starts `2026-10-01`. For every supported cell day, normalize source `SELLTHRUSALESHOLD`/terminal `SLSHLD` to the separate `SELLTHRUSALESFEE` category, preserving raw labels, IDs, amounts, and `Remarks`. Normal ST requires platform fee companions totaling Rp100 and separately accounts the source SLSHOLD amount. The cell policy has no September retirement or annual expiry: both fees contribute to ST expected settlement and running SALDO, and the hold line remains in Summary/Invoice even when zero. A missing hold is not fabricated as a source row and remains Unusual; an observed zero-valued hold is present and remains zero.
 - Recharge fee-only rows remain unusual but included. ST fee-only and unsupported `Reversal - ST*` families are unusual and excluded.
 - Out-cluster relabeling and exact reversal linkage follow [`classification.py`](classification.py); downstream code trusts prepared labels instead of relabeling twice.
 - Characterize new labels and remark structures from source before extending allowlists. The legacy October preprocessing change does not itself change legacy Sheet/invoice or monthly release contracts.
 
 Legacy invoices include `BIAYA FEE BAR A ST (HOLD)` and its MANDIRI ST contribution
 only before `2026-09-01`; September onward omits them. The October classification
-restoration does not reinstate that legacy presentation. See
+restoration does not reinstate that legacy presentation. This is separate from the
+permanent cell Summary/Invoice rule above. See
 [`summary_sheets.py`](summary_sheets.py) for this separate invoice cutoff.
+
+Cell Summary, SALDO/ST expected settlement, and Invoice always include the
+SLSHOLD line; empty/missing fee data projects as zero, while the Unusual rules
+still distinguish an absent companion from an observed zero source row. This
+cell policy must not change the legacy September behavior.
 
 See [`classification.py`](classification.py), [`dedup.py`](dedup.py),
 [`summary.py`](summary.py), and [`cell_calculation.py`](cell_calculation.py)

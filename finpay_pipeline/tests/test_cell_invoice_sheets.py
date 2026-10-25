@@ -1,4 +1,4 @@
-"""Offline per-cell FinPay invoice panels and cutover regressions."""
+"""Offline per-cell FinPay invoice panels and permanent hold-fee regressions."""
 import unittest
 
 from finpay_pipeline.cell_calculation import CellReportConfig
@@ -11,8 +11,8 @@ from finpay_pipeline.cell_invoice_sheets import (
 class CellInvoiceSheetTests(unittest.TestCase):
     def setUp(self):
         self.config = CellReportConfig(
-            "412110_B", ("412111", "412112"), "2026-08-31",
-            "2026-08-31T00:00:00+08:00", {"412111": 1_000_000, "412112": 2_000_000},
+            "412110_B", ("412111", "412112"), "2026-10-01",
+            "2026-10-01T00:00:00+08:00", {"412111": 1_000_000, "412112": 2_000_000},
             "SYNTHETIC-v2",
         )
 
@@ -44,9 +44,13 @@ class CellInvoiceSheetTests(unittest.TestCase):
             {"Disbursement Date": "04/06/2026", "Kredit": 15}]))
         labels = [row[1] for row in matrix["values"]]
         for label in ("CASH IN - NGRS", "NGRS", "Recharge Fee", "SELLTHRU", "ST",
-                      "BIAYA FEE ST", "ACCOUNTING", "QRISDUWIT", "QRISDUWIT - 04/06/2026"):
+                      "BIAYA FEE ST", SALES_FEE_LABEL, "ACCOUNTING", "QRISDUWIT",
+                      "QRISDUWIT - 04/06/2026"):
             self.assertIn(label, labels)
-        self.assertNotIn(SALES_FEE_LABEL, labels)
+        hold_index = self.index(matrix, SALES_FEE_LABEL)
+        for panel in matrix["panels"]:
+            start = panel["start_column"] - 1
+            self.assertEqual(matrix["values"][hold_index][start + 2:start + 4], [0, 0])
         self.assertFalse(any("LINKAJA" in value for row in matrix["values"] for value in row if isinstance(value, str)))
         self.assertEqual(matrix["scope_note"],
                          "FinPay-only invoice; LinkAja fees and separate LinkAja workflow are excluded.")
@@ -95,24 +99,65 @@ class CellInvoiceSheetTests(unittest.TestCase):
         self.assertLess(self.index(matrix, "QRISDUWIT - invalid"),
                         self.index(matrix, "QRISDUWIT - MISSING DISBURSEMENT DATE"))
 
-    def test_slsfee_cutover_and_october_hold_invoice_only(self):
+    def test_cell_slsfee_row_is_permanent_and_zero_safe(self):
         fee = (("SELLTHRUSALESFEE", 0, 100, 1),)
-        before = build_cell_invoice_matrix(self.config, self.facts("2026-08-31", first=fee))
-        september_first = build_cell_invoice_matrix(self.config, self.facts("2026-09-01", first=fee))
-        september_last = build_cell_invoice_matrix(self.config, self.facts("2026-09-30", first=fee))
         october = build_cell_invoice_matrix(self.config, self.facts("2026-10-01", first=fee))
-        self.assertIn(SALES_FEE_LABEL, [row[1] for row in before["values"]])
-        self.assertNotIn(SALES_FEE_LABEL, [row[1] for row in september_first["values"]])
-        self.assertNotIn(SALES_FEE_LABEL, [row[1] for row in september_last["values"]])
         index = self.index(october, SALES_FEE_LABEL)
         self.assertEqual(october["values"][index][2:4], [0, 100])
         self.assertEqual(october["values"][index][9:11], [0, 0])
 
-    def test_reversal_with_slsfee_suffix_is_not_an_invoice_fee(self):
-        # Invoice projection consumes processed category, not a raw ID suffix.
+        zero_observed = build_cell_invoice_matrix(
+            self.config, self.facts("2026-10-02", first=(("SELLTHRUSALESFEE", 0, 0, 1),)))
+        zero_absent = build_cell_invoice_matrix(self.config, self.facts("2026-10-03"))
+        future = build_cell_invoice_matrix(self.config, self.facts("2027-09-01", first=fee))
+        for matrix in (zero_observed, zero_absent):
+            row = self.index(matrix, SALES_FEE_LABEL)
+            for panel in matrix["panels"]:
+                start = panel["start_column"] - 1
+                self.assertEqual(matrix["values"][row][start + 2:start + 4], [0, 0])
+        future_row = self.index(future, SALES_FEE_LABEL)
+        self.assertEqual(future["values"][future_row][2:4], [0, 100])
+
+    def test_reversal_with_slsfee_suffix_does_not_create_hold_amount(self):
+        # The permanent cell row stays visible, but a reversal is not its amount.
         reversal = (("REVERSAL", 0, 100, 1),)
         matrix = build_cell_invoice_matrix(self.config, self.facts("2026-10-01", first=reversal))
-        self.assertNotIn(SALES_FEE_LABEL, [row[1] for row in matrix["values"]])
+        index = self.index(matrix, SALES_FEE_LABEL)
+        for panel in matrix["panels"]:
+            start = panel["start_column"] - 1
+            self.assertEqual(matrix["values"][index][start + 2:start + 4], [0, 0])
+
+    def test_raw_hold_family_reaches_summary_and_invoice_matrices(self):
+        from finpay_pipeline.cell_publication_v2 import build_cell_cluster_matrices_v2
+        from finpay_pipeline.tests.test_cell_calculation import CellCalculationTests
+
+        fixture = CellCalculationTests()
+        fixture.setUp()
+        day = "2026-10-13"
+        for hold_amount in (20, 0):
+            with self.subTest(hold_amount=hold_amount):
+                facts = []
+                for code in fixture.config.cell_codes:
+                    rows = [
+                        fixture.row(day=day, amount=10000, label="SELLTHRU", identifier="BASEST",
+                                    remarks="Sellthru Sales Fee"),
+                        fixture.row(day=day, amount=0, debit=100, label="SELLTHRUFEE", identifier="BASESTFEE",
+                                    remarks="Platform fee sellthru rp. 100,-"),
+                        fixture.row(day=day, amount=0, debit=hold_amount, label="SELLTHRUSALESHOLD",
+                                    identifier="BASESTSLSHLD",
+                                    remarks=f"Sales hold transaksi sellthru sejumlah {hold_amount} rupiah, dari 412110"),
+                    ]
+                    for row in rows:
+                        if row["Debet"]:
+                            row["Transaction Type"] = "Debit"
+                    facts.append(fixture.prepare(code, rows, day))
+                matrices = build_cell_cluster_matrices_v2(fixture.config, facts, day)
+                invoice = matrices["invoice"]
+                index = self.index(invoice, SALES_FEE_LABEL)
+                for panel in invoice["panels"]:
+                    start = panel["start_column"] - 1
+                    self.assertEqual(invoice["values"][index][start + 2:start + 4], [0, hold_amount])
+                self.assertTrue(any(SALES_FEE_LABEL in row for row in matrices["summary"]["values"]))
 
     def test_rejects_incomplete_identity_config_or_unvalidated_summary(self):
         incomplete = self.facts("2026-10-01")[:1]

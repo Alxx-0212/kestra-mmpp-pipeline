@@ -118,6 +118,32 @@ class CellSheetDesignTests(unittest.TestCase):
         self.assertEqual(matrix["values"][row][3], f"=MAX(SUM(K{row + 1},R{row + 1}),0)")
         self.assertEqual(matrix["values"][row][4], f"=MAX(-SUM(K{row + 1},R{row + 1}),0)")
 
+    def test_st_formula_includes_separate_sls_hold_once(self):
+        fixture = fixtures.CellCalculationTests()
+        fixture.setUp()
+        rows = [
+            fixture.row(label="SELLTHRU", identifier="FAMILY", amount=10_000,
+                        remarks="Sellthru Sales Fee"),
+            fixture.row(label="SELLTHRUFEE", identifier="FAMILYFEE", amount=0, debit=100,
+                        remarks="Platform fee sellthru rp. 100,-"),
+            fixture.row(label="SELLTHRUSALESHOLD", identifier="FAMILYSLSHLD", amount=0, debit=20,
+                        remarks="Sales hold transaksi sellthru sejumlah 20 rupiah, dari 412110"),
+        ]
+        facts = [fixture.prepare("412111", rows), fixture.prepare("412112", [])]
+        report = build_cluster_report(fixture.config, facts, "2026-10-13")
+        matrix = render_cell_matrix(report, dummy=True)
+        st_row = matrix["row_keys"].index("MANDIRI:net:ST")
+        hold_row = self.row(matrix, "2026-10-13", "DETAIL:SELLTHRUSALESFEE")
+        categories = ("SELLTHRU", "SELLTHRUFEE", "SELLTHRUSALESFEE")
+        expected = "=" + "+".join(
+            f"(K{self.row(matrix, '2026-10-13', 'DETAIL:' + category)}-"
+            f"L{self.row(matrix, '2026-10-13', 'DETAIL:' + category)})"
+            for category in categories
+        )
+        self.assertEqual(matrix["values"][st_row][10], expected)
+        self.assertEqual(expected.count(f"K{hold_row}"), 1)
+        self.assertEqual(matrix["numeric_preview"][st_row][10], 9_880)
+
     def test_numeric_preview_cash_difference_sign_matches_finance_layout(self):
         matrix = render_cell_matrix(self.report, dummy=True,
                                     manual_values={("2026-10-13", "412111"): 45000})

@@ -5,12 +5,18 @@ Agent-readable build, CI/CD, commissioning, and recovery procedure. Read
 [security](../docs/security.md), [architecture](../docs/architecture.md), and
 [validation](../docs/validation.md) rules before acting.
 
-This procedure does not authorize deployment, infrastructure creation, sharing
-changes to existing workbooks, resets, credential rotation, commits, or registry
-publication. The configured auto-create option may share a newly created workbook
-only with its explicit Finance editor list. Obtain current approval for all other
-targets and operations. No hosted CI workflow is installed here; the gates below
-define what CI/CD must execute.
+This procedure does not authorize production deployment, infrastructure creation,
+changes to sharing on existing workbooks, production resets or repairs, credential
+rotation, commits, or registry publication. Development destructive tests are
+separate from production replication and may run only against dedicated disposable
+non-production databases and workbooks, using synthetic data and code-level target
+guards, except for the single current-user-approved scope in Section 6.1. That
+exception is not production approval and does not generalize to other runs or
+targets. Never point test resets or cleanup at production resources. The configured
+auto-create option may share a newly created workbook only with its explicit
+Finance editor list. Obtain current approval for production targets and operations.
+No hosted CI workflow is installed here; the gates below define what CI/CD must
+execute.
 
 ## 1. Freeze And Configure
 
@@ -165,8 +171,11 @@ publication and production promotion require explicit approval.
    account alone does not isolate Docker resources.
 2. Keep application data separate from Kestra metadata. Verify
    `current_database()`, `current_user`, and schema against the approved target
-   before any migration/write. Destructive tests must never use `finpay`,
-   `finpay_txn`, `linkaja`, or `kestra`.
+   before any migration/write. Run destructive tests only against dedicated
+   disposable non-production databases with code-level target guards, except for
+   the exact one-time development target and operation in Section 6.1. Otherwise,
+   never use `finpay`, `finpay_txn`, `linkaja`, or `kestra` for destructive tests,
+   and never direct test cleanup at production databases or workbooks.
 3. Before changing existing data, stop competing writers and take external,
    checksum-verified DB and Sheet backups with tested restore instructions.
 4. Under approved bootstrap credentials, explicitly apply
@@ -313,9 +322,103 @@ approximately one minute; it did not rescrape or repeat database persistence.
 
 ## 6. Canary And Acceptance
 
-Obtain approval for the account/date, exact four tabs, DB target, migration, and
-any test-only reset. A reset requires a verified private backup and exact scope;
-it is not normal deployment. Begin with October 1. Inspect a dry acquisition,
+Development E2E checks, including destructive reset/cleanup, are separate from
+production commissioning and may continue while development is in progress. Keep
+them on dedicated disposable non-production database and workbook targets, with
+synthetic data and code-level target guards, except for the single approved
+development run below. Production commissioning approval is not a prerequisite
+for isolated development checks.
+
+### 6.1 One-Time Development Reset Exception
+
+The current user explicitly approved this one-time exception, including removal
+of the existing `UNKNOWN` operation and publication/source history. It overrides
+only the development-test restrictions in Sections 1, 4.2, and 6; it is not a
+production canary, release, or reusable reset authorization.
+
+This is a controlled disposal of one development test state, not an application
+recovery path. The normal source-generation/ledger append-only and publication
+recovery rules remain unchanged for application behavior and every other target.
+The complete pre-run state must remain in an access-restricted external archive as
+the immutable evidence for the removed development copy.
+
+- Database: `finpay`, schema `public`, only after connection preflight proves the
+  endpoint is the intended development instance and not production. Every
+  destructive SQL transaction must itself abort unless
+  `current_database() = 'finpay'` and the selected schema is `public`; a separate
+  application preflight does not replace this SQL guard. The exception does not
+  authorize touching `finpay_txn`, `linkaja`, or `kestra`.
+- Workbook: the exact user-approved ID must be supplied from the private
+  mode-restricted execution profile and verified by live metadata. Before any
+  Sheet write, independently establish from a trusted environment inventory or
+  explicit owner confirmation that it is a non-production development/test copy.
+  If this cannot be established, or the file is the production workbook, stop;
+  production writes require the ordinary production-canary approval and gates.
+  The non-production copy must also match `Monitoring Finpay (MMPP & GMM)`; a
+  title mismatch blocks the run. Do not store the ID in this tracked document or
+  public logs.
+- Data scope: daily cell reporting for `2026-10-01` through `2026-10-24`
+  inclusive, all eight configured clusters (`412110`, `422010`, `422040`,
+  `422090`, `422100`, `422140`, `422180`, and `422220`).
+- Before deletion, make a private allowlist of the exact source-generation and
+  calculation IDs, cluster/cell/date keys, source fingerprints, and selected
+  current rows. For every selected publication epoch, record its exact
+  `(cluster_id, target_id, epoch)`, range, status, error, confirmed chunks,
+  `snapshot_fingerprint`, and canonical snapshot hash. The live key sets and all
+  recorded values must still match this allowlist in the guarded transaction;
+  delete only those exact rows and their FK children. Any extra/missing row,
+  changed fingerprint/status, unexpected status, or `IN_FLIGHT` state blocks the
+  reset. No date-only predicate may widen the deletion beyond this receipt.
+- The approved reset may remove the selected cell source generations, ledger,
+  calculations, current selections, dirty dates, publication snapshots/date rows,
+  and manual-reset records for the selected clusters and inclusive date range.
+  Keep configuration provenance unless reset preflight proves it must be
+  replaced. Any selected publication epoch that starts before October 1 or ends
+  after October 24 blocks the reset; do not partially remove an out-of-range
+  publication snapshot.
+- The target-operation table has no date key. Remove a row only if the private
+  preflight receipt proves there is exactly one row for the approved workbook ID,
+  with `cluster_id=422180`, `status=UNKNOWN`, `error_class=APIError`, and the exact
+  captured `operation_id` and `started_at`. This is the only target-operation row
+  authorized for removal. Any mismatch, additional row, or `IN_FLIGHT` state
+  blocks the reset. Record the complete row fingerprint in the private archive.
+- The run may create only expected alias-named role tabs confirmed missing at
+  preflight, up to 32. It must not delete or rewrite any pre-existing worksheet,
+  change workbook sharing, or modify non-cell tables, other schemas, other
+  destinations, or records outside the stated clusters/date range.
+
+Before reset, stop and verify all writers and active executions are quiescent;
+verify database, host/instance, role, and schema without printing credentials;
+record exact before-state counts and target identities; and take fresh external,
+checksum-verified database and full workbook backups. Test the database restore
+in an isolated scratch database. Verify the workbook archive by recomputing its
+full-state hashes and exercising its restore instructions against an offline
+fixture; do not test restoration by mutating this approved workbook. Workbook
+evidence must include all existing sheets' grids, metadata, protections, and
+sharing. Because this exception only creates tabs confirmed missing and never
+changes existing sheets, a failed publication is retained and reconciled rather
+than rolled back. Any actual workbook restoration requires separate approval.
+Keep backups access-restricted and outside the repository; retain them as the
+immutable evidence removed from the development database. A missing, inaccessible,
+stale, or unverified backup/recovery path blocks all reset and Sheet writes.
+
+Use a transactionally guarded reset with exact target predicates, FK-safe delete
+order, and asserted before/after counts; do not use blanket `TRUNCATE`, delete
+other targets, or continue after unexpected state. Build only uniquely tagged
+local test images from the reviewed source snapshot; do not overwrite release
+tags or publish images. Run the full inclusive range once. Any failed or ambiguous
+stage stops the run; retain its new evidence and obtain fresh approval before
+another reset or destructive retry. Independently verify all 192 cluster/date
+cohorts and 432 cell-days, database source/current/calculation consistency,
+four-tab values and evaluated formulas, publication markers/fingerprints,
+protections, and unchanged pre-existing worksheet metadata/content and workbook
+sharing. No scheduler, production deployment, commit, push, or registry
+publication is authorized by this exception.
+
+For the production canary, obtain approval for the account/date, exact four tabs,
+DB target, migration, and planned writes. Limit it to the approved DB/Sheet
+publication for that scope; do not run destructive tests, resets, or cleanup, or
+clear existing production state. Begin with October 1. Inspect a dry acquisition,
 then execute the approved non-dry canary with `write_gsheet=true`. Reuse checked
 artifacts when retrying a safe stage rather than scraping the whole range again.
 

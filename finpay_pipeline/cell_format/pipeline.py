@@ -13,7 +13,7 @@ from ..cell_contracts import (
     CellIdentity, business_date, fingerprint, read_bounded_bytes, roster_fingerprint,
 )
 from ..cell_database import cell_publication_session, prepare_cell_day, validate_cluster_batch
-from ..cell_publication import ExistingSheetAdapter
+from ..cell_publication import ExistingSheetAdapter, _read_with_retry
 from ..cell_publication_v2 import (
     ROLES, build_cell_cluster_matrices_v2, cell_worksheet_title,
     preflight_unpublished_v2_sheet, publish_cell_cluster_v2, validate_output_targets,
@@ -89,11 +89,14 @@ def _spreadsheet_files(client, title):
     }
     files = []
     while True:
-        response = client.http_client.request(
-            "get", "https://www.googleapis.com/drive/v3/files", params=params,
-        )
-        response.raise_for_status()
-        page = response.json()
+        def read_page():
+            response = client.http_client.request(
+                "get", "https://www.googleapis.com/drive/v3/files", params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+
+        page = _read_with_retry(read_page)
         if not isinstance(page, dict) or page.get("incompleteSearch"):
             raise RuntimeError("Google Drive exact-title search was incomplete")
         entries = page.get("files")
@@ -113,7 +116,7 @@ def _spreadsheet_files(client, title):
 def _verify_workbook(workbook, spreadsheet_id, spreadsheet_name):
     if getattr(workbook, "id", None) != spreadsheet_id:
         raise ValueError("opened cell-format workbook ID differs from the resolved target")
-    metadata = workbook.fetch_sheet_metadata()
+    metadata = _read_with_retry(workbook.fetch_sheet_metadata)
     if metadata.get("spreadsheetId") != spreadsheet_id:
         raise ValueError("opened cell-format workbook metadata ID differs from the resolved target")
     title = metadata.get("properties", {}).get("title")
@@ -124,7 +127,7 @@ def _verify_workbook(workbook, spreadsheet_id, spreadsheet_name):
 
 def _verify_workbook_access(workbook, configuration):
     try:
-        permissions = workbook.list_permissions()
+        permissions = _read_with_retry(workbook.list_permissions)
     except Exception as exc:
         raise RuntimeError(
             "cannot verify existing cell-format workbook editor access; grant writer and Finance editor access manually"
@@ -158,7 +161,7 @@ def _spreadsheet_by_name(client, title):
     spreadsheet_id = matches[0].get("id")
     if not isinstance(spreadsheet_id, str) or not spreadsheet_id:
         raise RuntimeError("Google Drive listing did not return the spreadsheet ID")
-    workbook = client.open_by_key(spreadsheet_id)
+    workbook = _read_with_retry(lambda: client.open_by_key(spreadsheet_id))
     _verify_workbook(workbook, spreadsheet_id, title)
     return workbook, spreadsheet_id
 
@@ -181,7 +184,7 @@ def _journaled_create_spreadsheet(store, client, configuration):
                 or matches[0].get("id") != created_id):
             raise RuntimeError("spreadsheet creation response did not uniquely identify the new file")
         spreadsheet_id = created_id
-        workbook = client.open_by_key(spreadsheet_id)
+        workbook = _read_with_retry(lambda: client.open_by_key(spreadsheet_id))
         _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
         for email in configuration.finance_emails:
             if email.casefold() != configuration.writer_email.casefold():
@@ -205,7 +208,7 @@ def resolve_cell_workbook(client, configuration: CellSheetConfiguration, store=N
         spreadsheet_id = configuration.spreadsheet_id
         if store is not None and cluster_id is not None:
             store.assert_cluster_target(spreadsheet_id)
-        workbook = client.open_by_key(spreadsheet_id)
+        workbook = _read_with_retry(lambda: client.open_by_key(spreadsheet_id))
         _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
         return workbook, spreadsheet_id, False
 
@@ -229,6 +232,7 @@ def resolve_cell_workbook(client, configuration: CellSheetConfiguration, store=N
 def _journaled_add_worksheet(store, workbook, title, worksheet_id=None):
     operation_id = uuid.uuid4().hex
     store.begin_target_operation(operation_id)
+    phase = "add_sheet"
     try:
         store.assert_alive()
         properties = {"title": title, "gridProperties": {"rowCount": 1000, "columnCount": 26}}
@@ -246,13 +250,15 @@ def _journaled_add_worksheet(store, workbook, title, worksheet_id=None):
                 response_id = add_reply.get("properties", {}).get("sheetId")
         except Exception as exc:
             response_error = exc
-        matches = [item for item in workbook.worksheets() if item.title == title]
+        phase = "add_sheet_readback"
+        matches = [item for item in _read_with_retry(workbook.worksheets) if item.title == title]
         if (len(matches) != 1 or type(getattr(matches[0], "id", None)) is not int
                 or (worksheet_id is not None and matches[0].id != worksheet_id)
                 or (response_id is not None and matches[0].id != response_id)):
             if response_error:
                 raise RuntimeError("addSheet outcome could not be reconciled by exact title/ID readback") from response_error
             raise RuntimeError("addSheet response and exact title/ID readback differ")
+        phase = None
         store.assert_alive()
         store.finish_target_operation(operation_id)
         return matches[0]
@@ -261,9 +267,12 @@ def _journaled_add_worksheet(store, workbook, title, worksheet_id=None):
             store.finish_target_operation(operation_id, unknown_error=type(exc).__name__)
         except Exception:
             pass
-        raise RuntimeError(
+        error = RuntimeError(
             "cell worksheet creation outcome is unknown; target is blocked for operator reconciliation"
-        ) from exc
+        )
+        if phase is not None:
+            error.safe_phase = phase
+        raise error from exc
 
 
 def _resolve_cell_targets(store, workbook, cluster_id, configuration, publication):
@@ -273,7 +282,7 @@ def _resolve_cell_targets(store, workbook, cluster_id, configuration, publicatio
     spreadsheet_id = workbook.id
     runtime_configuration = replace(configuration, spreadsheet_id=spreadsheet_id)
     account = cluster_id + "_B"
-    worksheets = workbook.worksheets()
+    worksheets = _read_with_retry(workbook.worksheets)
     by_id = {}
     by_title = {}
     for worksheet in worksheets:
@@ -356,7 +365,7 @@ def _resolve_cell_targets(store, workbook, cluster_id, configuration, publicatio
     )
     adapters = {}
     for role, target in targets.items():
-        worksheet = workbook.get_worksheet_by_id(target.worksheet_id)
+        worksheet = _read_with_retry(lambda: workbook.get_worksheet_by_id(target.worksheet_id))
         if worksheet is None or worksheet.id != target.worksheet_id or worksheet.title != target.title:
             raise ValueError("resolved cell worksheet workbook/ID/title identity changed")
         adapters[role] = ExistingSheetAdapter(workbook, worksheet)
@@ -637,7 +646,7 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
 
         if client is None:
             client = sheet_client_factory(credentials_info)
-        workbook = client.open_by_key(workbook_id)
+        workbook = _read_with_retry(lambda: client.open_by_key(workbook_id))
         _verify_workbook(workbook, workbook_id, configuration.spreadsheet_name)
         _verify_workbook_access(workbook, configuration)
         targets, adapters = _resolve_cell_targets(

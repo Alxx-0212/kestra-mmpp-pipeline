@@ -1,11 +1,13 @@
 """Offline coverage for configurable cell-format spreadsheet targets."""
 import json
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import call, patch
 
 from finpay_pipeline.cell_format import bulk_pipeline, pipeline, settings
 from finpay_pipeline.cell_format.settings import selected_clusters
 from finpay_pipeline.cell_workflow import make_cell_sheet_client
+from finpay_pipeline.cell_publication import safe_cell_sheet_error
 from finpay_pipeline.cell_publication_v2 import ROLES, cell_worksheet_title
 
 
@@ -27,6 +29,19 @@ class FakeResponse:
 
     def json(self):
         return self.payload
+
+
+class APIError(Exception):
+    def __init__(self, status_code, *, errordict=None, message="synthetic API error"):
+        super().__init__(message)
+        self.response = SimpleNamespace(status_code=status_code, headers={})
+        self.errordict = errordict or {}
+        self.error = self.errordict
+
+
+def _raise_next(failures):
+    if failures:
+        raise failures.pop(0)
 
 
 class FakeWorksheet:
@@ -60,6 +75,12 @@ class FakeWorkbook:
         self.shares = []
         self.add_requests = []
         self.fail_add = None
+        self.metadata_failures = []
+        self.permission_failures = []
+        self.worksheet_listing_failures = []
+        self.worksheet_lookup_failures = []
+        self.response_sheet_id = None
+        self.duplicate_title_after_add = False
         self.next_sheet_id = 1000
         self.client = FakeHttpClient(self._metadata_request)
 
@@ -69,6 +90,7 @@ class FakeWorkbook:
         return FakeResponse({"id": self.id, "owners": []})
 
     def fetch_sheet_metadata(self):
+        _raise_next(self.metadata_failures)
         return {
             "spreadsheetId": self.id,
             "properties": {"title": self.title},
@@ -84,9 +106,11 @@ class FakeWorkbook:
         }
 
     def worksheets(self):
+        _raise_next(self.worksheet_listing_failures)
         return list(self._worksheets)
 
     def get_worksheet_by_id(self, worksheet_id):
+        _raise_next(self.worksheet_lookup_failures)
         return next((item for item in self._worksheets if item.id == worksheet_id), None)
 
     def batch_update(self, body):
@@ -105,16 +129,20 @@ class FakeWorkbook:
             raise ValueError("duplicate worksheet ID")
         worksheet = FakeWorksheet(worksheet_id, properties["title"])
         self._worksheets.append(worksheet)
+        if self.duplicate_title_after_add:
+            self._worksheets.append(FakeWorksheet(worksheet_id + 1, properties["title"]))
         if self.fail_add == "after":
             self.fail_add = None
             raise TimeoutError("synthetic addSheet response timeout")
-        return {"replies": [{"addSheet": {"properties": {"sheetId": worksheet_id}}}]}
+        response_id = worksheet_id if self.response_sheet_id is None else self.response_sheet_id
+        return {"replies": [{"addSheet": {"properties": {"sheetId": response_id}}}]}
 
     def share(self, email, *, perm_type, role, notify):
         self.shares.append((email, perm_type, role, notify))
         self.permissions.append({"emailAddress": email, "role": role})
 
     def list_permissions(self):
+        _raise_next(self.permission_failures)
         return list(self.permissions)
 
 
@@ -125,10 +153,13 @@ class FakeClient:
         self.create_mode = None
         self.next_file_id = 1
         self.drive_queries = []
+        self.drive_failures = []
+        self.open_failures = []
         self.http_client = FakeHttpClient(self._request)
 
     def _request(self, method, url, *, params):
         self.drive_queries.append((method, url, dict(params)))
+        _raise_next(self.drive_failures)
         title = params["q"].split("'", 2)[1].replace("\\'", "'").replace("\\\\", "\\")
         files = [
             {"id": book.id, "name": book.title, "mimeType": "application/vnd.google-apps.spreadsheet"}
@@ -137,6 +168,7 @@ class FakeClient:
         return FakeResponse({"files": files, "incompleteSearch": False})
 
     def open_by_key(self, spreadsheet_id):
+        _raise_next(self.open_failures)
         return self.workbooks[spreadsheet_id]
 
     def create(self, title):
@@ -167,6 +199,7 @@ class FakeClient:
 class MemoryOperationStore:
     def __init__(self, conflicting_targets=()):
         self.operations = {}
+        self.operation_errors = {}
         self.conflicting_targets = set(conflicting_targets)
 
     def assert_cluster_target(self, target_id):
@@ -183,6 +216,7 @@ class MemoryOperationStore:
 
     def finish_target_operation(self, operation_id, unknown_error=None):
         self.operations[operation_id] = "UNKNOWN" if unknown_error else "IDLE"
+        self.operation_errors[operation_id] = unknown_error
 
 
 def _configuration(**overrides):
@@ -310,6 +344,39 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(client.create_calls, [])
         self.assertEqual(workbook.shares, [])
 
+    def test_pipeline_read_leaves_retry_individually(self):
+        worksheets = [
+            FakeWorksheet(
+                900 + index,
+                cell_worksheet_title(ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME),
+            )
+            for index, role in enumerate(ROLES)
+        ]
+        permissions = [
+            {"emailAddress": email, "role": "writer"}
+            for email in ("writer@example.test", "finance-a@example.test", "finance-b@example.test")
+        ]
+        workbook = FakeWorkbook("existing", "Cell Reports", worksheets, permissions)
+        workbook.metadata_failures = [APIError(503)]
+        workbook.permission_failures = [APIError(429)]
+        workbook.worksheet_listing_failures = [APIError(503)]
+        workbook.worksheet_lookup_failures = [APIError(500)]
+        client = FakeClient([workbook])
+        client.drive_failures = [APIError(503)]
+        client.open_failures = [APIError(503)]
+
+        with patch("finpay_pipeline.cell_publication.time.sleep") as sleep:
+            resolved, spreadsheet_id = pipeline._spreadsheet_by_name(client, "Cell Reports")
+            pipeline._verify_workbook_access(resolved, _configuration())
+            targets, _ = pipeline._resolve_cell_targets(
+                MemoryOperationStore(), resolved, CLUSTER, _configuration(CELL_FORMAT_SPREADSHEET_ID="existing"), None,
+            )
+
+        self.assertIs(resolved, workbook)
+        self.assertEqual(spreadsheet_id, "existing")
+        self.assertEqual(set(targets), set(ROLES))
+        self.assertEqual(sleep.call_args_list, [call(2)] * 6)
+
     def test_missing_named_workbook_is_created_and_shared_inside_journal(self):
         client, store = FakeClient(), MemoryOperationStore()
         workbook, spreadsheet_id, created = pipeline.resolve_cell_workbook(
@@ -414,6 +481,114 @@ class CellSheetTargetTests(unittest.TestCase):
             {role: target.worksheet_id for role, target in targets.items()}, configured[ACCOUNT],
         )
         self.assertEqual([request["sheetId"] for request in workbook.add_requests], list(configured[ACCOUNT].values()))
+
+    def test_acknowledged_add_retries_transient_readback_once_and_finishes_idle(self):
+        workbook = FakeWorkbook("existing", "Cell Reports")
+        workbook.worksheet_listing_failures = [APIError(503)]
+        store = MemoryOperationStore()
+
+        with patch("finpay_pipeline.cell_publication.time.sleep") as sleep:
+            worksheet = pipeline._journaled_add_worksheet(
+                store, workbook, "MRW", worksheet_id=701,
+            )
+
+        self.assertEqual((worksheet.id, worksheet.title), (701, "MRW"))
+        self.assertEqual(len(workbook.add_requests), 1)
+        self.assertEqual(workbook.add_requests[0]["sheetId"], 701)
+        self.assertEqual(list(store.operations.values()), ["IDLE"])
+        self.assertEqual(sleep.call_args_list, [call(2)])
+
+    def test_failed_readback_stays_unknown_and_keeps_class_only_journal_error(self):
+        # A leaf read error is journaled directly; an addSheet error is rewrapped first.
+        cases = (
+            ("permanent", [APIError(403)]),
+            ("exhausted", [APIError(503) for _ in range(6)]),
+        )
+        for label, failures in cases:
+            with self.subTest(label=label):
+                workbook = FakeWorkbook("existing", "Cell Reports")
+                workbook.worksheet_listing_failures = list(failures)
+                store = MemoryOperationStore()
+
+                with patch("finpay_pipeline.cell_publication.time.sleep"):
+                    with self.assertRaises(RuntimeError) as raised:
+                        pipeline._journaled_add_worksheet(
+                            store, workbook, "MRW", worksheet_id=701,
+                        )
+
+                self.assertEqual(len(workbook.add_requests), 1)
+                self.assertEqual(list(store.operations.values()), ["UNKNOWN"])
+                self.assertEqual(list(store.operation_errors.values()), ["APIError"])
+                self.assertEqual(raised.exception.safe_phase, "add_sheet_readback")
+                self.assertEqual(
+                    safe_cell_sheet_error(raised.exception)["error_types"],
+                    ["RuntimeError", "APIError"],
+                )
+
+    def test_create_error_is_rewrapped_as_runtime_error_without_historical_status(self):
+        workbook = FakeWorkbook("existing", "Cell Reports")
+        workbook.fail_add = "before"
+        store = MemoryOperationStore()
+
+        with self.assertRaises(RuntimeError) as raised:
+            pipeline._journaled_add_worksheet(store, workbook, "MRW", worksheet_id=701)
+
+        self.assertEqual(len(workbook.add_requests), 1)
+        self.assertEqual(list(store.operations.values()), ["UNKNOWN"])
+        self.assertEqual(list(store.operation_errors.values()), ["RuntimeError"])
+        summary = safe_cell_sheet_error(raised.exception)
+        self.assertEqual(summary["error_types"], ["RuntimeError", "RuntimeError", "TimeoutError"])
+        self.assertNotIn("http_status", summary)
+
+    def test_add_sheet_never_adopts_wrong_response_id_or_duplicate_title(self):
+        for mode in ("wrong-response-id", "duplicate-title"):
+            with self.subTest(mode=mode):
+                workbook = FakeWorkbook("existing", "Cell Reports")
+                if mode == "wrong-response-id":
+                    workbook.response_sheet_id = 702
+                else:
+                    workbook.duplicate_title_after_add = True
+                store = MemoryOperationStore()
+
+                with self.assertRaisesRegex(RuntimeError, "blocked for operator reconciliation"):
+                    pipeline._journaled_add_worksheet(
+                        store, workbook, "MRW", worksheet_id=701,
+                    )
+
+                self.assertEqual(len(workbook.add_requests), 1)
+                self.assertEqual(list(store.operations.values()), ["UNKNOWN"])
+                self.assertEqual(list(store.operation_errors.values()), ["RuntimeError"])
+
+    def test_safe_sheet_error_summary_is_allowlisted_bounded_and_cycle_safe(self):
+        secret = "token=https://private.example.test/path?key=value"
+        api_error = APIError(
+            503,
+            errordict={
+                "status": "UNAVAILABLE",
+                "errors": [{"reason": "backendError", "message": secret}],
+            },
+            message=secret,
+        )
+        outer = RuntimeError(secret)
+        outer.safe_phase = "add_sheet_readback"
+        outer.__cause__ = api_error
+        summary = safe_cell_sheet_error(outer)
+        self.assertEqual(summary, {
+            "error_types": ["RuntimeError", "APIError"],
+            "http_status": 503,
+            "api_status": "UNAVAILABLE",
+            "api_reason": "backendError",
+            "setup_phase": "add_sheet_readback",
+        })
+        self.assertNotIn(secret, json.dumps(summary))
+
+        chain = [RuntimeError(secret) for _ in range(10)]
+        for current, following in zip(chain, chain[1:]):
+            current.__cause__ = following
+        chain[-1].__cause__ = chain[0]
+        bounded = safe_cell_sheet_error(chain[0])
+        self.assertEqual(len(bounded["error_types"]), 8)
+        self.assertNotIn(secret, json.dumps(bounded))
 
     def test_prior_publication_with_missing_tab_fails_before_creation(self):
         workbook = FakeWorkbook("existing", "Cell Reports")

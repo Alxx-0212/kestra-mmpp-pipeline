@@ -327,6 +327,7 @@ def _st_fee_validation_reasons(
     group: pd.DataFrame,
     *,
     require_sales_fee: bool,
+    require_sales_fee_debit: bool = False,
 ) -> list[str]:
     reasons = []
     fee_rows = group[group['Transaction'] == 'SELLTHRUFEE']
@@ -337,8 +338,12 @@ def _st_fee_validation_reasons(
         if actual != 100:
             reasons.append(f'SELLTHRUFEE Debet={actual} (expected 100)')
 
-    if require_sales_fee and group[group['Transaction'] == 'SELLTHRUSALESFEE'].empty:
+    sales_fee_rows = group[group['Transaction'] == 'SELLTHRUSALESFEE']
+    if require_sales_fee and sales_fee_rows.empty:
         reasons.append('missing SELLTHRUSALESFEE')
+    if require_sales_fee_debit and not sales_fee_rows.empty:
+        if sales_fee_rows['Kredit'].ne(0).any() or sales_fee_rows['Debet'].lt(0).any():
+            reasons.append('SELLTHRUSALESFEE must be nonnegative Debet')
     return reasons
 
 
@@ -656,6 +661,8 @@ def _collect_unknown_transaction_or_remark_unusual_transactions(
 
 def _collect_st_family_unusual_transactions(
     df: pd.DataFrame,
+    *,
+    require_sales_fee_debit: bool = False,
 ) -> tuple[pd.DataFrame, set[int]]:
     """Apply the date-versioned ST family contract once per base transaction."""
     source = df.copy()
@@ -719,6 +726,7 @@ def _collect_st_family_unusual_transactions(
             _st_fee_validation_reasons(
                 non_reversal_group,
                 require_sales_fee=era in {ST_RULE_LEGACY, ST_RULE_RESTORED},
+                require_sales_fee_debit=require_sales_fee_debit,
             )
         )
         if not reasons:
@@ -1036,6 +1044,8 @@ def _collect_reversal_unusual_transactions(
 
 def _collect_validation_unusual_transactions(
     df: pd.DataFrame,
+    *,
+    cell_policy: bool = False,
 ) -> tuple[pd.DataFrame, set[int], dict[str, int]]:
     """Evaluate all non-duplicate rows through one shared disposition path."""
     unknown_unusual_df, unknown_excluded_indices = (
@@ -1047,7 +1057,7 @@ def _collect_validation_unusual_transactions(
         else df
     )
     st_unusual_df, st_excluded_indices = _collect_st_family_unusual_transactions(
-        known_result
+        known_result, require_sales_fee_debit=cell_policy,
     )
     st_result = (
         known_result.drop(index=sorted(st_excluded_indices))

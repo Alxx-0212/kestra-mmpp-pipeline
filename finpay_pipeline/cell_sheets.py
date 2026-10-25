@@ -201,8 +201,6 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
                     else:
                         from .cell_calculation import MANDIRI_GROUPS
                         group = next(keys for name, keys in MANDIRI_GROUPS if name == measure["label"])
-                        if measure["label"] == "ST" and "SELLTHRUSALESFEE" in day_positions:
-                            group = (*group, "SELLTHRUSALESFEE")
                         debit_formula = "=" + "+".join(
                             f"({debit_col}{day_positions[item]}-{credit_col}{day_positions[item]})" for item in group
                         )

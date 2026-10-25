@@ -21,13 +21,12 @@ from .detail_exports import prepare_reversal_detail_export, prepare_transaction_
 from .digipos_scraper import HEADERS
 from .summary import summarize_by_transaction
 
-RULES_VERSION = "finpay-cell-rules-v1-october-preprocessing"
-TEMPLATE_VERSION = "finpay-cell-cashflow-v2"
+RULES_VERSION = "finpay-cell-rules-v2-permanent-sls-hold"
+TEMPLATE_VERSION = "finpay-cell-cashflow-v3-permanent-sls-hold"
 MAKASSAR = ZoneInfo("Asia/Makassar")
 
-# Legacy operational category semantics, excluding every invoice integration.
-# October SLSFEE remains classified/stored, but is not added to the legacy-layout
-# ST footer; the October change is preprocessing-only, not a new fee policy.
+# Cell reporting includes the hold as a separate ST movement. The previous-format
+# invoice cutoff remains in summary_sheets.py and must not leak into this layout.
 DETAIL_CATEGORIES = (
     ("TRANSFER MASUK DARI FINPAY", "CASHOUT APOLLO"),
     ("QRISDUWIT", "QRISDUWIT"),
@@ -45,6 +44,7 @@ DETAIL_CATEGORIES = (
     ("REVERSAL RECHARGE OUT CLUSTER FEE", "REVERSAL - RECHARGE OUT CLUSTER FEE"),
     ("ST", "SELLTHRU"),
     ("BIAYA FEE ST", "SELLTHRUFEE"),
+    ("BIAYA FEE BAR A ST (HOLD)", "SELLTHRUSALESFEE"),
 )
 MANDIRI_GROUPS = (
     ("NGRS", ("RECHARGE", "RECHARGEFEE", "PEMBELIAN RECHARGE OUT CLUSTER")),
@@ -53,7 +53,7 @@ MANDIRI_GROUPS = (
     ("Reversal - Pembelian Recharge Out Cluster", ("REVERSAL - PEMBELIAN RECHARGE OUT CLUSTER",)),
     ("Reversal - Recharge Out Cluster", ("REVERSAL - RECHARGE OUT CLUSTER", "REVERSAL - RECHARGE OUT CLUSTER FEE")),
     ("PPOB", ("FEETRANSAKSI",)),
-    ("ST", ("SELLTHRU", "SELLTHRUFEE")),
+    ("ST", ("SELLTHRU", "SELLTHRUFEE", "SELLTHRUSALESFEE")),
     ("DISBURSEMENT", ("DISBURSEMENT",)),
     ("QRISDUWIT", ("QRISDUWIT",)),
 )
@@ -195,7 +195,9 @@ def calculate_cell_day(identity: CellIdentity, entry: dict, raw_rows: list[dict]
         deduplicated, duplicates = deduplicate_rows_by_minute_with_report(
             preprocessed, comparison_frame=comparison,
         )
-        validation_unusual, excluded, _ = _collect_validation_unusual_transactions(deduplicated)
+        validation_unusual, excluded, _ = _collect_validation_unusual_transactions(
+            deduplicated, cell_policy=True,
+        )
         parts = [frame for frame in (validation_unusual, duplicates) if not frame.empty]
         unusual = pd.concat(parts, ignore_index=True, sort=False) if parts else validation_unusual
         summary_ready = deduplicated.drop(index=sorted(excluded)).reset_index(drop=True)
@@ -233,20 +235,19 @@ def category_measures(summary: list[dict]) -> dict[str, dict]:
 
 
 def detail_categories(report_date: str):
-    categories = list(DETAIL_CATEGORIES)
-    if business_date(report_date) < business_date("2026-09-01"):
-        categories.append(("BIAYA FEE BAR A ST (HOLD)", "SELLTHRUSALESFEE"))
-    return tuple(categories)
+    # Keep the date argument for existing callers; cell reports always account
+    # for SLSHOLD. The 2026-09-01 legacy layout exception lives elsewhere.
+    business_date(report_date)
+    return tuple(DETAIL_CATEGORIES)
 
 
 def mandiri_measures(measures: dict, report_date: str) -> list[dict]:
+    # Validate the existing caller input while keeping cell ST fees permanent.
+    business_date(report_date)
     rows = []
     for label, base_keys in MANDIRI_GROUPS:
-        keys = base_keys
-        if label == "ST" and business_date(report_date) < business_date("2026-09-01"):
-            keys = (*keys, "SELLTHRUSALESFEE")
         signed = sum(measures.get(key, {}).get("debet", 0) -
-                     measures.get(key, {}).get("kredit", 0) for key in keys)
+                     measures.get(key, {}).get("kredit", 0) for key in base_keys)
         rows.append({"label": label, "signed": signed,
                      "debet": max(signed, 0), "kredit": max(-signed, 0)})
     signed = sum(row["signed"] for row in rows)

@@ -49,6 +49,8 @@ tasks:
   - id: validate_cell_sheet_targets
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
     timeout: PT1M
     runIf: "{{ inputs.write_gsheet }}"
     env:
@@ -70,6 +72,30 @@ tasks:
           os.environ["REPORT_DATE"], os.environ["REPORT_DATE"],
           os.environ["CLUSTER_ID"],
       )
+
+  - id: preflight_cell_database
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    timeout: PT1M
+    runIf: "{{ inputs.dry_run == false }}"
+    env:
+      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
+      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
+      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
+      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
+      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_database import preflight_cell_database
+      from finpay_pipeline.cell_format.settings import database_target
+
+      target = database_target()
+      Kestra.outputs(preflight_cell_database(
+          target, {target}, password=os.environ["FINPAY_DB_PASSWORD"],
+      ))
 
   - id: acquire_cell_cluster_day
     type: io.kestra.plugin.scripts.python.Script
@@ -103,6 +129,8 @@ tasks:
   - id: preprocess_cell_cluster_day
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
     timeout: PT3H
     inputFiles:
       cell_sources_v2.zip: "{{ outputs.acquire_cell_cluster_day.outputFiles['cell_sources_v2.zip'] }}"
@@ -129,6 +157,8 @@ tasks:
   - id: persist_cell_sources_and_calculations
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
     timeout: PT3H
     runIf: "{{ inputs.dry_run == false }}"
     inputFiles:
@@ -146,6 +176,7 @@ tasks:
     script: |
       import os
       from kestra import Kestra
+      from finpay_pipeline.cell_database import safe_cell_database_error
       from finpay_pipeline.cell_format import persist_cell_day
 
       try:
@@ -155,12 +186,16 @@ tasks:
               dry_run=os.environ["DRY_RUN"].lower() == "true",
           )
       except Exception as exc:
-          raise RuntimeError("Cell database persistence failed: " + type(exc).__name__) from None
+          raise RuntimeError(
+              "Cell database persistence failed: " + safe_cell_database_error(exc)
+          ) from None
       Kestra.outputs(result)
 
   - id: publish_cell_four_tabs
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
     timeout: PT3H
     runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
     inputFiles:
@@ -183,9 +218,11 @@ tasks:
       CELL_FORMAT_WORKSHEET_IDS: "{{ inputs.cell_worksheet_ids_json }}"
       CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ inputs.create_worksheets_if_missing }}"
     script: |
+      import json
       import os
       from kestra import Kestra
       from finpay_pipeline import decode_cell_google_credentials
+      from finpay_pipeline.cell_publication import safe_cell_sheet_error
       from finpay_pipeline.cell_format import publish_cell_sheets
 
       try:
@@ -196,5 +233,5 @@ tasks:
               cluster_id=os.environ["CLUSTER_ID"],
           )
       except Exception as exc:
-          raise RuntimeError("Cell Sheet publication failed: " + type(exc).__name__) from None
+          raise RuntimeError("Cell Sheet publication failed: " + json.dumps(safe_cell_sheet_error(exc), sort_keys=True)) from None
       Kestra.outputs(result)

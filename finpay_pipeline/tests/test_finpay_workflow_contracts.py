@@ -345,6 +345,96 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                     task = _task_block(day_flow, task_id)
                     self.assertIn(f'{environment_name}: "{{{{ inputs.{name} }}}}"', task)
 
+    def test_current_cell_script_tasks_use_the_container_image_runner(self):
+        workflow_tasks = {
+            "finpay_cell_day_v1.yml": (
+                "validate_cell_sheet_targets", "preflight_cell_database", "acquire_cell_cluster_day",
+                "preprocess_cell_cluster_day", "persist_cell_sources_and_calculations",
+                "publish_cell_four_tabs",
+            ),
+            "finpay_cell_range_v1.yml": ("expand_cell_range",),
+            "finpay_cell_bulk_v1.yml": (
+                "preflight_cell_bulk_targets", "acquire_cell_bulk", "preprocess_cell_bulk",
+                "persist_cell_bulk", "publish_cell_bulk",
+            ),
+        }
+        for workflow_name, task_ids in workflow_tasks.items():
+            flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / workflow_name).read_text()
+            for task_id in task_ids:
+                with self.subTest(workflow=workflow_name, task=task_id):
+                    task = _task_block(flow, task_id)
+                    self.assertIn(
+                        "taskRunner:\n      type: io.kestra.plugin.scripts.runner.docker.Docker",
+                        task,
+                    )
+
+    def test_day_and_bulk_database_preflight_precedes_acquisition(self):
+        flows = (
+            ("finpay_cell_day_v1.yml", "acquire_cell_cluster_day"),
+            ("finpay_cell_bulk_v1.yml", "acquire_cell_bulk"),
+        )
+        for workflow_name, acquisition_task_id in flows:
+            flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / workflow_name).read_text()
+            with self.subTest(workflow=workflow_name):
+                task_ids = re.findall(r"(?m)^  - id: ([A-Za-z0-9_-]+)$", flow)
+                self.assertLess(task_ids.index("preflight_cell_database"), task_ids.index(acquisition_task_id))
+
+                task = _task_block(flow, "preflight_cell_database")
+                self.assertIn("containerImage: finpay-cell-reporting:2.0", task)
+                self.assertIn('runIf: "{{ inputs.dry_run == false }}"', task)
+                self.assertIn(
+                    "taskRunner:\n      type: io.kestra.plugin.scripts.runner.docker.Docker",
+                    task,
+                )
+                for name in ("HOST", "PORT", "NAME", "USER", "PASSWORD"):
+                    self.assertIn(
+                        f"FINPAY_DB_{name}: \"{{{{ secret('FINPAY_DB_{name}') }}}}\"",
+                        task,
+                    )
+                self.assertIn("from finpay_pipeline.cell_format.settings import database_target", task)
+                self.assertIn("from finpay_pipeline.cell_database import preflight_cell_database", task)
+                self.assertIn("target = database_target()", task)
+                self.assertRegex(
+                    task,
+                    r'preflight_cell_database\(\s+target, \{target\},\s+'
+                    r'password=os\.environ\["FINPAY_DB_PASSWORD"\],',
+                )
+                self.assertIn("Kestra.outputs(preflight_cell_database(", task)
+                script = textwrap.dedent(task.split("    script: |\n", 1)[1])
+                compile(script, f"{workflow_name}:preflight_cell_database", "exec")
+
+    def test_cell_persistence_errors_use_sanitized_database_message(self):
+        flows = (
+            ("finpay_cell_day_v1.yml", "persist_cell_sources_and_calculations", "Cell database persistence failed:"),
+            ("finpay_cell_bulk_v1.yml", "persist_cell_bulk", "Cell bulk database persistence failed:"),
+        )
+        for workflow_name, task_id, error_prefix in flows:
+            flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / workflow_name).read_text()
+            with self.subTest(workflow=workflow_name):
+                task = _task_block(flow, task_id)
+                self.assertIn("from finpay_pipeline.cell_database import safe_cell_database_error", task)
+                self.assertIn(error_prefix, task)
+                self.assertIn("safe_cell_database_error(exc)", task)
+                self.assertIn(") from None", task)
+                self.assertNotIn("type(exc).__name__", task)
+                script = textwrap.dedent(task.split("    script: |\n", 1)[1])
+                compile(script, f"{workflow_name}:{task_id}", "exec")
+
+    def test_cell_publishers_retain_only_safe_api_failure_details(self):
+        for workflow, task_id in (("finpay_cell_day_v1.yml", "publish_cell_four_tabs"),
+                                  ("finpay_cell_bulk_v1.yml", "publish_cell_bulk")):
+            with self.subTest(workflow=workflow):
+                flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / workflow).read_text()
+                task = _task_block(flow, task_id)
+                self.assertIn("import json", task)
+                self.assertIn("from finpay_pipeline.cell_publication import safe_cell_sheet_error", task)
+                self.assertIn("json.dumps(safe_cell_sheet_error(exc), sort_keys=True)", task)
+                self.assertNotIn("str(exc)", task)
+
+    def test_cell_reporting_image_keeps_package_path_when_kestra_changes_workdir(self):
+        dockerfile = (REPOSITORY_ROOT / "finpay_pipeline/Dockerfile.cell-reporting").read_text()
+        self.assertRegex(dockerfile, r"(?m)^ENV PYTHONPATH=/app$")
+
 
 class FinPayMonthlyWorkflowContractTest(unittest.TestCase):
     def test_monthly_flow_identity_and_inputs(self):

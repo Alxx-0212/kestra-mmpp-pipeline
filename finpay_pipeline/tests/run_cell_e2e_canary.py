@@ -59,7 +59,7 @@ def _configuration(writer):
         "accounts": [{"account": "412110_B", "cell_codes": ["412111", "412112"],
             "first_report_date": DATES[0], "opening_boundary": DATES[0] + "T00:00:00+08:00",
             "opening_balances": {"412111": 1000000, "412112": 2000000},
-            "roster_version": "SYNTHETIC-CANARY-20261015", "template_version": "finpay-cell-cashflow-v2"}],
+            "roster_version": "SYNTHETIC-CANARY-20261015", "template_version": "finpay-cell-cashflow-v3-permanent-sls-hold"}],
         "database_target": target, "approved_database_targets": [target],
         "sheet_targets": {"412110_B": sheet}, "approved_sheet_targets": [sheet],
     }

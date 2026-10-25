@@ -513,6 +513,35 @@ class CellPublicationV2Tests(unittest.TestCase):
         self.assertEqual(self.store.events.count("sheets:summary"), writes)
         self.assertEqual(self.store.operation, "IDLE")
 
+    def test_publication_of_new_artifact_with_unchanged_rows_preserves_bank_inputs(self):
+        from finpay_pipeline.cell_contracts import CellIdentity
+        from finpay_pipeline.cell_database import prepare_cell_day
+
+        self.publish()
+        inputs = self.store.publications[1]["snapshot"]["worksheets"]["summary"]["matrix"]["editable_inputs"]
+        expected = {}
+        for index, entry in enumerate(inputs):
+            position = entry["row"] - 1, entry["column"] - 1
+            expected[position] = 333 + index
+            self.adapters["summary"].values[position[0]][position[1]] = expected[position]
+        for key, old in list(self.store.facts.items()):
+            entry = {**old["manifest"], "source_sha256": "b" * 64}
+            self.store.facts[key] = prepare_cell_day(
+                CellIdentity(**old["identity"]), entry, old["raw_rows"], old["calculation"],
+                self.config.to_dict(), self.config.rules_version,
+            )
+            self.store.dirty[key[0]] = False
+        start = len(self.store.events)
+        result = publish_cell_cluster_v2(
+            self.store, self.store.target_id, self.roles, self.adapters, None, self.config,
+            publication_only=True, preserve_manual_inputs=True,
+        )
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertEqual(result["epoch"], 2)
+        for (row, column), value in expected.items():
+            self.assertEqual(self.adapters["summary"].values[row][column], value)
+        self.assertNotIn("manual_audit", self.store.events[start:])
+
     def test_history_publish_then_rerun_fingerprints_actual_full_written_range(self):
         for day in ("2026-10-13", "2026-10-14", "2026-10-15"):
             for code in self.config.cell_codes:

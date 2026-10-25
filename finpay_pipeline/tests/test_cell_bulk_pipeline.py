@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from finpay_pipeline.cell_calculation import build_cluster_report
 from finpay_pipeline.cell_contracts import (
     OBSERVED_CELL_ROSTER, configured_cells, fingerprint, roster_fingerprint,
 )
@@ -33,7 +34,7 @@ ACCOUNT = CLUSTER + "_B"
 TARGET = CellDatabaseTarget("synthetic-db", 5432, "synthetic", "public", "synthetic-role")
 
 
-def _write_daily_bundle(root: Path, cluster: str, report_date: str) -> tuple[Path, str]:
+def _write_daily_bundle(root: Path, cluster: str, report_date: str, credit=100) -> tuple[Path, str]:
     account, codes = account_settings(cluster)
     cells = configured_cells({account: codes})
     export_date = date.fromisoformat(report_date).strftime("%d-%m-%Y")
@@ -43,7 +44,7 @@ def _write_daily_bundle(root: Path, cluster: str, report_date: str) -> tuple[Pat
         source = root / artifact
         _write_xhr_export(source, [[
             position, f"{export_date} 12:00:00", f"000123456789012345{position}",
-            1000, 100, 0, 1100, "Credit", "RECHARGE", "0812345678",
+            1000, credit, 0, 1000 + credit, "Credit", "RECHARGE", "0812345678",
             "Transaksi Sellthru",
         ]])
         content = source.read_bytes()
@@ -66,12 +67,12 @@ def _write_daily_bundle(root: Path, cluster: str, report_date: str) -> tuple[Pat
 
 
 def _write_source_bulk(root: Path, start=START, end=END, cluster_id=CLUSTER, *,
-                       entry_mutator=None, member_mutator=None, duplicate_member=False):
+                        entry_mutator=None, member_mutator=None, duplicate_member=False, credit=100):
     clusters = list(selected_clusters(cluster_id))
     entries, members = [], []
     for cluster in clusters:
         for report_date in bulk_pipeline._dates(start, end):
-            daily_path, _ = _write_daily_bundle(root, cluster, report_date)
+            daily_path, _ = _write_daily_bundle(root, cluster, report_date, credit)
             member_path = bulk_pipeline._daily_source_path(cluster, report_date)
             content = daily_path.read_bytes()
             if member_mutator:
@@ -357,6 +358,60 @@ class CellBulkPipelineTests(unittest.TestCase):
             self.assertEqual(store.commits, [])
             self.assertFalse(output.exists())
 
+    def test_overlapping_extension_and_single_date_correction_use_stored_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = MemoryCellStore()
+
+            def process(start, end, credit=100):
+                source, digest = _write_source_bulk(root, start, end, credit=credit)
+                prepared_path = root / "cell_bulk_prepared_v1.zip"
+                prepared = preprocess_cell_range(str(source), digest, start, end, CLUSTER, str(prepared_path))
+                self._persist(prepared_path, prepared, store)
+                with zipfile.ZipFile(root / "cell_bulk_handoffs_v1.zip") as archive:
+                    index = json.loads(archive.read("index.json"))
+                    return json.loads(archive.read(index["entries"][0]["path"]))
+
+            process(START, "2026-10-10")
+            earlier = {key: item["calculation_id"] for key, item in store.facts.items() if key[0] < "2026-10-10"}
+            handoff = process("2026-10-10", "2026-10-15", credit=200)
+            self.assertEqual(len(store.facts), 15 * len(account_settings(CLUSTER)[1]))
+            self.assertEqual(handoff["first_report_date"], START)
+            self.assertEqual(handoff["last_report_date"], "2026-10-15")
+            for key, digest in earlier.items():
+                self.assertEqual(store.facts[key]["calculation_id"], digest)
+            self.assertEqual(store.facts[("2026-10-10", "412111")]["raw_rows"][0]["Kredit"], 200)
+
+            process("2026-10-16", "2026-10-20")
+            before = deepcopy(store.facts)
+            config = report_config(CLUSTER, START)
+            report_before = build_cluster_report(config, list(before.values()), "2026-10-20")
+            handoff = process("2026-10-19", "2026-10-19", credit=350)
+            self.assertEqual(handoff["submitted_report_date"], "2026-10-19")
+            self.assertEqual(handoff["last_report_date"], "2026-10-20")
+            self.assertEqual(len(store.facts), 20 * len(config.cells))
+            for key, item in before.items():
+                if key[0] != "2026-10-19":
+                    self.assertEqual(store.facts[key]["calculation_id"], item["calculation_id"])
+            report_after = build_cluster_report(config, list(store.facts.values()), "2026-10-20")
+            self.assertEqual(report_after["days"][-1]["combined"]["opening_saldo"] -
+                             report_before["days"][-1]["combined"]["opening_saldo"], 500)
+            before_range = deepcopy(store.facts)
+            handoff = process("2026-10-10", "2026-10-15", credit=250)
+            self.assertEqual(handoff["submitted_report_date"], "2026-10-15")
+            self.assertEqual(handoff["last_report_date"], "2026-10-20")
+            self.assertEqual(len(store.facts), 20 * len(config.cells))
+            for key, item in before_range.items():
+                if not "2026-10-10" <= key[0] <= "2026-10-15":
+                    self.assertEqual(store.facts[key]["calculation_id"], item["calculation_id"])
+            report_corrected = build_cluster_report(config, list(store.facts.values()), "2026-10-20")
+            self.assertEqual(report_corrected["days"][-1]["combined"]["opening_saldo"] -
+                             report_after["days"][-1]["combined"]["opening_saldo"], 600)
+            unchanged = deepcopy(store.facts)
+            with self.assertRaisesRegex(ValueError, "missing cell coverage"):
+                process("2026-10-22", "2026-10-22")
+            self.assertEqual(store.facts, unchanged)
+
     def test_persist_preflights_every_prepared_member_before_opening_database(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -480,7 +535,7 @@ class CellBulkPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "IDs/titles must be unique"):
                 bulk_pipeline.validate_cell_bulk_sheet_range(START, END, "ALL")
 
-    def test_five_stage_workflow_scripts_compile_and_keep_writes_serial(self):
+    def test_workflow_scripts_compile_and_keep_writes_serial(self):
         workflow = Path(__file__).parents[1] / "workflows" / "finpay_cell_bulk_v1.yml"
         text = workflow.read_text(encoding="utf-8")
         ids = (
@@ -505,7 +560,7 @@ class CellBulkPipelineTests(unittest.TestCase):
                 current = None
         if current is not None:
             scripts.append("\n".join(current))
-        self.assertEqual(len(scripts), 5)
+        self.assertEqual(len(scripts), 6)
         for index, script in enumerate(scripts, 1):
             compile(script, f"finpay_cell_bulk_v1.yml:script-{index}", "exec")
 

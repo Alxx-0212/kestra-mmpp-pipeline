@@ -1,11 +1,16 @@
-"""Governed cell publication: explicit target, one DB session, no blind retries."""
+"""Governed cell publication with explicit targets and read-only retries."""
 from __future__ import annotations
 
 import copy
 import json
+import math
 import re
+import time
 import uuid
 from dataclasses import dataclass
+
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 from .cell_calculation import build_cluster_report, recalculate_stale_history
 from .cell_contracts import fingerprint
@@ -19,6 +24,102 @@ GUARD_PREFIX = "FINPAY CELL REFRESH V1:"
 MANAGED_PREFIX = "FINPAY CELL REPORT V1:"
 MAX_REQUEST_BYTES = 1_500_000
 PUBLICATION_METADATA_KEY = "finpay_cell_publication_v2"
+_TRANSIENT_READ_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_READ_RETRY_DELAYS = (2, 4, 8, 16, 32)
+_MAX_READ_ATTEMPTS = len(_READ_RETRY_DELAYS) + 1
+_MAX_RETRY_AFTER_SECONDS = 60
+_SAFE_API_STATUSES = frozenset({
+    "ABORTED", "ALREADY_EXISTS", "CANCELLED", "DATA_LOSS", "DEADLINE_EXCEEDED",
+    "FAILED_PRECONDITION", "INTERNAL", "INVALID_ARGUMENT", "NOT_FOUND",
+    "OUT_OF_RANGE", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "UNAUTHENTICATED",
+    "UNAVAILABLE", "UNIMPLEMENTED", "UNKNOWN",
+})
+_SAFE_API_REASONS = frozenset({
+    "accessNotConfigured", "backendError", "dailyLimitExceeded", "failedPrecondition",
+    "forbidden", "insufficientPermissions", "internalError", "notFound", "quotaExceeded",
+    "rateLimitExceeded", "resourceExhausted", "userRateLimitExceeded",
+})
+_SAFE_CELL_SHEET_PHASES = frozenset({"add_sheet", "add_sheet_readback"})
+
+
+def _read_with_retry(read_call):
+    for attempt in range(_MAX_READ_ATTEMPTS):
+        try:
+            return read_call()
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            error = getattr(exc, "error", {})
+            details = error.get("errors", []) if isinstance(error, dict) else []
+            quota_limited = status_code == 403 and isinstance(details, list) and any(
+                isinstance(item, dict) and item.get("domain") == "usageLimits"
+                and item.get("reason") in {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}
+                for item in details
+            )
+            retryable_status = status_code in _TRANSIENT_READ_STATUS_CODES or quota_limited
+            if (not retryable_status
+                    and not isinstance(exc, (RequestsTimeout, RequestsConnectionError))):
+                raise
+            if attempt == len(_READ_RETRY_DELAYS):
+                raise
+
+            delay = _READ_RETRY_DELAYS[attempt]
+            if retryable_status:
+                headers = getattr(response, "headers", {})
+                retry_after = next((value for key, value in headers.items()
+                                    if str(key).lower() == "retry-after"), None)
+                if retry_after is not None:
+                    try:
+                        delay = float(retry_after)
+                    except (TypeError, ValueError):
+                        raise exc from None
+                    if (not math.isfinite(delay) or delay < 0
+                            or delay > _MAX_RETRY_AFTER_SECONDS):
+                        raise
+            time.sleep(delay)
+
+
+def safe_cell_sheet_error(exc):
+    """Return bounded exception-class and allowlisted API diagnostics only."""
+    summary = {"error_types": []}
+    seen = set()
+    current = exc
+
+    for _ in range(8):
+        if not isinstance(current, BaseException) or id(current) in seen:
+            break
+        seen.add(id(current))
+        summary["error_types"].append(type(current).__name__)
+
+        if "http_status" not in summary:
+            response = getattr(current, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if type(status_code) is int and 100 <= status_code <= 599:
+                summary["http_status"] = status_code
+
+        details = getattr(current, "errordict", None)
+        if not isinstance(details, dict):
+            details = getattr(current, "error", None)
+        if isinstance(details, dict):
+            status = details.get("status")
+            if "api_status" not in summary and isinstance(status, str) and status in _SAFE_API_STATUSES:
+                summary["api_status"] = status
+            errors = details.get("errors", [])
+            if "api_reason" not in summary and isinstance(errors, list):
+                for item in errors[:8]:
+                    reason = item.get("reason") if isinstance(item, dict) else None
+                    if isinstance(reason, str) and reason in _SAFE_API_REASONS:
+                        summary["api_reason"] = reason
+                        break
+
+        phase = getattr(current, "safe_phase", None)
+        if ("setup_phase" not in summary and isinstance(phase, str)
+                and phase in _SAFE_CELL_SHEET_PHASES):
+            summary["setup_phase"] = phase
+
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+    return summary
 
 
 def _marker_entries(metadata):
@@ -126,14 +227,14 @@ class ExistingSheetAdapter:
 
     def metadata(self):
         if self._owners is None:
-            response = self.spreadsheet.client.request(
+            response = _read_with_retry(lambda: self.spreadsheet.client.request(
                 "get", f"https://www.googleapis.com/drive/v3/files/{self.spreadsheet_id}",
                 params={"fields": "id,owners(emailAddress)", "supportsAllDrives": "true"},
-            ).json()
+            ).json())
             if response.get("id") != self.spreadsheet_id:
                 raise ValueError("spreadsheet ownership metadata identity mismatch")
             self._owners = [item["emailAddress"] for item in response.get("owners", [])]
-        sheets = self.spreadsheet.fetch_sheet_metadata().get("sheets", [])
+        sheets = _read_with_retry(self.spreadsheet.fetch_sheet_metadata).get("sheets", [])
         result = dict(next(sheet for sheet in sheets if sheet["properties"]["sheetId"] == self.worksheet_id))
         result["implicitOwnerEmails"] = list(self._owners)
         return result
@@ -142,7 +243,8 @@ class ExistingSheetAdapter:
         return self.spreadsheet.batch_update({"requests": requests})
 
     def read(self, rows, columns):
-        return self.worksheet.get(f"A1:{column_letter(columns)}{rows}", value_render_option="FORMULA")
+        return _read_with_retry(lambda: self.worksheet.get(
+            f"A1:{column_letter(columns)}{rows}", value_render_option="FORMULA"))
 
     def read_style(self, rows, columns):
         """Read bounded formatting metadata, never values, formulas or other tabs."""
@@ -150,7 +252,8 @@ class ExistingSheetAdapter:
             raise ValueError("style read exceeds governed dimensions")
         title = self.worksheet.title.replace("'", "''")
         structure_fields = "spreadsheetId,sheets(properties(sheetId),merges,bandedRanges(range))"
-        structure = self.spreadsheet.fetch_sheet_metadata(params={"fields": structure_fields})
+        structure = _read_with_retry(lambda: self.spreadsheet.fetch_sheet_metadata(
+            params={"fields": structure_fields}))
         if structure.get("spreadsheetId") != self.spreadsheet_id:
             raise ValueError("style spreadsheet identity mismatch")
         sheets = structure.get("sheets", [])
@@ -167,8 +270,8 @@ class ExistingSheetAdapter:
             result = {"start": start, "formats": [[{} for _ in range(columns)] for _ in range(stop - start)],
                       "entered": [[{} for _ in range(columns)] for _ in range(stop - start)],
                       "widths": [None] * columns, "heights": [None] * (stop - start)}
-            response = self.spreadsheet.fetch_sheet_metadata(params={"fields": fields,
-                "ranges": f"'{title}'!A{start + 1}:{column_letter(columns)}{stop}"})
+            response = _read_with_retry(lambda: self.spreadsheet.fetch_sheet_metadata(params={"fields": fields,
+                "ranges": f"'{title}'!A{start + 1}:{column_letter(columns)}{stop}"}))
             if response.get("spreadsheetId") != self.spreadsheet_id:
                 raise ValueError("style spreadsheet identity mismatch")
             sheets = response.get("sheets", [])

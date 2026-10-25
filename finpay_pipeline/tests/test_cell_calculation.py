@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from finpay_pipeline.cell_calculation import (
     CellReportConfig, affected_publication_range, build_cluster_report,
-    calculate_cell_day, detail_categories,
+    calculate_cell_day, category_measures, detail_categories, mandiri_measures,
 )
 from finpay_pipeline.cell_contracts import fingerprint
 from finpay_pipeline.classification import _collect_validation_unusual_transactions
@@ -173,22 +173,72 @@ class CellCalculationTests(unittest.TestCase):
         result = self.prepare("412111", rows)
         self.assertEqual(result["calculation"]["summary"][0]["Sum_of_Kredit"], 2 * 10 ** 12)
 
-    def test_october_hold_is_preprocessed_without_changing_legacy_layout(self):
+    def test_cell_hold_is_permanent_in_summary_saldo_and_st_net(self):
+        for hold_amount in (20, 0):
+            with self.subTest(hold_amount=hold_amount):
+                rows = [
+                    self.row(label="SELLTHRU", identifier="FAMILY", amount=10_000,
+                             remarks="Sellthru Sales Fee"),
+                    self.row(label="SELLTHRUFEE", identifier="FAMILYFEE", amount=0, debit=100,
+                             remarks="Platform fee sellthru rp. 100,-"),
+                    self.row(label="SELLTHRUSALESHOLD", identifier="FAMILYSLSHLD", amount=0,
+                             debit=hold_amount,
+                             remarks=f"Sales hold transaksi sellthru sejumlah {hold_amount} rupiah, dari 412110"),
+                ]
+                result = self.prepare("412111", rows)
+                calculation = result["calculation"]
+                hold = calculation["processed"][2]
+                self.assertEqual(hold["raw_transaction_label"], "SELLTHRUSALESHOLD")
+                self.assertEqual(hold["processed_transaction_label"], "sellthrusalesfee")
+                self.assertEqual(hold["base_id"], "FAMILY")
+                self.assertEqual(hold["transaction_id_type"], "SLSFEE")
+                self.assertFalse(calculation["unusual"])
+                self.assertIn("SELLTHRUSALESFEE", [key for _, key in detail_categories("2026-10-13")])
+                self.assertIn("SELLTHRUSALESFEE", [key for _, key in detail_categories("2027-09-01")])
+
+                measures = category_measures(calculation["summary"])
+                self.assertEqual(measures["SELLTHRUSALESFEE"]["kredit"], hold_amount)
+                st = next(row for row in mandiri_measures(measures, "2026-10-13")
+                          if row["label"] == "ST")
+                self.assertEqual(st["signed"], 9_900 - hold_amount)
+
+                facts = [result, self.prepare("412112", [])]
+                report = build_cluster_report(self.config, facts, "2026-10-13")
+                self.assertEqual(report["days"][0]["combined"]["closing_saldo"],
+                                 12_900 - hold_amount)
+
+    def test_cell_missing_hold_is_unusual_but_preserves_st_and_platform_rows(self):
         rows = [
-            self.row(label="SELLTHRU", identifier="FAMILY", remarks="Sellthru Sales Fee"),
+            self.row(label="SELLTHRU", identifier="FAMILY", amount=10_000,
+                     remarks="Sellthru Sales Fee"),
             self.row(label="SELLTHRUFEE", identifier="FAMILYFEE", amount=0, debit=100,
                      remarks="Platform fee sellthru rp. 100,-"),
-            self.row(label="SELLTHRUSALESHOLD", identifier="FAMILYSLSHLD", amount=0, debit=10,
-                     remarks="Sales hold transaksi sellthru sejumlah 10 rupiah, dari 412110"),
         ]
         result = self.prepare("412111", rows)
-        hold = result["calculation"]["processed"][2]
-        self.assertEqual(hold["raw_transaction_label"], "SELLTHRUSALESHOLD")
-        self.assertEqual(hold["processed_transaction_label"], "sellthrusalesfee")
-        self.assertEqual(hold["base_id"], "FAMILY")
-        self.assertEqual(hold["transaction_id_type"], "SLSFEE")
-        self.assertNotIn("SELLTHRUSALESFEE", [key for _, key in detail_categories("2026-10-13")])
-        self.assertIn("SELLTHRUSALESFEE", [key for _, key in detail_categories("2026-08-31")])
+        calculation = result["calculation"]
+        self.assertEqual(calculation["calculation_row_count"], 2)
+        self.assertEqual(len(calculation["unusual"]), 2)
+        self.assertTrue(all("SELLTHRUSALESFEE" in row["unusual_reason"]
+                            for row in calculation["unusual"]))
+        self.assertEqual({row["processed_transaction_label"]
+                          for row in calculation["summary_ready"]}, {"sellthru", "sellthrufee"})
+
+    def test_cell_credit_side_hold_is_unusual_but_retained_for_review(self):
+        rows = [
+            self.row(label="SELLTHRU", identifier="FAMILY", amount=10_000,
+                     remarks="Sellthru Sales Fee"),
+            self.row(label="SELLTHRUFEE", identifier="FAMILYFEE", amount=0, debit=100,
+                     remarks="Platform fee sellthru rp. 100,-"),
+            self.row(label="SELLTHRUSALESHOLD", identifier="FAMILYSLSHLD", amount=20, debit=0,
+                     remarks="Sales hold transaksi sellthru sejumlah 20 rupiah, dari 412110"),
+        ]
+        result = self.prepare("412111", rows)
+        calculation = result["calculation"]
+        self.assertTrue(any("SELLTHRUSALESFEE must be nonnegative Debet" in row["unusual_reason"]
+                            for row in calculation["unusual"]))
+        self.assertEqual(calculation["calculation_row_count"], 3)
+        self.assertIn("sellthrusalesfee", {row["processed_transaction_label"]
+                                           for row in calculation["summary_ready"]})
 
     def test_historical_correction_recalculates_all_following_balances(self):
         facts = [self.prepare(code, [self.row(day=day)], day)

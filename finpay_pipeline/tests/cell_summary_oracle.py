@@ -1,22 +1,23 @@
-"""Independent October cash-flow oracle over recorded eligible ledger rows.
+"""Independent cell cash-flow oracle over recorded eligible ledger rows.
 
 This does not import the report producer or certify Finance opening balances,
 bank statements, or the correctness of recorded family dispositions.
 """
 from collections import defaultdict
 
-# Pinned legacy cash-flow contract; October sales hold is intentionally invoice-only.
+# Cell contract: the SLSHOLD amount is a permanent, separate ST movement.
 DETAIL = ("CASHOUT APOLLO", "QRISDUWIT", "DISBURSEMENT", "FEETRANSAKSI", "RECHARGE",
     "RECHARGEFEE", "PEMBELIAN RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE",
     "REVERSAL - NGRS", "REVERSAL - NGRS FEE", "REVERSAL - PEMBELIAN RECHARGE OUT CLUSTER",
-    "REVERSAL - RECHARGE OUT CLUSTER", "REVERSAL - RECHARGE OUT CLUSTER FEE", "SELLTHRU", "SELLTHRUFEE")
+    "REVERSAL - RECHARGE OUT CLUSTER", "REVERSAL - RECHARGE OUT CLUSTER FEE", "SELLTHRU",
+    "SELLTHRUFEE", "SELLTHRUSALESFEE")
 GROUPS = {
     "NGRS": ("RECHARGE", "RECHARGEFEE", "PEMBELIAN RECHARGE OUT CLUSTER"),
     "Recharge Out Cluster": ("RECHARGE OUT CLUSTER", "RECHARGE OUT CLUSTER FEE"),
     "Reversal - NGRS": ("REVERSAL - NGRS", "REVERSAL - NGRS FEE"),
     "Reversal - Pembelian Recharge Out Cluster": ("REVERSAL - PEMBELIAN RECHARGE OUT CLUSTER",),
     "Reversal - Recharge Out Cluster": ("REVERSAL - RECHARGE OUT CLUSTER", "REVERSAL - RECHARGE OUT CLUSTER FEE"),
-    "PPOB": ("FEETRANSAKSI",), "ST": ("SELLTHRU", "SELLTHRUFEE"),
+    "PPOB": ("FEETRANSAKSI",), "ST": ("SELLTHRU", "SELLTHRUFEE", "SELLTHRUSALESFEE"),
     "DISBURSEMENT": ("DISBURSEMENT",), "QRISDUWIT": ("QRISDUWIT",),
 }
 
@@ -87,7 +88,7 @@ def audit_summary(config, facts, matrix, *, manual_inputs=None):
             for row in fact["calculation"]["summary"]}
         if supplied != dict(totals):
             raise ValueError("stored category summary differs from eligible ledger aggregation")
-        if set(totals) - set(DETAIL) - {"SELLTHRUSALESFEE"}:
+        if set(totals) - set(DETAIL):
             raise ValueError("eligible category lacks an approved cash-flow bridge")
         indexed[(date, code)] = totals
     dates = [item["report_date"] for item in matrix["date_ranges"]]
@@ -169,7 +170,7 @@ def audit_summary(config, facts, matrix, *, manual_inputs=None):
             "numeric_cells_compared": comparisons, "mismatches": 0, "declared_manual_bank_inputs": len(manual_inputs),
             "opening_balances_finance_approved": False, "bank_statement_validated": False,
             "family_dispositions_independently_classified": False,
-            "october_sales_hold_policy": "invoice-only; excluded from cash-flow per approved contract"}
+            "cell_sales_hold_policy": "permanent; included in cell ST cash-flow as a separate fee"}
 
 
 def main():

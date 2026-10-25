@@ -12,7 +12,7 @@ from unittest.mock import Mock
 from finpay_pipeline.cell_contracts import configured_cells, fingerprint
 from finpay_pipeline.cell_database import (
     CELL_MIGRATION, CellDatabaseTarget, CellStore, cell_publication_session,
-    prepare_cell_day, validate_cluster_batch,
+    preflight_cell_database, prepare_cell_day, safe_cell_database_error, validate_cluster_batch,
 )
 
 
@@ -37,6 +37,8 @@ class FakeConnection:
         self.commits = 0
         self.rollbacks = 0
         self.fail_ledger = False
+        self.missing_relation = None
+        self.denied_privilege = None
         self.state = {"sources": {}, "ledger": [], "current": {}, "publications": {}, "dates": [], "operations": {}, "dirty": {}, "route_targets": []}
 
     @contextmanager
@@ -55,6 +57,15 @@ class FakeConnection:
         self.calls.append((text, params))
         if "current_database()" in text:
             return Result(self.database_identity)
+        if text.startswith('SET search_path TO "'):
+            self.database_identity = (*self.database_identity[:2], text.split('"')[1])
+            return Result()
+        if "has_schema_privilege" in text:
+            return Result((True,))
+        if "to_regclass" in text:
+            return Result((None if params[0] == self.missing_relation else params[0],))
+        if "has_table_privilege" in text:
+            return Result((params != self.denied_privilege,))
         if "SELECT DISTINCT target_id" in text and "finpay_cell_publications_v1" in text:
             return Result(rows=[(target_id,) for target_id, status in self.state["route_targets"]
                                 if status != "DB_ONLY"])
@@ -190,17 +201,70 @@ class CellDatabaseTests(unittest.TestCase):
             connect=self.factory, **kwargs,
         )
 
-    def prepared(self, identity, *, rows=2, digest="a" * 64):
+    def prepared(self, identity, *, rows=2, digest="a" * 64, credit=100):
         raw = [{"No": 99, "Transaction ID": "000123", "Transaction Date": "13-10-2026 12:00:00",
-                "Saldo Awal": 1000, "Kredit": 100, "Debet": 0, "Saldo Akhir": 1100,
+                 "Saldo Awal": 1000, "Kredit": credit, "Debet": 0, "Saldo Akhir": 1000 + credit,
                 "Remarks": "=literal source", "Transaction": "RECHARGE",
                 "Transaction Type": "Credit", "Nomor RS": "0812345678"}] * rows
         source = {**identity.to_dict(), "report_date": "2026-10-13",
                   "validated_rows": rows, "footer_total": rows,
                   "status": "validated" if rows else "empty",
                   "artifact": "fixture.xlsx" if rows else None, "source_sha256": digest}
-        return prepare_cell_day(identity, source, raw, {"summary": {"credit": 100 * rows}},
+        return prepare_cell_day(identity, source, raw, {"summary": {"credit": credit * rows}},
                                 self.config, "dummy-rules-v1")
+
+    def test_preflight_is_read_only_validates_all_relations_and_closes_connection(self):
+        result = preflight_cell_database(
+            self.target, {self.target}, password="synthetic", connect=self.factory,
+        )
+        self.assertEqual(result, {"status": "READY", "tables_checked": 10, "views_checked": 1})
+        self.assertEqual(self.factory.call_args.kwargs["options"], "-c default_transaction_read_only=on")
+        self.assertTrue(all(query.startswith(("SELECT ", "SET search_path TO ")) for query, _ in self.database.calls))
+        self.assertFalse(any("advisory" in query for query, _ in self.database.calls))
+        self.assertTrue(self.database.closed)
+
+    def test_preflight_missing_relation_or_privilege_fails_without_writes(self):
+        for relation, denied in (
+            ("dummy_schema.finpay_cell_current_v1", None),
+            (None, ("dummy_schema.finpay_cell_dirty_dates_v1", "DELETE")),
+        ):
+            connection = FakeConnection()
+            connection.missing_relation, connection.denied_privilege = relation, denied
+            with self.subTest(relation=relation, denied=denied), self.assertRaisesRegex(
+                RuntimeError, "category=missing_relation|category=permission_denied",
+            ):
+                preflight_cell_database(self.target, {self.target}, password="synthetic",
+                                        connect=lambda **kwargs: connection)
+            self.assertTrue(connection.closed)
+            self.assertTrue(all(query.startswith(("SELECT ", "SET search_path TO ")) for query, _ in connection.calls))
+
+    def test_preflight_selects_target_schema_instead_of_the_default_user_schema(self):
+        self.database.database_identity = (self.target.database, self.target.user, self.target.user)
+        result = preflight_cell_database(self.target, {self.target}, password="synthetic", connect=self.factory)
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(self.database.database_identity[-1], "dummy_schema")
+
+    def test_preflight_rejects_identity_and_unapproved_targets(self):
+        with self.assertRaises(ValueError):
+            preflight_cell_database(self.target, set(), password="synthetic", connect=self.factory)
+        self.factory.assert_not_called()
+        self.database.database_identity = ("wrong", "dummy_role", "dummy_schema")
+        with self.assertRaisesRegex(RuntimeError, "category=identity_mismatch"):
+            preflight_cell_database(self.target, {self.target}, password="synthetic", connect=self.factory)
+        self.assertTrue(self.database.closed)
+
+    def test_safe_connection_error_does_not_reveal_dsn_or_credentials(self):
+        from psycopg import OperationalError
+
+        secret = "postgresql://sensitive-user:private-password@private-host/private-db"
+        error = OperationalError("connection failed: password authentication failed " + secret)
+        factory = Mock(side_effect=error)
+        with self.assertRaisesRegex(RuntimeError, "category=authentication_failed") as raised:
+            preflight_cell_database(self.target, {self.target}, password="synthetic", connect=factory)
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn("private-password", str(raised.exception))
+        error.sqlstate = "28P01"
+        self.assertIn("sqlstate=28P01", safe_cell_database_error(error))
 
     def test_target_fail_closed_before_connection_and_no_legacy_defaults(self):
         for target, allowed in ((self.target, set()),
@@ -339,6 +403,38 @@ class CellDatabaseTests(unittest.TestCase):
             store.commit_cluster_day(corrected, self.cells)
             self.assertEqual(store.dirty_dates(), ["2026-10-13"])
             self.assertEqual(store.dirty_dates(reset_only=True), [])
+
+    def test_new_xlsx_hash_with_identical_rows_retains_evidence_without_manual_reset(self):
+        original = [self.prepared(cell) for cell in self.cells]
+        exported_again = [self.prepared(cell, digest="b" * 64) for cell in self.cells]
+        with self.session() as store:
+            store.commit_cluster_day(original, self.cells)
+            self.database.state["dirty"].clear()
+            store.commit_cluster_day(exported_again, self.cells)
+            self.assertEqual(store.dirty_dates(), ["2026-10-13"])
+            self.assertEqual(store.dirty_dates(reset_only=True), [])
+        self.assertEqual(len(self.database.state["sources"]), 4)
+        self.assertEqual(len(self.database.state["current"]), 2)
+        for cell, new in zip(self.cells, exported_again):
+            self.assertEqual(
+                self.database.state["current"][(cell.account, cell.cluster_id, cell.cell_code, "2026-10-13")],
+                (new["generation_id"], new["calculation_id"]),
+            )
+
+    def test_genuine_row_change_still_requires_an_audited_manual_reset(self):
+        with self.session() as store:
+            store.commit_cluster_day([self.prepared(cell) for cell in self.cells], self.cells)
+            self.database.state["dirty"].clear()
+            correction = [self.prepared(self.cells[0], digest="b" * 64, credit=175),
+                          self.prepared(self.cells[1], digest="b" * 64)]
+            store.commit_cluster_day(correction, self.cells)
+            self.assertEqual(store.dirty_dates(reset_only=True), ["2026-10-13"])
+
+    def test_identical_rerun_does_not_clear_an_existing_pending_reset(self):
+        with self.session() as store:
+            store.commit_cluster_day([self.prepared(cell) for cell in self.cells], self.cells)
+            store.commit_cluster_day([self.prepared(cell, digest="b" * 64) for cell in self.cells], self.cells)
+            self.assertEqual(store.dirty_dates(reset_only=True), ["2026-10-13"])
 
     def test_database_only_dirty_date_survives_retry_until_matching_publication(self):
         batch = [self.prepared(cell) for cell in self.cells]

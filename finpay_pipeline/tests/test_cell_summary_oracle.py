@@ -44,11 +44,20 @@ class IndependentSummaryOracleTests(unittest.TestCase):
         for index, day in enumerate(("2026-10-13", "2026-10-14", "2026-10-15")):
             for scale, cell in enumerate(self.config.cells, 1):
                 credit, debit = 100 * (index + 1) * scale, (100, 80, 60)[index] * scale
+                hold = 0 if (index, scale) == (1, 2) else 20 * scale
+                eligible = [
+                    ("RECHARGE", credit, 0),
+                    ("CASHOUT APOLLO", 0, debit),
+                    ("SELLTHRU", 10_000 * scale, 0),
+                    ("SELLTHRUFEE", 0, 100),
+                    ("SELLTHRUSALESFEE", 0, hold),
+                ]
                 result = {"report_date": day, "qris": [], "unusual": [], "reversal": [],
-                    "summary_ready": [{"processed_transaction_label": "recharge", "Kredit": credit, "Debet": 0},
-                                      {"processed_transaction_label": "cashout apollo", "Kredit": 0, "Debet": debit}],
-                    "summary": [{"Transaction": "RECHARGE", "Sum_of_Kredit": credit, "Sum_of_Debet": 0, "Transaction_Count": 1},
-                                {"Transaction": "CASHOUT APOLLO", "Sum_of_Kredit": 0, "Sum_of_Debet": debit, "Transaction_Count": 1}]}
+                    "summary_ready": [{"processed_transaction_label": label.lower(), "Kredit": item_credit,
+                                       "Debet": item_debit} for label, item_credit, item_debit in eligible],
+                    "summary": [{"Transaction": label, "Sum_of_Kredit": item_credit,
+                                 "Sum_of_Debet": item_debit, "Transaction_Count": 1}
+                                for label, item_credit, item_debit in eligible]}
                 generation, config_id = "fixture-" + day + cell.cell_code, fingerprint(self.config.to_dict())
                 self.facts.append({"identity": cell.to_dict(), "report_date": day, "generation_id": generation,
                     "config_id": config_id, "rules_version": self.config.rules_version, "calculation": result,
@@ -60,6 +69,10 @@ class IndependentSummaryOracleTests(unittest.TestCase):
         result = audit_summary(self.config, self.facts, self.matrix)
         self.assertEqual((result["cell_days"], result["mismatches"]), (6, 0))
         self.assertFalse(result["opening_balances_finance_approved"])
+        self.assertEqual(
+            result["cell_sales_hold_policy"],
+            "permanent; included in cell ST cash-flow as a separate fee",
+        )
 
     def test_independent_oracle_rejects_wrong_bank_and_aggregation(self):
         matrix = copy.deepcopy(self.matrix)

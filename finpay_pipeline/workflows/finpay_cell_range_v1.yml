@@ -36,6 +36,8 @@ tasks:
   - id: expand_cell_range
     type: io.kestra.plugin.scripts.python.Script
     containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
     timeout: PT1M
     env:
       START_DATE: "{{ inputs.start_date }}"

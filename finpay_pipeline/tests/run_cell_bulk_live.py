@@ -29,7 +29,7 @@ NAMESPACE, FLOW_ID = "finance.finpay." + RUN_ID, "finpay_cell_" + RUN_ID
 RECOVERY_FLOW_ID = "finpay_cell_alias_publish_remaining20261020v3"
 REPORT_IMAGE = "finpay-cell-reporting:bulk-20261020-alias-v2"
 SCRAPER_IMAGE = "finpay-digipos-cell-scraper:bulk-20261020-alias-v2"
-BULK_TASKS = ("preflight_cell_bulk_targets", "acquire_cell_bulk", "preprocess_cell_bulk",
+BULK_TASKS = ("preflight_cell_bulk_targets", "preflight_cell_database", "acquire_cell_bulk", "preprocess_cell_bulk",
               "persist_cell_bulk", "publish_cell_bulk")
 spec = importlib.util.spec_from_file_location("_finpay_private_ops", Path(__file__).with_name("run_cell_single_day_e2e.py"))
 ops = importlib.util.module_from_spec(spec)
