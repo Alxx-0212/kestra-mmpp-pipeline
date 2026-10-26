@@ -362,7 +362,7 @@ reset retain their backup and evidence-retention requirements.
   The non-production copy must also match `Monitoring Finpay (MMPP & GMM)`; a
   title mismatch blocks the run. Do not store the ID in this tracked document or
   public logs.
-- Data scope: daily cell reporting for `2026-10-01` through `2026-10-24`
+- Data scope: daily cell reporting for `2026-10-01` through `2026-10-25`
   inclusive, all eight configured clusters (`412110`, `422010`, `422040`,
   `422090`, `422100`, `422140`, `422180`, and `422220`).
 - Before deletion, make an in-memory allowlist of the exact source-generation and
@@ -380,7 +380,7 @@ reset retain their backup and evidence-retention requirements.
   and manual-reset records for the selected clusters and inclusive date range.
   Keep configuration provenance unless reset preflight proves it must be
   replaced. Any selected publication epoch that starts before October 1 or ends
-  after October 24 blocks the reset; do not partially remove an out-of-range
+  after October 25 blocks the reset; do not partially remove an out-of-range
   publication snapshot.
 - The target-operation table has no date key. Remove a row only if the in-memory
   preflight proves there is exactly one row for the approved workbook ID,
@@ -410,8 +410,8 @@ local test images from the reviewed source snapshot; do not overwrite release
 tags or publish images. Run the full inclusive range once. Any failed or ambiguous
 stage stops the run; retain only normal workflow outputs and sanitized execution
 status, not a new receipt, archive, or backup, and obtain fresh approval before
-another reset or destructive retry. Independently verify all 192 cluster/date
-cohorts and 432 cell-days, database source/current/calculation consistency,
+another reset or destructive retry. Independently verify all 200 cluster/date
+cohorts and 450 cell-days, database source/current/calculation consistency,
 four-tab values and evaluated formulas, publication markers/fingerprints,
 protections, and unchanged pre-existing worksheet metadata/content and workbook
 sharing. No scheduler, production deployment, commit, push, or registry
