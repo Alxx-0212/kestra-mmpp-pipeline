@@ -296,7 +296,7 @@ def make_cell_sheet_client(credentials_info, *, include_drive_file=False):
     session = AuthorizedSession(credentials, max_refresh_attempts=0)
     session.mount("https://", HTTPAdapter(max_retries=0))
     client = gspread.Client(auth=credentials, session=session)
-    client.set_timeout((10, 45))
+    client.set_timeout((10, 120))
     return client
 
 

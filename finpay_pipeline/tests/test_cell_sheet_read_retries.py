@@ -7,6 +7,7 @@ from unittest.mock import Mock, call, patch
 from requests.exceptions import ConnectionError, Timeout
 
 from finpay_pipeline.cell_publication import ExistingSheetAdapter, _padded
+from finpay_pipeline.cell_workflow import make_cell_sheet_client
 
 
 class FakeResponse:
@@ -34,6 +35,24 @@ class CellSheetReadRetriesTests(unittest.TestCase):
         )
         self.worksheet = SimpleNamespace(id=7, title="Approved Tab", get=Mock())
         self.adapter = ExistingSheetAdapter(self.spreadsheet, self.worksheet)
+
+    def test_sheet_client_allows_slow_responses_without_retrying_writes(self):
+        credentials = Mock()
+        session = Mock()
+        client = Mock()
+        adapter = Mock()
+
+        with patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=credentials), \
+             patch("google.auth.transport.requests.AuthorizedSession", return_value=session), \
+             patch("requests.adapters.HTTPAdapter", return_value=adapter) as http_adapter, \
+             patch("gspread.Client", return_value=client) as gspread_client:
+            result = make_cell_sheet_client({"client_email": "writer@example.test"})
+
+        self.assertIs(result, client)
+        session.mount.assert_called_once_with("https://", adapter)
+        http_adapter.assert_called_once_with(max_retries=0)
+        gspread_client.assert_called_once_with(auth=credentials, session=session)
+        client.set_timeout.assert_called_once_with((10, 120))
 
     def test_value_read_retries_timeouts_connections_and_transient_statuses(self):
         self.worksheet.get.side_effect = [
