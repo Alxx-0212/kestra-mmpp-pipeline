@@ -17,6 +17,7 @@ from ..cell_contracts import (
     MAX_CELL_ARTIFACT_BYTES, configured_cells, sha256_file_bounded,
     validate_complete_manifest,
 )
+from ..cell_progress import Progress
 from ..cell_workflow import MAX_BUNDLE_BYTES
 from .acquisition import acquire_cell_day
 from .settings import (
@@ -26,6 +27,11 @@ from .settings import (
 MAX_BULK_BUNDLE_BYTES = 1024 * 1024 * 1024
 MAX_INDEX_BYTES = 8 * 1024 * 1024
 _CACHE_SCHEMA_VERSION = 1
+
+
+class _CohortRetriesExhausted(Exception):
+    def __init__(self, error: str) -> None:
+        self.error = error
 
 
 def _unique_json(pairs):
@@ -167,53 +173,79 @@ def _cached_cohort(directory: Path, cluster_id: str, day: str) -> dict | None:
 
 def _acquire_cohort(cluster_id: str, day: str, password: str, directory: Path,
                     max_attempts: int, googleapis_compatibility: bool):
-    _private_directory(directory)
-    cached = _cached_cohort(directory, cluster_id, day)
-    if cached is not None:
-        return cached, None
-    bundle = directory / "cell_sources_v2.zip"
-    error = "AcquisitionError"
-    for _ in range(max_attempts):
-        try:
-            result = acquire_cell_day(
-                day, cluster_id, password, str(directory), max_attempts=1,
-                googleapis_compatibility=googleapis_compatibility,
-            )
-            if (result.get("cluster_id") != cluster_id or result.get("report_date") != day
-                    or Path(result.get("source_bundle", "")).resolve() != bundle.resolve()):
-                raise ValueError("daily cell acquisition returned a different identity")
-            digest, cells = _validate_daily_bundle(
-                bundle, cluster_id, day, result.get("source_bundle_sha256"),
-            )
-            receipt = {
-                "schema_version": _CACHE_SCHEMA_VERSION, "cluster_id": cluster_id,
-                "report_date": day, "roster_version": ROSTER_VERSION,
-                "sha256": digest, "cells": cells,
-            }
-            _write_json(directory / "receipt.json", receipt, 16 * 1024)
-            return {"cluster_id": cluster_id, "report_date": day,
-                    "path": f"sources/{cluster_id}/{day}.zip", "sha256": digest,
-                    "cells": cells, "_source": bundle}, None
-        except Exception as exc:
-            error = type(exc).__name__
-    return None, error
+    try:
+        with Progress(
+            "cell_cohort_acquisition", total=1, cluster_id=cluster_id,
+            report_date=day, role="cohort", heartbeat_interval=None,
+        ) as progress:
+            _private_directory(directory)
+            cached = _cached_cohort(directory, cluster_id, day)
+            if cached is not None:
+                progress.update("cohort_cache_reused", count=cached["cells"])
+                return cached, None
+            bundle = directory / "cell_sources_v2.zip"
+            error = "AcquisitionError"
+            for attempt in range(1, max_attempts + 1):
+                progress.update("cohort_attempt_started", attempt=attempt)
+                try:
+                    result = acquire_cell_day(
+                        day, cluster_id, password, str(directory), max_attempts=1,
+                        googleapis_compatibility=googleapis_compatibility,
+                    )
+                    if (result.get("cluster_id") != cluster_id or result.get("report_date") != day
+                            or Path(result.get("source_bundle", "")).resolve() != bundle.resolve()):
+                        raise ValueError("daily cell acquisition returned a different identity")
+                    digest, cells = _validate_daily_bundle(
+                        bundle, cluster_id, day, result.get("source_bundle_sha256"),
+                    )
+                    receipt = {
+                        "schema_version": _CACHE_SCHEMA_VERSION, "cluster_id": cluster_id,
+                        "report_date": day, "roster_version": ROSTER_VERSION,
+                        "sha256": digest, "cells": cells,
+                    }
+                    _write_json(directory / "receipt.json", receipt, 16 * 1024)
+                    progress.update("cohort_bundle_ready", count=cells, attempt=attempt)
+                    return {"cluster_id": cluster_id, "report_date": day,
+                            "path": f"sources/{cluster_id}/{day}.zip", "sha256": digest,
+                            "cells": cells, "_source": bundle}, None
+                except Exception as exc:
+                    error = type(exc).__name__
+                    progress.update(
+                        "cohort_retry" if attempt < max_attempts else "cohort_attempt_failed",
+                        attempt=attempt,
+                    )
+            raise _CohortRetriesExhausted(error)
+    except _CohortRetriesExhausted as exc:
+        return None, exc.error
 
 
 def _acquire_account(cluster_id: str, start: date, end: date, password: str,
                      cache_root: Path, max_attempts: int, googleapis_compatibility: bool):
     entries, failures = [], []
-    day = start
-    while day <= end:
-        text = day.isoformat()
-        directory = cache_root / "cohorts" / cluster_id / text
-        entry, error = _acquire_cohort(
-            cluster_id, text, password, directory, max_attempts, googleapis_compatibility,
-        )
-        if entry is None:
-            failures.append(f"{cluster_id}/{text} ({error})")
-        else:
-            entries.append(entry)
-        day += timedelta(days=1)
+    total = (end - start).days + 1
+    with Progress(
+        "cell_account_acquisition", total=total, cluster_id=cluster_id,
+        role="account", heartbeat_interval=None,
+    ) as progress:
+        day = start
+        processed = 0
+        while day <= end:
+            text = day.isoformat()
+            directory = cache_root / "cohorts" / cluster_id / text
+            entry, error = _acquire_cohort(
+                cluster_id, text, password, directory, max_attempts, googleapis_compatibility,
+            )
+            processed += 1
+            if entry is None:
+                failures.append(f"{cluster_id}/{text} ({error})")
+                progress.update("cohort_failed", completed=processed, report_date=text)
+            else:
+                entries.append(entry)
+                progress.update(
+                    "cohort_complete", completed=processed, report_date=text,
+                    count=entry["cells"],
+                )
+            day += timedelta(days=1)
     return entries, failures
 
 
@@ -263,69 +295,85 @@ def acquire_cell_range(start_date: str, end_date: str, cluster_id: str,
     if type(googleapis_compatibility) is not bool:
         raise ValueError("googleapis_compatibility must be a boolean")
 
-    started = time.perf_counter()
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    cache_root = Path(cache_dir) if cache_dir is not None else output / ".cell_bulk_cache_v1"
-    _private_directory(cache_root)
-    _cache_scope(cache_root, output, start_text, end_text, clusters)
-    active_workers = min(workers, len(clusters))
-    results, failures = [], []
-    with ThreadPoolExecutor(max_workers=active_workers, thread_name_prefix="cell-account") as pool:
-        futures = {
-            pool.submit(_acquire_account, cluster, start, end, password, cache_root,
-                        max_attempts, googleapis_compatibility): cluster
-            for cluster in clusters
-        }
-        for future in as_completed(futures):
-            try:
-                entries, failed = future.result()
-                results.extend(entries)
-                failures.extend(failed)
-            except Exception as exc:
-                failures.append(f"{futures[future]} (worker {type(exc).__name__})")
-    if failures:
-        raise RuntimeError("cell bulk acquisition incomplete: " + ", ".join(sorted(failures))) from None
+    total_cohorts = ((end - start).days + 1) * len(clusters)
+    with Progress(
+        "cell_bulk_acquisition", total=total_cohorts,
+        start_date=start_text, end_date=end_text, cluster_id=cluster_id,
+        role="bulk",
+    ) as progress:
+        started = time.perf_counter()
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        cache_root = Path(cache_dir) if cache_dir is not None else output / ".cell_bulk_cache_v1"
+        _private_directory(cache_root)
+        _cache_scope(cache_root, output, start_text, end_text, clusters)
+        active_workers = min(workers, len(clusters))
+        results, failures = [], []
+        completed = 0
+        with ThreadPoolExecutor(max_workers=active_workers, thread_name_prefix="cell-account") as pool:
+            futures = {
+                pool.submit(_acquire_account, cluster, start, end, password, cache_root,
+                            max_attempts, googleapis_compatibility): cluster
+                for cluster in clusters
+            }
+            for future in as_completed(futures):
+                cluster = futures[future]
+                try:
+                    entries, failed = future.result()
+                    results.extend(entries)
+                    failures.extend(failed)
+                    count = len(entries) + len(failed)
+                    completed += count
+                    progress.update(
+                        "account_range_partial" if failed else "account_range_complete",
+                        cluster_id=cluster, completed=completed, count=count,
+                    )
+                except Exception as exc:
+                    failures.append(f"{cluster} (worker {type(exc).__name__})")
+                    progress.update("account_worker_failed", cluster_id=cluster, completed=completed)
+        if failures:
+            raise RuntimeError("cell bulk acquisition incomplete: " + ", ".join(sorted(failures))) from None
 
-    results.sort(key=lambda item: (int(item["cluster_id"]), item["report_date"]))
-    cohorts, cells = len(results), sum(item["cells"] for item in results)
-    elapsed = round(time.perf_counter() - started, 3)
-    index = {
-        "schema_version": 1, "start_date": start_text, "end_date": end_text,
-        "clusters": list(clusters), "roster_version": ROSTER_VERSION,
-        "cohorts": cohorts, "cells": cells, "elapsed_seconds": elapsed,
-        "entries": [{key: item[key] for key in (
-            "cluster_id", "report_date", "path", "sha256", "cells",
-        )} for item in results],
-    }
-    index_bytes = json.dumps(index, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    if len(index_bytes) > MAX_INDEX_BYTES:
-        raise ValueError("cell bulk index exceeds size limit")
-    destination = output / "cell_bulk_sources_v1.zip"
-    fd, temporary = tempfile.mkstemp(prefix=".cell_bulk_sources_v1-", suffix=".pending", dir=output)
-    try:
-        with os.fdopen(fd, "w+b") as raw:
-            with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_STORED) as archive:
-                info = zipfile.ZipInfo("index.json")
-                info.compress_type = zipfile.ZIP_STORED
-                info.external_attr = (stat.S_IFREG | 0o600) << 16
-                archive.writestr(info, index_bytes)
-                total = len(index_bytes) + 256
-                for item in results:
-                    total = _write_member(archive, item["_source"], item["path"], item["sha256"], total)
-            raw.flush()
-            os.fsync(raw.fileno())
-            if raw.tell() > MAX_BULK_BUNDLE_BYTES:
-                raise ValueError("cell bulk source bundle exceeds size limit")
-        os.replace(temporary, destination)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-    os.chmod(destination, 0o600)
-    digest = sha256_file_bounded(destination, MAX_BULK_BUNDLE_BYTES)
-    elapsed = round(time.perf_counter() - started, 3)
-    return {
-        "source_bundle": str(destination), "source_bundle_sha256": digest,
-        "start_date": start_text, "end_date": end_text,
-        "clusters": list(clusters), "cohorts": cohorts, "cells": cells,
-        "workers": active_workers, "elapsed_seconds": elapsed,
-    }
+        results.sort(key=lambda item: (int(item["cluster_id"]), item["report_date"]))
+        cohorts, cells = len(results), sum(item["cells"] for item in results)
+        elapsed = round(time.perf_counter() - started, 3)
+        index = {
+            "schema_version": 1, "start_date": start_text, "end_date": end_text,
+            "clusters": list(clusters), "roster_version": ROSTER_VERSION,
+            "cohorts": cohorts, "cells": cells, "elapsed_seconds": elapsed,
+            "entries": [{key: item[key] for key in (
+                "cluster_id", "report_date", "path", "sha256", "cells",
+            )} for item in results],
+        }
+        index_bytes = json.dumps(index, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        if len(index_bytes) > MAX_INDEX_BYTES:
+            raise ValueError("cell bulk index exceeds size limit")
+        destination = output / "cell_bulk_sources_v1.zip"
+        fd, temporary = tempfile.mkstemp(prefix=".cell_bulk_sources_v1-", suffix=".pending", dir=output)
+        try:
+            with os.fdopen(fd, "w+b") as raw:
+                with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_STORED) as archive:
+                    info = zipfile.ZipInfo("index.json")
+                    info.compress_type = zipfile.ZIP_STORED
+                    info.external_attr = (stat.S_IFREG | 0o600) << 16
+                    archive.writestr(info, index_bytes)
+                    total = len(index_bytes) + 256
+                    for item in results:
+                        total = _write_member(archive, item["_source"], item["path"], item["sha256"], total)
+                raw.flush()
+                os.fsync(raw.fileno())
+                if raw.tell() > MAX_BULK_BUNDLE_BYTES:
+                    raise ValueError("cell bulk source bundle exceeds size limit")
+            os.replace(temporary, destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        os.chmod(destination, 0o600)
+        digest = sha256_file_bounded(destination, MAX_BULK_BUNDLE_BYTES)
+        elapsed = round(time.perf_counter() - started, 3)
+        progress.update("bulk_bundle_ready", completed=total_cohorts, bytes=destination.stat().st_size)
+        return {
+            "source_bundle": str(destination), "source_bundle_sha256": digest,
+            "start_date": start_text, "end_date": end_text,
+            "clusters": list(clusters), "cohorts": cohorts, "cells": cells,
+            "workers": active_workers, "elapsed_seconds": elapsed,
+        }

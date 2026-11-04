@@ -5,12 +5,14 @@ import copy
 import json
 import re
 import uuid
+from datetime import datetime
 
 from .cell_calculation import build_cluster_report, recalculate_stale_history
-from .cell_contracts import fingerprint
+from .cell_contracts import business_date, fingerprint
 from .cell_database import validate_cluster_batch
 from .cell_detail_sheets import build_cell_detail_history, detail_format_requests
 from .cell_invoice_sheets import build_cell_invoice_matrix, invoice_format_requests
+from .cell_observability import report
 from .cell_publication import (
     GUARD_PREFIX, MANAGED_PREFIX, MAX_REQUEST_BYTES, _editors_match, _format_requests,
     _manual_values, _marker_entries, _marker_request, _padded, _protection_requests,
@@ -52,6 +54,12 @@ def bind_cell_style_contract(role, matrix):
     if role == "summary":
         if matrix.get("layout_version") not in (4, 5):
             raise ValueError("new summary style requires the cell-only layout")
+        stripes = matrix.get("row_stripes")
+        if stripes is None:
+            stripes = ["detail" if index % 2 else "white" for index in range(height)]
+        if len(stripes) != height or any(value not in ("detail", "white") for value in stripes):
+            raise ValueError("Summary row stripes do not match its committed height")
+        matrix["row_stripes"] = list(stripes)
         widths[:3] = [115, 100, 430]
         merges = [[0, 2, col, col + 1] for col in range(3)]
         for block in matrix["blocks"]:
@@ -65,6 +73,12 @@ def bind_cell_style_contract(role, matrix):
             if matrix.get("layout_version") in (3, 4):
                 merges.append([0, 1, start, end])
     elif role in ("unusual", "reversal"):
+        stripes = matrix.get("row_stripes")
+        if stripes is None:
+            stripes = ["white" if index % 2 else "stripe" for index in range(height)]
+        if len(stripes) != height or any(value not in ("white", "stripe") for value in stripes):
+            raise ValueError("detail row stripes do not match its committed height")
+        matrix["row_stripes"] = list(stripes)
         sizes = {"REPORT DATE": 110, "CELL": 70 if matrix.get("layout_version") == 3 else 50, "NO": 70, "TRANSACTION DATE": 165,
             "TRANSACTION ID": 300, "BASE ID": 220, "TRANSACTION TYPE": 150, "TRANSACTION": 410,
             "KREDIT": 120, "DEBET": 120, "SALDO AWAL": 130, "SALDO AKHIR": 130,
@@ -108,8 +122,11 @@ def _expected_style(matrix, row, column, section):
         if not header:
             key, previous = matrix["row_keys"][row], matrix["row_keys"][row - 1]
             group = key.split(":", 1)[0]
+            stripes = matrix.get("row_stripes", [])
+            stripe = stripes[row] if len(stripes) == len(matrix["values"]) else None
             expected["background"] = (palette["mandiri"] if group == "MANDIRI" else
-                palette["cash"] if group == "CASH" else palette["detail"] if row % 2 else palette["white"])
+                palette["cash"] if group == "CASH" else
+                palette[stripe] if stripe else palette["detail"] if row % 2 else palette["white"])
             if group in ("DETAIL", "MANDIRI") and group != previous.split(":", 1)[0]:
                 expected["borders"]["top"] = edge
                 if column == 1:
@@ -159,7 +176,10 @@ def _expected_style(matrix, row, column, section):
     else:
         expected["wrap"] = "WRAP" if header else "CLIP"
         if not header:
-            expected.update(background=palette["white"] if row % 2 else palette["stripe"], vertical="TOP")
+            stripes = matrix.get("row_stripes", [])
+            stripe = stripes[row] if len(stripes) == contract["height"] else None
+            expected.update(background=palette[stripe] if stripe else
+                            palette["white"] if row % 2 else palette["stripe"], vertical="TOP")
             name = matrix["headers"][column]
             if name in ("CELL", "NO"):
                 expected.update(align="CENTER", number_type="NUMBER", number_pattern="0")
@@ -311,7 +331,8 @@ def _verify_style(adapter, matrix, previous=None, *, allow_unattested=False):
                     if box[1] - box[0] > 1 or box[3] - box[2] > 1:
                         anchors[key], expected_anchors[key] = actual, expected
                 if any(actual.get(name) != value for name, value in expected.items() if name != "borders"):
-                    raise ValueError(f"{contract['role']} effective style mismatch at row {index + 1}, column {col + 1}")
+                    raise ValueError(f"{contract['role']} effective style mismatch at row {index + 1}, "
+                                     f"column {col + 1}: actual={actual}, expected={expected}")
                 actual_row[col], expected_row[col], boxes[col] = actual, expected, box
             if index < height:
                 # Inspect every visible grid edge once, with the previous row as
@@ -330,7 +351,8 @@ def _verify_style(adapter, matrix, previous=None, *, allow_unattested=False):
                     if index == height - 1:
                         edges.append((actual["bottom"], expected["bottom"]))
                     if any(actual_edge != expected_edge for actual_edge, expected_edge in edges):
-                        raise ValueError(f"{contract['role']} effective style border mismatch at row {index + 1}, column {col + 1}")
+                        raise ValueError(f"{contract['role']} effective style border mismatch at row {index + 1}, "
+                                         f"column {col + 1}: edges={edges}, actual={actual}, expected={expected}")
                 previous_actual, previous_expected, previous_boxes = actual_row, expected_row, boxes
         covered += len(page["formats"])
     if covered != read_height:
@@ -359,8 +381,10 @@ def validate_output_targets(spreadsheet_id, legacy_spreadsheet_id, accounts, tar
 
 
 def build_cell_cluster_matrices_v2(config, cell_days, through_date, *, summary_manual_values=None,
-                                   summary_reset_dates=None, dummy=False):
-    report = build_cluster_report(config, cell_days, through_date)
+                                   summary_reset_dates=None, dummy=False,
+                                   first_report_date=None, calculate_saldo=True):
+    report = build_cluster_report(config, cell_days, through_date,
+        first_report_date=first_report_date, calculate_saldo=calculate_saldo)
     matrices = {
         "summary": render_cell_matrix(report, manual_values=summary_manual_values or {},
             reset_dates=summary_reset_dates or set(), dummy=dummy, presentation_version=5),
@@ -377,6 +401,528 @@ def build_cell_cluster_matrices_v2(config, cell_days, through_date, *, summary_m
         json.dumps(values, allow_nan=False)
         bind_cell_style_contract(role, matrix)
     return matrices
+
+
+def _sheet_date(value):
+    if not isinstance(value, str):
+        return None
+    for pattern in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(value, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _date_groups(role, matrix):
+    if role in ("summary", "invoice") and matrix.get("date_ranges"):
+        return {item["report_date"]: (item["start_row"] - 1,
+                item["end_row"] - item["start_row"] + 1) for item in matrix["date_ranges"]}
+    values = matrix["values"]
+    first_data_row = 3 if role == "summary" else 2 if role == "invoice" else 1
+    groups = {}
+    for index, row in enumerate(values[first_data_row:], first_data_row):
+        day = _sheet_date(row[0]) if row else None
+        if day:
+            if day in groups and groups[day][0] + groups[day][1] == index:
+                start, count = groups[day]
+                groups[day] = (start, count + 1)
+            else:
+                groups[day] = (index, 1)
+    return groups
+
+
+def _shift_formula_rows(value, boundary, delta):
+    if not isinstance(value, str) or not value.startswith("=") or not delta:
+        return value
+    return re.sub(
+        r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3})(\$?)(\d+)(?!\s*\()",
+        lambda match: match[1] + match[2] + str(
+            int(match[3]) + delta if int(match[3]) > boundary else int(match[3])
+        ),
+        value,
+    )
+
+
+def _row_operation(old_range, new_count, insertion_index):
+    if old_range:
+        old_start, old_count = old_range
+        difference = new_count - old_count
+        if difference > 0:
+            return {"insert_row": old_start + old_count, "insert_count": difference}
+        if difference < 0:
+            return {"delete_row": old_start + new_count, "delete_count": -difference}
+        return {}
+    return ({"insert_row": insertion_index, "insert_count": new_count}
+            if new_count else {})
+
+
+def mark_cell_date_saldo_unverified(matrix, report_date):
+    ranges = [item for item in matrix.get("date_ranges", [])
+              if item["report_date"] == report_date]
+    if len(ranges) != 1:
+        raise ValueError("daily Summary must contain exactly one report-date block")
+    start = ranges[0]["start_row"] - 1
+    width = len(matrix["values"][0])
+    status = [report_date, "BALANCE", "CUMULATIVE SALDO UNVERIFIED"] + [""] * (width - 3)
+    matrix["values"].insert(start, status)
+    matrix["numeric_preview"].insert(start, status[:])
+    matrix["row_keys"].insert(start, "BALANCE_STATUS")
+    matrix["row_stripes"].insert(start, "detail" if start % 2 else "white")
+    ranges[0]["end_row"] += 1
+    for row_index in range(start + 1, len(matrix["values"])):
+        matrix["values"][row_index] = [
+            _shift_formula_rows(value, start, 1) for value in matrix["values"][row_index]
+        ]
+    for entry in matrix.get("editable_inputs", []):
+        if entry["row"] > start:
+            entry["row"] += 1
+        entry["default"] = _shift_formula_rows(entry["default"], start, 1)
+    matrix["report_fingerprint"] = fingerprint(matrix["values"])
+    return bind_cell_style_contract("summary", matrix)
+
+
+def preserve_cell_date_saldo_chain(prior, replacement, report_date):
+    old_ranges = [item for item in prior.get("date_ranges", [])
+                  if item["report_date"] == report_date]
+    if not old_ranges:
+        return False
+    old_start = old_ranges[0]["start_row"] - 1
+    old_end = old_ranges[0]["end_row"]
+    new_range = next((item for item in replacement["date_ranges"]
+                      if item["report_date"] == report_date), None)
+    if new_range is None:
+        raise ValueError("replacement Summary lacks its existing date block")
+    new_start, new_end = new_range["start_row"] - 1, new_range["end_row"]
+    saldo_columns = [block["end_column"] - 1 for block in replacement["blocks"]]
+    has_chain = any(isinstance(prior["values"][row][column], str)
+                    and prior["values"][row][column].startswith("=")
+                    for row in range(old_start, old_end) for column in saldo_columns)
+    if not has_chain:
+        return False
+    old_keys = prior["row_keys"][old_start:old_end]
+    new_keys = replacement["row_keys"][new_start:new_end]
+    if old_keys != new_keys:
+        raise ValueError("existing Summary SALDO chain cannot be aligned to the replacement block")
+    # These formulas intentionally keep the pre-existing cross-date dependency chain alive.
+    for offset in range(old_end - old_start):
+        for column in saldo_columns:
+            replacement["values"][new_start + offset][column] = prior["values"][old_start + offset][column]
+            replacement["numeric_preview"][new_start + offset][column] = prior["numeric_preview"][old_start + offset][column]
+    replacement["report_fingerprint"] = fingerprint(replacement["values"])
+    return True
+
+
+def _merge_summary_date(prior, replacement, report_date, preserve_saldo_chain):
+    old_groups = _date_groups("summary", prior) if prior else {}
+    new_groups = _date_groups("summary", replacement)
+    if set(new_groups) != {report_date}:
+        raise ValueError("date-scoped Summary replacement must contain exactly one date")
+    old_range, new_range = old_groups.get(report_date), new_groups[report_date]
+    old_count = old_range[1] if old_range else 0
+    new_count = new_range[1]
+    if old_range:
+        boundary = old_range[0] + old_count
+        delta = new_count - old_count
+        insertion_index = boundary
+    else:
+        insertion_index = next((start for day, (start, _) in sorted(old_groups.items())
+                                if day > report_date), len(prior["values"]) if prior else 3)
+        boundary, delta = insertion_index, new_count
+    base = prior or replacement
+    values, preview = [row[:] for row in base["values"][:3]], [row[:] for row in base["numeric_preview"][:3]]
+    row_keys, ranges, inputs = base["row_keys"][:3], [], []
+    saldo_columns = {block["end_column"] - 1 for block in replacement["blocks"]}
+    base_stripes = base.get("row_stripes", [
+        "detail" if index % 2 else "white" for index in range(len(base["values"]))
+    ])
+    stripes = base_stripes[:3]
+    for day in sorted(set(old_groups) | {report_date}):
+        source = replacement if day == report_date else prior
+        source_start, count = (new_groups if day == report_date else old_groups)[day]
+        start = len(values)
+        for row in source["values"][source_start:source_start + count]:
+            value = []
+            for column, item in enumerate(row):
+                if day == report_date and preserve_saldo_chain and column in saldo_columns:
+                    value.append(item)
+                else:
+                    delta_rows = start - source_start if day == report_date else 0
+                    value.append(_shift_formula_rows(item, 0, delta_rows) if day == report_date
+                                 else _shift_formula_rows(item, boundary, delta))
+            values.append(value)
+        preview.extend(row[:] for row in source["numeric_preview"][source_start:source_start + count])
+        row_keys.extend(source["row_keys"][source_start:source_start + count])
+        source_stripes = source.get("row_stripes", [
+            "detail" if index % 2 else "white" for index in range(len(source["values"]))
+        ])
+        stripes.extend(("detail" if index % 2 else "white")
+                       for index in range(start, start + count) if day == report_date)
+        if day != report_date:
+            stripes.extend(source_stripes[source_start:source_start + count])
+        ranges.append({"report_date": day, "start_row": start + 1, "end_row": len(values)})
+        source_first_row = source_start + 1
+        for entry in source.get("editable_inputs", []):
+            if entry["report_date"] != day:
+                continue
+            inputs.append({**entry, "row": start + entry["row"] - source_first_row + 1,
+                "default": (_shift_formula_rows(entry["default"], 0, start - source_start)
+                            if day == report_date else
+                            _shift_formula_rows(entry["default"], boundary, delta))})
+    matrix = {
+        **base, "values": values, "numeric_preview": preview, "row_keys": row_keys,
+        "date_ranges": ranges, "editable_inputs": inputs, "row_stripes": stripes,
+        "manual_reset_audit": [],
+        "report_fingerprint": fingerprint(values),
+    }
+    target = next(item for item in ranges if item["report_date"] == report_date)
+    patch = {"start_row": target["start_row"] - 1, "row_count": new_count}
+    patch.update(_row_operation(old_range, new_count, insertion_index))
+    if prior is None:
+        patch.update({"start_row": 0, "row_count": len(values), "initial": True})
+        patch.pop("insert_row", None)
+        patch.pop("insert_count", None)
+        patch.pop("delete_row", None)
+        patch.pop("delete_count", None)
+    return bind_cell_style_contract("summary", matrix), patch
+
+
+def _merge_invoice_date(prior, replacement, report_date):
+    old_groups = _date_groups("invoice", prior) if prior else {}
+    new_groups = _date_groups("invoice", replacement)
+    if set(new_groups) != {report_date}:
+        raise ValueError("date-scoped invoice replacement must contain exactly one date")
+    old_range, new_range = old_groups.get(report_date), new_groups[report_date]
+    new_count = new_range[1]
+    if old_range:
+        insertion_index = old_range[0] + old_range[1]
+    elif old_groups:
+        next_start = next((start for day, (start, _) in sorted(old_groups.items())
+                           if day > report_date), None)
+        insertion_index = next_start if next_start is not None else len(prior["values"])
+    else:
+        insertion_index = 2
+    base = prior or replacement
+    values, sections = [row[:] for row in base["values"][:2]], list(base.get("row_sections", [None, None])[:2])
+    dates, ranges, section_ranges, subtitles, children = sorted(set(old_groups) | {report_date}), [], [], [], []
+    pending_separators = []
+    for date_index, day in enumerate(dates):
+        if date_index:
+            pending_separators.append((len(values), len(values) + 2))
+            values.extend([[""] * len(values[0]) for _ in range(2)])
+            sections.extend([None, None])
+        source = replacement if day == report_date else prior
+        source_start, count = (new_groups if day == report_date else old_groups)[day]
+        start = len(values)
+        values.extend(row[:] for row in source["values"][source_start:source_start + count])
+        source_sections = source.get("row_sections", [None] * len(source["values"]))
+        sections.extend(source_sections[source_start:source_start + count])
+        ranges.append({"report_date": day, "start_row": start + 1, "end_row": len(values)})
+        for area in source.get("section_ranges", []):
+            if area.get("report_date") == day:
+                section_ranges.append({**area,
+                    "start_row": start + area["start_row"] - source_start,
+                    "end_row": start + area["end_row"] - source_start})
+        for key, output in (("qris_subtitle_rows", subtitles), ("qris_child_rows", children)):
+            output.extend(start + row - source_start for row in source.get(key, [])
+                          if source_start < row <= source_start + count)
+    old_count = old_range[1] if old_range else 0
+    if old_range:
+        difference = new_count - old_count
+        patch = ({"insert_row": insertion_index, "insert_count": difference}
+                 if difference > 0 else
+                 {"delete_row": old_range[0] + new_count, "delete_count": -difference}
+                 if difference < 0 else {})
+        spacer_ranges = []
+    elif old_groups and new_count:
+        next_start = next((start for day, (start, _) in sorted(old_groups.items())
+                           if day > report_date), None)
+        if next_start is None:
+            patch = {"insert_row": insertion_index, "insert_count": new_count + 2}
+            spacer_ranges = [(insertion_index, insertion_index + 2)]
+        else:
+            patch = {"insert_row": insertion_index, "insert_count": new_count + 2}
+            spacer_ranges = [(insertion_index + new_count, insertion_index + new_count + 2)]
+    elif not old_groups and new_count:
+        patch, spacer_ranges = {}, []
+    else:
+        patch, spacer_ranges = {}, []
+    matrix = {
+        **base, "values": values, "row_sections": sections, "dates": dates,
+        "date_ranges": ranges, "section_ranges": section_ranges,
+        "qris_subtitle_rows": subtitles, "qris_child_rows": children,
+        "fingerprint": fingerprint(values),
+    }
+    target = next(item for item in ranges if item["report_date"] == report_date)
+    patch.update({"start_row": target["start_row"] - 1, "row_count": new_count,
+                  "spacer_ranges": spacer_ranges})
+    if old_range is None and old_groups and report_date > max(old_groups):
+        patch["start_row"] = insertion_index + 2
+    if prior is None:
+        patch.update({"start_row": 0, "row_count": len(values), "spacer_ranges": [], "initial": True})
+        patch.pop("insert_row", None)
+        patch.pop("insert_count", None)
+        patch.pop("delete_row", None)
+        patch.pop("delete_count", None)
+    return bind_cell_style_contract("invoice", matrix), patch
+
+
+def _merge_detail_date(role, prior, replacement, report_date):
+    old_groups = _date_groups(role, prior) if prior else {}
+    new_groups = _date_groups(role, replacement)
+    old_range, new_range = old_groups.get(report_date), new_groups.get(report_date)
+    new_count = new_range[1] if new_range else 0
+    insertion_index = old_range[0] + old_range[1] if old_range else (
+        next((start for day, (start, _) in sorted(old_groups.items()) if day > report_date),
+             len(prior["values"]) if prior else 1))
+    base = prior or replacement
+    values = [row[:] for row in base["values"][:1]]
+    base_stripes = base.get("row_stripes", [
+        "white" if index % 2 else "stripe" for index in range(len(base["values"]))
+    ])
+    stripes = base_stripes[:1]
+    ranges, separators = [], []
+    for day in sorted((set(old_groups) - {report_date}) | ({report_date} if new_range else set())):
+        source = replacement if day == report_date else prior
+        source_start, count = (new_groups if day == report_date else old_groups)[day]
+        start = len(values)
+        values.extend(row[:] for row in source["values"][source_start:source_start + count])
+        source_stripes = source.get("row_stripes", [
+            "white" if index % 2 else "stripe" for index in range(len(source["values"]))
+        ])
+        stripes.extend(("white" if index % 2 else "stripe")
+                       for index in range(start, start + count) if day == report_date)
+        if day != report_date:
+            stripes.extend(source_stripes[source_start:source_start + count])
+        ranges.append({"report_date": day, "start_row": start + 1, "end_row": len(values)})
+        separators.append(start + 1)
+    matrix = {**base, "values": values, "rows": values, "date_ranges": ranges,
+        "dates": [item["report_date"] for item in ranges], "day_separator_rows": separators,
+        "row_stripes": stripes, "row_count": len(values) - 1, "empty": len(values) == 1}
+    patch = _row_operation(old_range, new_count, insertion_index)
+    target = next((item for item in ranges if item["report_date"] == report_date), None)
+    patch.update({"start_row": target["start_row"] - 1 if target else insertion_index,
+                  "row_count": new_count})
+    if prior is None:
+        patch.update({"start_row": 0, "row_count": len(values), "initial": True})
+        patch.pop("insert_row", None)
+        patch.pop("insert_count", None)
+        patch.pop("delete_row", None)
+        patch.pop("delete_count", None)
+    return bind_cell_style_contract(role, matrix), patch
+
+
+def merge_cell_date_matrix(role, prior, replacement, report_date, *, preserve_saldo_chain=False):
+    """Replace one date's saved matrix while retaining every other date block."""
+    if role == "summary":
+        return _merge_summary_date(prior, replacement, report_date, preserve_saldo_chain)
+    if role == "invoice":
+        return _merge_invoice_date(prior, replacement, report_date)
+    if role in ("unusual", "reversal"):
+        return _merge_detail_date(role, prior, replacement, report_date)
+    raise ValueError("unknown cell worksheet role")
+
+
+def _date_format_requests(role, target, matrix, patch):
+    start, end = patch["start_row"], patch["start_row"] + patch["row_count"]
+    intervals = [(start, end), *patch.get("spacer_ranges", [])]
+    requests = (_format_requests(target.sheet_target(), matrix) if role == "summary" else
+        invoice_format_requests(target.worksheet_id, matrix) if role == "invoice" else
+        detail_format_requests(target.worksheet_id, matrix))
+    if patch.get("initial"):
+        return requests
+    result = []
+    for request in requests:
+        operation = next(iter(request))
+        if operation == "setBasicFilter" and role in ("invoice", "unusual", "reversal"):
+            result.append(copy.deepcopy(request))
+            continue
+        for interval_start, interval_end in intervals:
+            clipped = copy.deepcopy(request)
+            payload = clipped[operation]
+            if operation in ("repeatCell", "updateBorders"):
+                area = payload["range"]
+                first = max(interval_start, area["startRowIndex"])
+                last = min(interval_end, area["endRowIndex"])
+                if first >= last:
+                    continue
+                area["startRowIndex"], area["endRowIndex"] = first, last
+                if operation == "updateBorders" and (interval_start, interval_end) in patch.get("spacer_ranges", []):
+                    payload.pop("top", None)
+                    payload.pop("bottom", None)
+            elif operation == "updateDimensionProperties":
+                area = payload["range"]
+                if area["dimension"] != "ROWS":
+                    continue
+                first = max(interval_start, area["startIndex"])
+                last = min(interval_end, area["endIndex"])
+                if first >= last:
+                    continue
+                area["startIndex"], area["endIndex"] = first, last
+            elif operation == "autoResizeDimensions":
+                area = payload["dimensions"]
+                if area["dimension"] != "ROWS":
+                    continue
+                first = max(interval_start, area["startIndex"])
+                last = min(interval_end, area["endIndex"])
+                if first >= last:
+                    continue
+                area["startIndex"], area["endIndex"] = first, last
+            else:
+                continue
+            result.append(clipped)
+    return result
+
+
+def _source_calculation_history(rows):
+    source_ids = {}
+    for row in rows:
+        value = row["report_date"]
+        day = value.isoformat() if hasattr(value, "isoformat") else str(value)
+        source_ids.setdefault(day, []).append(row["calculation_id"])
+    return {day: fingerprint(sorted(ids)) for day, ids in source_ids.items()}
+
+
+def _validate_deleted_row_tails(saved, adapters, metadata, call):
+    for role in ROLES:
+        patch = saved[role].get("patch", {})
+        delete_count = patch.get("delete_count", 0)
+        if not delete_count:
+            continue
+        grid = metadata[role].get("properties", {}).get("gridProperties", {})
+        columns = grid.get("columnCount")
+        width = len(saved[role]["values"][0])
+        if type(columns) is not int or columns < width:
+            raise ValueError("cannot verify the worksheet width before deleting rows")
+        if columns > 100:
+            raise ValueError("cannot safely inspect off-matrix cells before deleting rows")
+        if columns == width:
+            continue
+        start = patch["delete_row"]
+        end = start + delete_count
+        reader = getattr(adapters[role], "read_range", None)
+        values = (call(reader, start, end, columns) if reader else
+                  call(adapters[role].read, end, columns)[start:end])
+        rows = _padded(values, delete_count, columns)
+        if any(value not in ("", None) for row in rows for value in row[width:]):
+            raise ValueError("row deletion would remove unmanaged cells outside the saved matrix width")
+
+
+def _restore_prior_guards(prior, targets, adapters, guarded, guards, previous, send, call):
+    restoration = []
+    for role in ROLES:
+        restoration.extend(_protection_requests(
+            targets[role].sheet_target(), prior[role]["matrix"], guarded[role], guards[role],
+        ))
+    send(restoration)
+    expected = {"status": "COMPLETE", "epoch": previous["epoch"],
+                "fingerprint": previous["fingerprint"]}
+    for role in ROLES:
+        meta = call(adapters[role].metadata)
+        _verify_final_protections(targets[role].sheet_target(), prior[role]["matrix"], meta)
+        _verify_marker(meta, expected)
+
+
+def _write_date_snapshot(saved, targets, adapters, store, epoch, mutate, send_formatting,
+                         report, rows_per_request):
+    for role in ROLES:
+        target, item = targets[role], saved[role]
+        patch, values = item.get("patch"), item["values"]
+        if not isinstance(patch, dict):
+            raise ValueError("date-scoped publication snapshot lacks its row patch")
+        for kind in ("insert", "delete"):
+            count = patch.get(kind + "_count", 0)
+            if not count:
+                continue
+            start = patch[kind + "_row"]
+            dimension_range = {"sheetId": target.worksheet_id, "dimension": "ROWS",
+                               "startIndex": start, "endIndex": start + count}
+            if kind == "insert":
+                request = {"insertDimension": {"range": dimension_range,
+                                                "inheritFromBefore": start > 0}}
+            else:
+                request = {"deleteDimension": {"range": dimension_range}}
+            mutate(adapters[role], [request])
+            store.confirm_chunk(epoch, f"{role}-rows-{kind}")
+        start = patch["start_row"]
+        rows = values[start:start + patch["row_count"]]
+        requests = matrix_write_requests(rows, target.worksheet_id, start_row=start,
+            rows_per_request=rows_per_request, allow_formulas=role == "summary")
+        report("worksheet_write_started", role=role, completed=0, total=len(requests))
+        for index, request in enumerate(requests):
+            mutate(adapters[role], [request])
+            store.confirm_chunk(epoch, f"{role}-date-rows-{index}")
+            report("worksheet_chunk_confirmed", role=role,
+                   completed=index + 1, total=len(requests))
+    formatting = []
+    for role in ROLES:
+        formatting.extend(_date_format_requests(
+            role, targets[role], saved[role]["matrix"], saved[role]["patch"],
+        ))
+    send_formatting(formatting, "date-format")
+
+
+def _write_full_snapshot(saved, prior, targets, adapters, guarded, store, epoch, mutate,
+                         send_formatting, report, rows_per_request):
+    cleanup = []
+    for role in ROLES:
+        values = saved[role]["values"]
+        old = prior[role]["values"] if prior else values
+        height, width = max(len(values), len(old)), max(len(values[0]), len(old[0]))
+        sheet_id = targets[role].worksheet_id
+        area = {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": height,
+                "startColumnIndex": 0, "endColumnIndex": width}
+        for merge in guarded[role].get("merges", []):
+            if merge.get("startRowIndex", 0) < height and merge.get("startColumnIndex", 0) < width:
+                if merge.get("endRowIndex", height + 1) > height or merge.get("endColumnIndex", width + 1) > width:
+                    raise ValueError("unmanaged merge crosses the governed migration footprint")
+                cleanup.append({"unmergeCells": {"range": merge}})
+        for band in guarded[role].get("bandedRanges", []):
+            bound = band["range"]
+            if bound.get("startRowIndex", 0) < height and bound.get("startColumnIndex", 0) < width:
+                if bound.get("endRowIndex", height + 1) > height or bound.get("endColumnIndex", width + 1) > width:
+                    raise ValueError("unmanaged banding crosses the governed migration footprint")
+                cleanup.append({"deleteBanding": {"bandedRangeId": band["bandedRangeId"]}})
+        cleanup.extend([
+            {"repeatCell": {"range": area, "cell": {"userEnteredFormat": {}}, "fields": "userEnteredFormat"}},
+            {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "ROWS",
+                "startIndex": 0, "endIndex": height}, "properties": {"pixelSize": 21}, "fields": "pixelSize"}},
+        ])
+        if width > len(values[0]):
+            cleanup.append({"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                "startIndex": len(values[0]), "endIndex": width}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}})
+    send_formatting(cleanup, "cleanup")
+    for role in ROLES:
+        target, values = targets[role], saved[role]["values"]
+        requests = matrix_write_requests(values, target.worksheet_id,
+            rows_per_request=rows_per_request, allow_formulas=role == "summary")
+        report("worksheet_write_started", role=role, completed=0, total=len(requests))
+        for index, request in enumerate(requests):
+            mutate(adapters[role], [request])
+            store.confirm_chunk(epoch, f"{role}-rows-{index}")
+            report("worksheet_chunk_confirmed", role=role,
+                   completed=index + 1, total=len(requests))
+        if prior:
+            old = prior[role]["values"]
+            if len(old) > len(values):
+                mutate(adapters[role], [{"updateCells": {"range": {
+                    "sheetId": target.worksheet_id, "startRowIndex": len(values), "endRowIndex": len(old),
+                    "startColumnIndex": 0, "endColumnIndex": len(old[0])},
+                    "rows": [], "fields": "userEnteredValue,userEnteredFormat"}}])
+            if len(old[0]) > len(values[0]):
+                mutate(adapters[role], [{"updateCells": {"range": {
+                    "sheetId": target.worksheet_id, "startRowIndex": 0,
+                    "endRowIndex": max(len(old), len(values)),
+                    "startColumnIndex": len(values[0]), "endColumnIndex": len(old[0])},
+                    "rows": [], "fields": "userEnteredValue,userEnteredFormat"}}])
+    formatting = []
+    for role in ROLES:
+        target, matrix = targets[role], saved[role]["matrix"]
+        formatting.extend(_format_requests(target.sheet_target(), matrix) if role == "summary" else
+            invoice_format_requests(target.worksheet_id, matrix) if role == "invoice" else
+            detail_format_requests(target.worksheet_id, matrix))
+    send_formatting(formatting)
+    report("formatting_applied")
 
 
 def _read_baseline(adapters, prior):
@@ -495,22 +1041,41 @@ def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_
     return publication
 
 
+def validate_refresh_request_id(refresh_request_id):
+    if refresh_request_id is not None and (
+        not isinstance(refresh_request_id, str)
+        or not 1 <= len(refresh_request_id) <= 128
+        or re.fullmatch(r"[A-Za-z0-9_-]+", refresh_request_id) is None
+    ):
+        raise ValueError("refresh request ID must be 1-128 safe ASCII characters")
+
+
 def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, config, *,
                             changed_dates=None, additional_batches=None, configuration_only=False,
                             rows_per_request=200, publication_only=False,
-                            preserve_manual_inputs=False):
-    """Guard all tabs, stage once, write/read back all, then confirm one epoch."""
+                            preserve_manual_inputs=False, date_scoped=False, report_date=None,
+                            refresh_request_id: str | None = None):
+    """Publish four tabs; an optional refresh ID makes same-execution retries write-free."""
     from psycopg import InterfaceError, OperationalError
+    validate_refresh_request_id(refresh_request_id)
     if type(rows_per_request) is not int or rows_per_request < 1:
         raise ValueError("positive v2 write chunk size required")
     if any(type(value) is not bool for value in (
-        configuration_only, publication_only, preserve_manual_inputs,
+        configuration_only, publication_only, preserve_manual_inputs, date_scoped,
     )):
         raise ValueError("publication mode flags must be explicit booleans")
+    if date_scoped:
+        if not publication_only or report_date is None:
+            raise ValueError("date-scoped publication requires a persisted date handoff")
+        submitted_date = business_date(report_date).isoformat()
+    elif report_date is not None:
+        raise ValueError("report_date is only valid for a date-scoped publication")
+    if refresh_request_id is not None and not publication_only:
+        raise ValueError("refresh request ID requires committed publication-only history")
     if publication_only:
         if batch is not None or changed_dates is not None or additional_batches or configuration_only:
             raise ValueError("publication-only mode cannot import or recalculate source batches")
-        submitted = store.latest_report_date()
+        submitted = submitted_date if date_scoped else store.latest_report_date()
         if not submitted:
             raise ValueError("publication-only mode requires committed cell history")
         additional_batches = []
@@ -579,13 +1144,49 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
 
     previous = preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, config.account[:-2],
                                          allow_legacy_migration=configuration_only)
+    if refresh_request_id is not None:
+        used = store.publications_for_refresh_request(refresh_request_id)
+        if used:
+            latest = store.latest_publication()
+            publication = used[0] if len(used) == 1 else None
+            if (publication is None or latest is None or previous is None
+                or publication["epoch"] != latest["epoch"]
+                or publication["epoch"] != previous["epoch"]
+                or publication["status"] != "COMPLETE"
+                or latest["status"] != "COMPLETE"):
+                raise ValueError("refresh request ID is not associated with the latest COMPLETE publication")
+            through = submitted if date_scoped else max(submitted, store.latest_report_date() or submitted)
+            current_history = _source_calculation_history(
+                store.current_results(submitted, submitted) if date_scoped else
+                store.current_results(config.first_report_date, through),
+            )
+            if current_history != publication["snapshot"].get("source_calculations"):
+                raise ValueError("refresh request ID cannot be reused with changed source-calculation history")
+            for role in ROLES:
+                saved = publication["snapshot"]["worksheets"][role]["values"]
+                grid = call(adapters[role].metadata)["properties"].get("gridProperties", {})
+                rows, columns = grid.get("rowCount"), grid.get("columnCount")
+                if (type(rows) is not int or type(columns) is not int
+                        or rows < len(saved) or columns < len(saved[0])
+                        or rows > 100_000 or columns > 100 or rows * columns > 5_000_000):
+                    raise ValueError("v2 retry readback exceeds bounded grid")
+                actual = call(adapters[role].read, rows, columns)
+                if (not isinstance(actual, list) or len(actual) > rows
+                        or any(not isinstance(row, list) or len(row) > columns for row in actual)):
+                    raise ValueError("v2 retry readback has invalid grid dimensions")
+                if any(value not in ("", None) for row_index, row in enumerate(actual)
+                       for column_index, value in enumerate(row)
+                       if row_index >= len(saved) or column_index >= len(saved[0])):
+                    raise ValueError("v2 retry found values outside the committed report")
+            return {"epoch": publication["epoch"], "fingerprint": publication["fingerprint"],
+                    "status": "COMPLETE", "roles": list(ROLES)}
     prior = previous["snapshot"]["worksheets"] if previous else None
     metadata = {role: call(adapters[role].metadata) for role in ROLES}
     operation_id = uuid.uuid4().hex
     store.begin_target_operation(operation_id)
-    staged, write_started = None, False
+    staged, write_started, guarded, guards = None, False, None, {}
     try:
-        requests, guards, reply_indexes = [], {}, {}
+        requests, reply_indexes = [], {}
         for role in ROLES:
             target = targets[role]
             protections = metadata[role].get("protectedRanges", [])
@@ -630,6 +1231,55 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
         audits = []
 
         def render_committed(session):
+            if date_scoped:
+                rows = session.current_results(submitted, submitted)
+                days = [{"identity": {cell.cell_code: cell.to_dict() for cell in config.cells}[row["cell_code"]],
+                         "report_date": row["report_date"].isoformat() if hasattr(row["report_date"], "isoformat") else str(row["report_date"]),
+                         "generation_id": row["generation_id"], "calculation_id": row["calculation_id"],
+                         "config_id": row["config_id"], "rules_version": config.rules_version,
+                         "calculation": row["result"]}
+                        for row in rows]
+                if len(days) != len(config.cells):
+                    raise ValueError("date-scoped publication requires one current result per cell")
+                manual_day = {key: value for key, value in manual.items() if key[0] == submitted}
+                replacements = build_cell_cluster_matrices_v2(
+                    config, days, submitted, summary_manual_values=manual_day,
+                    first_report_date=submitted, calculate_saldo=False,
+                )
+                merged, patches = {}, {}
+                for role in ROLES:
+                    prior_matrix = prior[role]["matrix"] if prior else None
+                    preserve_saldo_chain = False
+                    if role == "summary" and prior_matrix is not None:
+                        prior_matrix = copy.deepcopy(prior_matrix)
+                        for entry in prior_matrix["editable_inputs"]:
+                            key = (entry["report_date"], entry["cell_code"])
+                            if key in manual:
+                                row, column = entry["row"] - 1, entry["column"] - 1
+                                prior_matrix["values"][row][column] = manual[key]
+                                prior_matrix["numeric_preview"][row][column] = manual[key]
+                    if role == "summary":
+                        has_saldo_chain = (prior_matrix is not None and
+                            preserve_cell_date_saldo_chain(prior_matrix, replacements[role], submitted))
+                        preserve_saldo_chain = has_saldo_chain
+                        if not has_saldo_chain:
+                            replacements[role] = mark_cell_date_saldo_unverified(
+                                replacements[role], submitted,
+                            )
+                    merged[role], patches[role] = merge_cell_date_matrix(
+                        role, prior_matrix, replacements[role], submitted,
+                        preserve_saldo_chain=preserve_saldo_chain,
+                    )
+                snapshot = {
+                    "schema_version": 2, "spreadsheet_id": spreadsheet_id,
+                    "worksheets": {role: {"worksheet_id": targets[role].worksheet_id,
+                        "title": targets[role].title, "values": merged[role]["values"],
+                        "matrix": merged[role], "patch": patches[role]} for role in ROLES},
+                    "source_calculations": _source_calculation_history(rows),
+                }
+                if refresh_request_id is not None:
+                    snapshot["refresh_request_id"] = refresh_request_id
+                return {"start": submitted, "end": submitted, "snapshot": snapshot}
             through = max(submitted, session.latest_report_date() or submitted)
             identities = {cell.cell_code: cell.to_dict() for cell in config.cells}
             days = [{"identity": identities[row["cell_code"]],
@@ -646,20 +1296,24 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             matrices = build_cell_cluster_matrices_v2(config, days, through, summary_manual_values=manual,
                 summary_reset_dates=mandiri_reset_dates(report, reset) if reset and prior else set())
             audits.extend(matrices["summary"].pop("manual_reset_audit", []))
-            source_ids = {}
-            for day in days:
-                source_ids.setdefault(day["report_date"], []).append(day["calculation_id"])
-            # Every v2 tab is replaced over its full history, including unchanged dates.
-            return {"start": config.first_report_date, "end": through, "snapshot": {
+            snapshot = {
                 "schema_version": 2, "spreadsheet_id": spreadsheet_id,
                 "worksheets": {role: {"worksheet_id": targets[role].worksheet_id,
                     "title": targets[role].title, "values": matrices[role]["values"], "matrix": matrices[role]}
                     for role in ROLES},
-                "source_calculations": {day: fingerprint(sorted(ids)) for day, ids in source_ids.items()}},
-                "refresh_audit_required": bool(audits)}
+                "source_calculations": _source_calculation_history(days),
+            }
+            if refresh_request_id is not None:
+                snapshot["refresh_request_id"] = refresh_request_id
+            return {"start": config.first_report_date, "end": through, "snapshot": snapshot,
+                    "refresh_audit_required": bool(audits)}
 
         if publication_only:
             rendered = render_committed(store)
+            if date_scoped:
+                _validate_deleted_row_tails(
+                    rendered["snapshot"]["worksheets"], adapters, metadata, call,
+                )
             staged = store.stage_publication(
                 rendered["start"], rendered["end"], rendered["snapshot"],
                 write_gsheet=True,
@@ -673,6 +1327,7 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             store.record_manual_reset(staged["epoch"], audit["cell_code"], audit["report_date"],
                                       audit["previous_value"], audit["replacement_value"])
         marker = {"status": "PENDING", "epoch": staged["epoch"], "fingerprint": staged["fingerprint"]}
+        report("publication_staged")
         if staged["status"] != "COMPLETE":
             setup = []
             for role in ROLES:
@@ -693,64 +1348,17 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             send(setup)
             for role in ROLES:
                 _verify_marker(call(adapters[role].metadata), marker)
-            cleanup = []
-            for role in ROLES:
-                values = saved[role]["values"]
-                old = prior[role]["values"] if prior else values
-                height, width = max(len(values), len(old)), max(len(values[0]), len(old[0]))
-                sheet_id = targets[role].worksheet_id
-                area = {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": height,
-                        "startColumnIndex": 0, "endColumnIndex": width}
-                for merge in guarded[role].get("merges", []):
-                    if merge.get("startRowIndex", 0) < height and merge.get("startColumnIndex", 0) < width:
-                        if merge.get("endRowIndex", height + 1) > height or merge.get("endColumnIndex", width + 1) > width:
-                            raise ValueError("unmanaged merge crosses the governed migration footprint")
-                        cleanup.append({"unmergeCells": {"range": merge}})
-                for band in guarded[role].get("bandedRanges", []):
-                    bound = band["range"]
-                    if bound.get("startRowIndex", 0) < height and bound.get("startColumnIndex", 0) < width:
-                        if bound.get("endRowIndex", height + 1) > height or bound.get("endColumnIndex", width + 1) > width:
-                            raise ValueError("unmanaged banding crosses the governed migration footprint")
-                        cleanup.append({"deleteBanding": {"bandedRangeId": band["bandedRangeId"]}})
-                cleanup.extend([
-                    {"repeatCell": {"range": area, "cell": {"userEnteredFormat": {}}, "fields": "userEnteredFormat"}},
-                    {"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "ROWS",
-                        "startIndex": 0, "endIndex": height}, "properties": {"pixelSize": 21}, "fields": "pixelSize"}},
-                ])
-                if width > len(values[0]):
-                    cleanup.append({"updateDimensionProperties": {"range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                        "startIndex": len(values[0]), "endIndex": width}, "properties": {"pixelSize": 100}, "fields": "pixelSize"}})
-            send_formatting(cleanup, "cleanup")
-            for role in ROLES:
-                target, values = targets[role], saved[role]["values"]
-                requests = matrix_write_requests(values, target.worksheet_id,
-                    rows_per_request=rows_per_request, allow_formulas=role == "summary")
-                for index, request in enumerate(requests):
-                    mutate(adapters[role], [request])
-                    store.confirm_chunk(staged["epoch"], f"{role}-rows-{index}")
-                if prior:
-                    old = prior[role]["values"]
-                    if len(old) > len(values):
-                        mutate(adapters[role], [{"updateCells": {"range": {
-                            "sheetId": target.worksheet_id, "startRowIndex": len(values), "endRowIndex": len(old),
-                            "startColumnIndex": 0, "endColumnIndex": len(old[0])},
-                            "rows": [], "fields": "userEnteredValue,userEnteredFormat"}}])
-                    if len(old[0]) > len(values[0]):
-                        mutate(adapters[role], [{"updateCells": {"range": {
-                            "sheetId": target.worksheet_id, "startRowIndex": 0,
-                            "endRowIndex": max(len(old), len(values)),
-                            "startColumnIndex": len(values[0]), "endColumnIndex": len(old[0])},
-                            "rows": [], "fields": "userEnteredValue,userEnteredFormat"}}])
-            formatting = []
-            for role in ROLES:
-                target, matrix = targets[role], saved[role]["matrix"]
-                formatting.extend(_format_requests(target.sheet_target(), matrix) if role == "summary" else
-                    invoice_format_requests(target.worksheet_id, matrix) if role == "invoice" else
-                    detail_format_requests(target.worksheet_id, matrix))
-            send_formatting(formatting)
+            if date_scoped:
+                _write_date_snapshot(saved, targets, adapters, store, staged["epoch"],
+                                     mutate, send_formatting, report, rows_per_request)
+            else:
+                _write_full_snapshot(saved, prior, targets, adapters, guarded, store,
+                                     staged["epoch"], mutate, send_formatting, report,
+                                     rows_per_request)
         else:
             marker["status"] = "COMPLETE"
         for role in ROLES:
+            report("worksheet_readback_started", role=role)
             call(_verify_values, adapters[role], saved[role], prior[role] if prior else None)
             call(_verify_style, adapters[role], saved[role]["matrix"], prior[role] if prior else None)
             _verify_marker(call(adapters[role].metadata), marker)
@@ -774,6 +1382,15 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
     except Exception as exc:
         # Only unacknowledged mutations or lost ownership/DB connectivity are
         # ambiguous. A failed readback after acknowledged writes remains PENDING.
+        if not write_started and prior and guarded is not None:
+            try:
+                if set(guards) != set(ROLES):
+                    raise RuntimeError("temporary guards are incomplete")
+                _restore_prior_guards(prior, targets, adapters, guarded, guards,
+                                      previous, send, call)
+            except Exception:
+                mutation_uncertain = True
+                write_started = True
         uncertain = mutation_uncertain or ownership_lost or isinstance(exc, (InterfaceError, OperationalError))
         if staged and staged["status"] != "COMPLETE":
             try:

@@ -1,9 +1,11 @@
 """Offline tests for the account-parallel cell source handoff."""
 import hashlib
+import io
 import json
 import threading
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -69,9 +71,10 @@ class CellBulkAcquisitionTests(unittest.TestCase):
                 raise RuntimeError("synthetic transient failure")
             return _daily_bundle(cluster, day, directory)
 
+        output = io.StringIO()
         with TemporaryDirectory() as temporary, patch(
             "finpay_pipeline.cell_format.bulk_acquisition.acquire_cell_day", side_effect=acquire,
-        ):
+        ), redirect_stdout(output):
             root = Path(temporary)
             result = acquire_cell_range(
                 "2026-10-01", "2026-10-02", "422140", "offline-secret",
@@ -101,6 +104,25 @@ class CellBulkAcquisitionTests(unittest.TestCase):
                 result["source_bundle_sha256"],
                 hashlib.sha256(Path(result["source_bundle"]).read_bytes()).hexdigest(),
             )
+        records = [
+            json.loads(json.loads(line[2:-2])["logs"][0]["message"])
+            for line in output.getvalue().splitlines()
+        ]
+        cohort_attempts = [
+            record for record in records
+            if record["stage"] == "cell_cohort_acquisition"
+            and record["event"] == "cohort_attempt_started"
+            and record["report_date"] == "2026-10-02"
+        ]
+        self.assertEqual([record["attempt"] for record in cohort_attempts], [1, 2])
+        self.assertIn("cohort_retry", [record["event"] for record in records])
+        bulk_done = next(
+            record for record in records
+            if record["stage"] == "cell_bulk_acquisition" and record["event"] == "bulk_bundle_ready"
+        )
+        self.assertEqual((bulk_done["completed"], bulk_done["total"]), (2, 2))
+        self.assertNotIn("offline-secret", output.getvalue())
+        self.assertNotIn("synthetic transient failure", output.getvalue())
 
     def test_all_clusters_run_concurrently_but_account_dates_stay_sequential(self):
         clusters = selected_clusters("ALL")

@@ -14,6 +14,19 @@ variables:
   create_spreadsheet_if_missing: true
   create_worksheets_if_missing: true
 
+triggers:
+  - id: daily_cell_range_0500_wita
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 5 * * *"
+    timezone: Asia/Makassar
+    disabled: true
+    inputs:
+      start_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+      end_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+      cluster_id: "ALL"
+      dry_run: false
+      write_gsheet: true
+
 inputs:
   - id: start_date
     type: STRING
@@ -31,10 +44,14 @@ inputs:
   - id: write_gsheet
     type: BOOLEAN
     defaults: false
+  - id: send_telegram
+    type: BOOLEAN
+    defaults: false
 
 tasks:
   - id: expand_cell_range
     type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
     containerImage: finpay-cell-reporting:2.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -56,7 +73,9 @@ tasks:
       import os
       from kestra import Kestra
       from finpay_pipeline.cell_format import expand_cell_range, validate_sheet_range
+      from finpay_pipeline.cell_observability import observed
 
+      expand_cell_range = observed("range_expansion")(expand_cell_range)
       runs = expand_cell_range(
           os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
       )
@@ -64,13 +83,17 @@ tasks:
           validate_sheet_range(
               os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
           )
-      Kestra.outputs({"runs": runs, "count": len(runs)})
+      Kestra.logger().info("Range ready: " + str(len(runs)) + " sequential cluster/date cohorts")
+      Kestra.outputs({"runs": [dict(run, ordinal=index + 1) for index, run in enumerate(runs)], "count": len(runs)})
 
   - id: process_cell_range_sequentially
     type: io.kestra.plugin.core.flow.ForEach
     values: "{{ outputs.expand_cell_range.vars.runs }}"
     concurrencyLimit: 1
     tasks:
+      - id: log_cell_cohort_started
+        type: io.kestra.plugin.core.log.Log
+        message: "Starting cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}; open the child execution for live cell progress and estimated remaining time."
       - id: process_cell_day
         type: io.kestra.plugin.core.flow.Subflow
         namespace: finance.finpay
@@ -82,9 +105,43 @@ tasks:
           cluster_id: "{{ fromJson(taskrun.value).cluster_id }}"
           dry_run: "{{ inputs.dry_run }}"
           write_gsheet: "{{ inputs.write_gsheet }}"
+          publication_scope: "history"
+          send_telegram: "{{ inputs.send_telegram }}"
           cell_spreadsheet_id: "{{ vars.cell_spreadsheet_id }}"
           cell_spreadsheet_name: "{{ vars.cell_spreadsheet_name }}"
           legacy_spreadsheet_id: "{{ vars.legacy_spreadsheet_id }}"
           cell_worksheet_ids_json: "{{ vars.cell_worksheet_ids_json }}"
           create_spreadsheet_if_missing: "{{ vars.create_spreadsheet_if_missing }}"
           create_worksheets_if_missing: "{{ vars.create_worksheets_if_missing }}"
+      - id: log_cell_cohort_completed
+        type: io.kestra.plugin.core.log.Log
+        message: "Completed cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}"
+
+afterExecution:
+  - id: notify_cell_range_failure_telegram
+    type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
+    containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    timeout: PT2M
+    runIf: "{{ inputs.dry_run == false and inputs.send_telegram and execution.state != 'SUCCESS' }}"
+    env:
+      TELEGRAM_BOT_TOKEN: "{{ secret('TELEGRAM_BOT_TOKEN') }}"
+      TELEGRAM_CHAT_ID: "{{ secret('TELEGRAM_CHAT_ID') }}"
+      EXECUTION_STATE: "{{ execution.state }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      FLOW_ID: "{{ flow.namespace }}.{{ flow.id }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      START_DATE: "{{ inputs.start_date }}"
+      END_DATE: "{{ inputs.end_date }}"
+      WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+      SUMMARY_JSON: "{}"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_notifications import notify_from_environment
+      from finpay_pipeline.cell_observability import observed
+
+      notify = observed("telegram")(notify_from_environment)
+      Kestra.outputs(notify(os.environ))

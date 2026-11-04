@@ -14,7 +14,7 @@ Build, CI/CD, commissioning, and recovery steps are in
 | Previous-format acquisition and daily reporting | Implemented; separate acquisition, compute, database, and Sheet tasks. |
 | Cell acquisition and four-tab reporting | Implemented through the compatibility flows below. |
 | Independent subpackages, date-range acquisition, and staged cell tasks | Implemented; range inputs and task boundaries below. |
-| Cell running SALDO | Starts at zero on October 1, 2026, then carries forward; no opening transaction or separate balance table is created. |
+| Cell running SALDO | Daily reports leave cumulative SALDO unverified; range/bulk balance calculations retain the October 1, 2026 boundary. No opening transaction or separate balance table is created. |
 | Cell publication targets | Package defaults fail closed. Configure a destination name (optionally pin its ID), legacy ID, writer and Finance editors through Kestra environment secrets or per-flow variables. Missing spreadsheet files/tabs can be created on a non-dry publish when enabled. |
 | Monthly settlement | Preview and gated publication implemented; Finance release requirements remain separate. |
 | Production commissioning and schedules | Not authorized by a local test or this refactor; acquisition schedules remain disabled. |
@@ -31,8 +31,29 @@ validation/calculation utilities without routing cell sources into legacy tables
 | Pipeline | Range entry point | Per-day processing |
 |---|---|---|
 | Previous format | `finpay_legacy_range_v1` | `finpay_legacy_day_v1`, then retained daily v5 tasks. |
-| Cell format | `finpay_cell_range_v1` | `finpay_cell_day_v1`, with four explicit stages. |
+| Cell format | `finpay_cell_range_v1` | `finpay_cell_day_v1` in full-history scope, with four explicit stages. Standalone day runs are date-scoped. |
 | Bulk cell | `finpay_cell_bulk_v1` | Range acquisition/preprocessing, one DB commit and Sheet publication per cluster. |
+
+`finpay_cell_range_v1` defines a disabled daily schedule for 05:00
+`Asia/Makassar`. If separately commissioned and enabled, it processes the previous
+day for `ALL` clusters serially through the per-cluster/day flow. Database persistence
+and guarded Sheet publication retry up to three total attempts with exponential
+backoff, reusing the checked cohort artifacts. `PENDING`, `IN_FLIGHT`, or `UNKNOWN`
+publication states still require operator reconciliation; retries do not issue
+blind Sheet writes or automatically clear those states.
+The schedule is dormant by default; local workflow edits do not authorize production
+activation.
+
+The daily cell acquisition task also copies validated XLSX files to the Docker
+host bind mount `/tmp/finpay inbox/<cluster>/<date>/<inbox_generation_sha256>/<cell>/`. The
+filename inside each cell directory retains the previous convention:
+`finpay-<cluster>(<DD-MM-YYYY>to<DD-MM-YYYY>).xlsx`. Each cohort is
+checksum-verified and promoted as one content-addressed directory; changed sources
+create a new generation rather than mixing versions. The key is derived from the
+cluster/date/cell identities and source checksums, and is exposed as the acquisition
+task's `inbox_generation_sha256` output. No inbox cleanup is scheduled.
+Create the host directory before running the flow, and keep it restricted because
+it contains raw financial source data.
 
 The cell Sheet title scheme is `cluster_alias`, not the DigiPOS account code:
 
@@ -74,8 +95,8 @@ indexed account/date bundle before database writes, retries only failed
 acquisition chunks, and publishes once per cluster. Scraping is parallel across
 accounts with dates sequential per account; processing, PostgreSQL, and Sheet
 writes are serial. It consumes validated daily exports, not arbitrary
-unpartitioned multi-date CSV uploads. Existing daily/range workflows remain
-unchanged. Acquisition retains per-cell/day portal login overhead; worker bounds
+unpartitioned multi-date CSV uploads. Day and range remain separate flow entry
+points. Acquisition retains per-cell/day portal login overhead; worker bounds
 do not remove that cost.
 
 Range flows take `start_date`, `end_date` (inclusive `YYYY-MM-DD`,
@@ -88,6 +109,38 @@ iteration limits active work, not the total Kestra task-run count.
 No configuration upload or checksum input is required. Safety
 controls default to `dry_run=true`, `write_gsheet=false`; legacy also defaults
 `send_telegram=false`. These controls are optional, not extra business inputs.
+
+### Progress And Telegram
+
+Current cell day, range, and bulk flows stream INFO progress into Kestra's Logs
+tab. Acquisition reports the current cell, portal phase, attempt and completed
+count; reporting logs validation, lock waits, commits, and Sheets chunk/readback
+phases. Long operations emit a heartbeat every 30 seconds, identifying the current
+phase and its elapsed time alongside full-stage elapsed time. Remaining-time
+estimates reflect completed-count progress for the current role/total work scope;
+they are approximate, not guaranteed. The range parent logs cohort `i/N`; open its
+child execution for detailed progress. Heartbeats indicate a live process, not a
+successful portal response or database commit. Source rows and credentials are
+never included in these progress messages.
+
+Set `send_telegram=true` to enable terminal cell alerts using the existing
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` Kestra secrets; it defaults to false,
+and dry runs never notify. A successful DB/Sheets run sends a completion message
+and a separate unusual alert when the requested cohort contains unusual rows.
+Range runs notify per cluster/date child; bulk runs send one requested-range
+summary. Unusual counts exclude unrelated stored history. DB-only successful runs
+explicitly report Sheets as disabled. Failed/warning/killed runs send a status
+alert when Kestra executes their terminal handler. Range failures always notify
+from the parent, including orchestration failures before child launch. If a child
+also fails, its alert and the parent status identify their distinct execution IDs.
+
+Notification delivery is separate from financial success: inspect the
+`notify_cell_result_telegram`, `notify_cell_bulk_result_telegram`, or the range's
+`notify_cell_range_failure_telegram` post-run task
+for delivery failures. A failed post-run notification does not change Kestra's
+already-final execution state. Messages use plain text and one send attempt each;
+an unconfirmed timeout is not automatically retried because Telegram may already
+have accepted it. No Telegram plugin upgrade or bot-service change is required.
 
 The cell day task graph is:
 
@@ -107,21 +160,47 @@ configured target and runtime role's schema/table privileges; it creates no
 schema or tables and applies no DDL or migration. Cell schema setup remains an
 explicit operation.
 
-Artifacts are bounded and checksummed. Persistence does not create a Google
-client; publication reacquires locks and rejects changed selected history before
-writing, without re-importing sources. Spreadsheet name/optional ID, distinct
+Bulk reporting tasks explicitly use the `cell_reporting_network` flow variable
+(default `bridge`). For a Compose-local database hostname such as `postgres`, set
+this variable to the exact shared Docker network name before running the flow.
+`kestra.plugins.configurations` does not set this runner-instance property;
+`networkMode` must be explicit on each nested `taskRunner`. Acquisition retains
+its separate host network. The selected
+reporting network must resolve the database host and allow Google HTTPS access.
+
+Cell artifacts are size-bounded, with SHA-256 checks performed by application
+code at specific task boundaries. Persistence does not create a Google client;
+publication reacquires locks and rejects changed selected history before writing,
+without re-importing sources. Spreadsheet name/optional ID, distinct
 legacy ID, writer, and Finance editors must be configured; missing configuration
 fails preflight before acquisition or DB writes. `write_gsheet=false` keeps the
 bulk acquisition/preprocessing/DB path independent from Google writes.
-Coverage checks validate stored history required for balance calculations; they
-do not require every correction request to continue from the current stored tail.
-For example, with October 1-10 stored, a request for October 10-15 replaces
-October 10 and adds October 11-15 without duplicating dates. Once October 1-19
-are stored, a single October 19 correction is valid. A correction preserves
-dates outside its requested range and recomputes later dependent balances. The
-new cell history still starts on `2026-10-01`; missing required stored dates are
-rejected rather than treated as zero activity. Per-day offline preprocessing
-remains available.
+Daily persistence validates and atomically replaces only the requested complete
+cell/date cohort. It does not require other dates or clear the current cohort if
+acquisition or validation fails; immutable source generations and row hashes are
+retained. A standalone daily Sheet publication patches only that date's block
+in each tab, resizing variable-height blocks as needed while preserving MANDIRI
+inputs and all other dates. The range flow passes full-history scope to each
+sequential day child and retains its complete-coverage checks and full-report
+publication. Before deleting rows, the daily writer refuses a block shrink if
+the affected rows contain values/formulas outside the governed matrix; resolve
+that extra content before retrying the persisted handoff. Daily database results
+never store cumulative SALDO. If the corrected Sheet date already has an SALDO
+formula chain, preserve it so later dependent SALDO formulas may recalculate.
+Without an existing chain, the date's Summary block marks
+`CUMULATIVE SALDO UNVERIFIED` and leaves SALDO values blank; earlier dates are
+not required. The configured boundary remains
+`2026-10-01`; source balance evidence remains in the ledger.
+Full-range/range/bulk balance calculations retain their historical-coverage
+checks; the date-scoped behavior applies to standalone day runs only.
+
+Bulk persistence and Sheet publication retry the whole task up to three times.
+Persistence reuses the same prepared bundle without duplicating evidence. A daily
+execution changes only its requested date block; range/bulk publication retains
+its full-report behavior. Finance MANDIRI inputs and unrelated date blocks remain
+intact during daily updates. The Kestra execution ID identifies the request:
+retries verify already-completed clusters without rewriting them. An uncertain
+write remains blocked for reconciliation; it is never blindly retried.
 
 Existing IDs remain compatibility interfaces, including their original inputs
 and artifact contracts:
@@ -134,9 +213,12 @@ and artifact contracts:
 | Monthly | Not applicable | `finpay_monthly_materialization_v1` |
 
 YAML lives in [`workflows/`](workflows/). The runtime pin is Kestra `v1.3.26`;
-use its `ForEach`/`taskrun.value` syntax, not the newer `Loop` syntax. Declared
-`outputFiles` and downstream `inputFiles` carry transaction artifacts through
-Kestra internal storage. Use task outputs for small metadata, not source rows.
+use its `ForEach`/`taskrun.value` syntax, not the newer `Loop` syntax. Kestra
+stores declared `outputFiles` and makes them available as downstream
+`inputFiles`; those declarations do not establish automatic checksum validation.
+Application code checks artifact hashes at task boundaries where implemented,
+while database freshness checks separately protect selected persisted history.
+Use task outputs for small metadata, not source rows.
 
 ### Previous Format
 
@@ -227,15 +309,38 @@ rows and continuous panel side rails. Unusual/Reversal display validated relativ
 CELL numbers 1-3, preserve semantic widths and muted stripes, and separate each
 visible date with a top border. Source full cell codes remain in evidence.
 
-Four-tab publication uses one epoch, full-history fingerprints, target/cluster
-locks, temporary guards, and value/formula/style/protection readback before
-completion. Each publication fully renders Summary, Invoice, Unusual, and
-Reversal; it is not a patch-only writer. Missing initial tabs are created only
+Four-tab publication uses one epoch, target/cluster locks, temporary guards, and
+value/formula/style/protection readback before completion. Daily publication
+merges one date's Summary, Invoice, Unusual, and Reversal blocks into the saved
+workbook snapshot and writes only those rows; range/bulk publication remains a
+full-report write. Missing initial tabs are created only
 when `create_worksheets_if_missing` is enabled. A missing worksheet ID with
 previous publication history fails closed rather than being rebound. A green
 tab/A1 note confirms Sheet verification only; success also requires the database
 completion record. A failed or ambiguous DB confirmation requires operator
 reconciliation even when the tabs look complete.
+The current source configures the dedicated cell Google client with a 30-second
+connection timeout and a 300-second response-read timeout (the prior source values
+were 10/120 seconds). This source change does not update a deployed image
+automatically; rebuild and deploy the image before relying on the new values in
+Kestra. Google can spend up to 180 seconds processing one Sheets request, so the
+client must not give up earlier. The timeout is a socket inactivity limit, not a
+total job deadline, and cannot fix a broken VPN or network route.
+
+Clusters and writes remain sequential. A bulk publication lazily shares one
+client across its clusters so pacing does not reset between them. HTTPS request
+attempts within each cell client are spaced at least 1.25 seconds apart, including
+metadata, paged style readback, and writes. Fast calls sleep for the remaining interval; slow calls
+already satisfy it. This limits one serial client to approximately 48 requests
+per minute, below Sheets' 60-per-user-per-project read and write quotas. It does
+not coordinate quota across other client instances, even in the same process,
+or across separate processes/stacks using the same service account. Do not run
+independent publishers concurrently against the same workbook without shared
+quota coordination. A `ReadTimeout` is not proof of a quota rejection; HTTP 429 is the
+explicit rate-limit response. The cell HTTP transport sets `max_retries=0`,
+including for mutations; Kestra task retries are separate and cannot clear
+unresolved `PENDING` or `UNKNOWN` publication states.
+
 Read-only metadata, value, and style fetches retry HTTP 408/429/500/502/503/504,
 Drive 403 rate/quota errors explicitly identified by `usageLimits`, and
 request timeout/connection errors for at most six attempts with 2/4/8/16/32-second
@@ -250,15 +355,18 @@ when pinned. A failed or ambiguous readback leaves the target-operation journal
 A checksum proves integrity, not source authority: deployment must
 restrict non-dry source imports to approved callers. Existing managed or design
 preview tabs are not fresh targets and cannot be adopted by inventing a baseline.
-Date, stored-coverage, stale-handoff, and publication-state guards remain in
-force for corrections; missing history is never inferred as zero and ambiguous
-`IN_FLIGHT`/`UNKNOWN` state is never bypassed.
+Date, stale-handoff, and publication-state guards remain in force for corrections.
+Stored-coverage checks apply to full-range cumulative calculations; a date-scoped
+daily run validates its complete cell/date cohort without requiring earlier dates
+or persisting a cumulative balance. Existing Sheet formula chains are preserved
+for dependent recalculation. Ambiguous `IN_FLIGHT`/`UNKNOWN` state is never
+bypassed.
 
-A byte-different source artifact may still append an immutable generation, update
-current rows, and rewrite the snapshot. If the validated raw-row fingerprint is
-identical, that generation change must not reset manual bank inputs. Actual
-validated source-content changes retain the existing audited reset policy for
-the corrected date and its preceding day.
+A byte-different XLSX creates a new source generation because generation identity
+includes the source-file SHA-256. If its normalized-row fingerprint and row count
+are unchanged, that generation change alone does not require a manual bank-input
+reset. Date-scoped daily updates preserve MANDIRI inputs on the corrected date and
+all other dates. Full-range correction retains its existing audited reset policy.
 
 ## Data Contracts
 
@@ -276,7 +384,7 @@ pipe, or tab delimiters; XLSX preserves exact IDs, phone numbers, and literal
 remarks. Required monetary values are integers, not manufactured zeroes.
 `Transaction Date` uses `DD-MM-YYYY HH:MM:SS`. Integrity rejects rows with both
 Kredit and Debet nonzero; both zero is allowed. Keep raw DigiPOS balances even
-when the new Sheet running SALDO starts at zero.
+though the date-scoped daily Sheet leaves cumulative SALDO unverified.
 
 - Preserve `raw_transaction_label`, source IDs, amounts, and `Remarks`; diagnostics belong in `unusual_reason`.
 - Evaluate a transaction family consistently for unusual output and summary eligibility. Unknown labels/remarks quarantine the complete family.
@@ -285,7 +393,7 @@ when the new Sheet running SALDO starts at zero.
 - Raw `RECHARGE` with the complete normalized remark `transaksi sellthru` is the no-companion SELLTHRU exception. Direct SELLTHRU does not inherit it; companions quarantine the standalone family.
 - Recharge and reversal-recharge fee expectation/cap is Rp20. Normal SELLTHRU platform fees total Rp100; missing/incorrect ST fees remain flagged but included, while excess fee rows are excluded.
 - The previous-format family policy is effective-dated: before `2026-09-01`, normal ST requires `SELLTHRUSALESFEE`; the temporary legacy September rule retires that companion and quarantines incoming SLSFEE families; from `2026-10-01`, the shared classifier recognizes the existing family again. Legacy invoice presentation remains separately governed below.
-- The new cell history starts `2026-10-01`. For every supported cell day, normalize source `SELLTHRUSALESHOLD`/terminal `SLSHLD` to the separate `SELLTHRUSALESFEE` category, preserving raw labels, IDs, amounts, and `Remarks`. Normal ST requires platform fee companions totaling Rp100 and separately accounts the source SLSHOLD amount. The cell policy has no September retirement or annual expiry: both fees contribute to ST expected settlement and running SALDO, and the hold line remains in Summary/Invoice even when zero. A missing hold is not fabricated as a source row and remains Unusual; an observed zero-valued hold is present and remains zero.
+- The new cell reporting boundary is `2026-10-01`. For every supported cell day, normalize source `SELLTHRUSALESHOLD`/terminal `SLSHLD` to the separate `SELLTHRUSALESFEE` category, preserving raw labels, IDs, amounts, and `Remarks`. Normal ST requires platform fee companions totaling Rp100 and separately accounts the source SLSHOLD amount. The cell policy has no September retirement or annual expiry: both fees contribute to ST expected settlement and full-range balance calculations, and the hold line remains in Summary/Invoice even when zero. A daily date-scoped Summary leaves cumulative SALDO blank and unverified. A missing hold is not fabricated as a source row and remains Unusual; an observed zero-valued hold is present and remains zero.
 - Recharge fee-only rows remain unusual but included. ST fee-only and unsupported `Reversal - ST*` families are unusual and excluded.
 - Out-cluster relabeling and exact reversal linkage follow [`classification.py`](classification.py); downstream code trusts prepared labels instead of relabeling twice.
 - Characterize new labels and remark structures from source before extending allowlists. The legacy October preprocessing change does not itself change legacy Sheet/invoice or monthly release contracts.
@@ -335,13 +443,30 @@ Cell migration `003_finpay_cell_reporting_v1.sql` is explicit and never applies
 as an ordinary write side effect. Empty verified cell-days may supersede current
 data; incomplete or failed downloads must not clear it.
 
+Cell database state is split by purpose:
+
+- Evidence: `finpay_cell_configs_v1`, `finpay_cell_sources_v1`,
+  `finpay_cell_ledger_v1`, and `finpay_cell_calculations_v1` retain configuration,
+  source generations/rows, and calculated results without replacing prior evidence.
+- Current/recalculation state: `finpay_cell_current_v1` selects each cell/date's
+  generation and calculation; `finpay_cell_current_results_v1` is its result view;
+  `finpay_cell_dirty_dates_v1` tracks changed calculations and reset requirements.
+- Publication/recovery state: `finpay_cell_publications_v1`,
+  `finpay_cell_publication_dates_v1`, and `finpay_cell_target_operations_v1` track
+  publication snapshots/statuses and ambiguous target operations;
+  `finpay_cell_manual_resets_v1` records manual bank-input resets.
+
+Exact reruns reuse evidence rows rather than duplicating them, but still update
+`finpay_cell_current_v1.selected_at`. Fingerprints use canonical JSON: dictionary
+keys are sorted, while list order is preserved.
+
 ## Publication Safety
 
 - Keep all Sheet writes sequential. Flow concurrency limits apply only to the same flow ID; database locks protect cell writers across entry points.
 - Queue or reject overlapping legacy writes to the same spreadsheet, worksheet, and report date across entry points; per-flow limits are not a shared lock.
 - Reacquire locks and validate persisted state before publishing across a task boundary. Reject stale handoffs before any Google mutation.
 - Never retry or clear `IN_FLIGHT`/`UNKNOWN` publications blindly. Lost ownership or an ambiguous mutation requires approved operator reconciliation; acknowledged writes with failed readback remain pending.
-- Preserve manual MANDIRI inputs except controlled, audited source-refresh resets. Missing history must fail, not become zero-activity days.
+- Daily date-block writes preserve manual MANDIRI inputs and unrelated dates. Daily cohorts do not require earlier dates; full-range cumulative calculations still require configured coverage and never treat missing history as zero-activity days.
 - Existing cell snapshots/layouts remain recovery inputs, not automatic rollback commands. Protection checks include read-only owner metadata; no sharing mutation is implied.
 - Previous-format writers replace the requested date, grow row capacity, and repair the stable `LinkAja` reference worksheet before invoice formulas use it. LinkAja source population remains outside this package.
 - Previous-format sheets retain A:F cash flow and H:K invoice panels, DETAIL/MANDIRI/Cash order, uppercase literal text, date separators, and editable protected MANDIRI inputs. The expected pembelian fee is count times Rp200, distinct from the Rp20 transaction-fee cap.
@@ -349,9 +474,10 @@ data; incomplete or failed downloads must not clear it.
 ## Run And Validate
 
 Use Kestra UI or `POST /api/v1/{tenant}/executions/finance.finpay/{flow_id}`.
-Only terminal `SUCCESS` is success; inspect task logs otherwise. Process backfill
-dates in ascending order and stop on failure. Keep schedules disabled until
-separately approved commissioning.
+Only terminal `SUCCESS` is success; inspect task logs otherwise. Bulk/range
+backfills process dates in ascending order and stop on failure; date-scoped day
+requests can run independently. Keep schedules disabled until separately
+approved commissioning.
 
 Before a production backfill, take a verified external backup and baseline
 counts, verify the pipeline role's schema/table privileges, and initialize only
@@ -367,8 +493,10 @@ production acquisition. Browser dependencies belong in the scraper images,
 not a local Chromium installation.
 
 Reporting `dry_run=true` never constructs DB/Google clients or sends alerts.
-Acquisition dry runs still contact DigiPOS; use synthetic bundles for offline
-reporting checks. `write_gsheet=false` permits DB-only processing, not Sheet writes.
+Acquisition dry runs still contact DigiPOS; the daily cell flow may also copy
+validated XLSX files into its inbox when the bind mount is configured. Use
+synthetic bundles for offline reporting checks. `write_gsheet=false` permits
+DB-only processing, not Sheet writes.
 
 From repository root, with the cached `finpay-pipeline:3.11` runtime:
 

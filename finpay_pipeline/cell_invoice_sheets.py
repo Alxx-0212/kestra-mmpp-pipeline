@@ -199,9 +199,11 @@ def build_cell_invoice_matrix(config: CellReportConfig, cell_days: list[dict], *
         matrix[0][start - 1:start + 3] = [f"C{index + 1} | CELL {code}", "", "", ""]
         matrix[1][start - 1:start + 3] = ["REPORT DATE", "INVOICE REPORT", "DEBET", "KREDIT"]
     date_strings = sorted({day for day, _ in facts})
+    date_ranges = []
     for date_index, date_string in enumerate(date_strings):
         day = business_date(date_string)
         per_code = {code: facts[(date_string, code)] for code in codes}
+        start_row = len(matrix) + 1
         for section, label, values in _records_for_day(per_code):
             if label == "QRISDUWIT":
                 qris_subtitle_rows.append(len(matrix) + 1)
@@ -224,6 +226,8 @@ def build_cell_invoice_matrix(config: CellReportConfig, cell_days: list[dict], *
             matrix.append(row)
             row_sections.append(section)
             section_ranges[-1]["end_row"] = len(matrix)
+        date_ranges.append({"report_date": date_string, "start_row": start_row,
+                            "end_row": len(matrix)})
         if date_index < len(date_strings) - 1:
             matrix.extend([[""] * widths for _ in range(2)])
             row_sections.extend([None, None])
@@ -232,7 +236,7 @@ def build_cell_invoice_matrix(config: CellReportConfig, cell_days: list[dict], *
         "dummy": dummy, "layout_version": 4, "panels": panels,
         "headers": list(PANEL_HEADERS), "values": matrix, "row_sections": row_sections,
         "dates": sorted({day for day, _ in facts}),
-        "section_ranges": section_ranges,
+        "date_ranges": date_ranges, "section_ranges": section_ranges,
         "qris_subtitle_rows": qris_subtitle_rows, "qris_child_rows": qris_child_rows,
         "scope_note": "FinPay-only invoice; LinkAja fees and separate LinkAja workflow are excluded.",
         "fingerprint": fingerprint(matrix),

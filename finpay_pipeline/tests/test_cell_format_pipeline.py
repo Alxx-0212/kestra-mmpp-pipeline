@@ -15,8 +15,8 @@ from finpay_pipeline.cell_contracts import (
 )
 from finpay_pipeline.cell_database import CellDatabaseTarget
 from finpay_pipeline.cell_format import (
-    acquire_cell_day, expand_cell_range, persist_cell_day, preprocess_cell_day,
-    publish_cell_sheets, validate_sheet_range,
+    acquire_cell_day, copy_cell_sources_to_inbox, expand_cell_range,
+    persist_cell_day, preprocess_cell_day, publish_cell_sheets, validate_sheet_range,
 )
 from finpay_pipeline.cell_format import settings
 from finpay_pipeline.cell_format import pipeline as cell_pipeline
@@ -139,7 +139,7 @@ class CellFormatPipelineTests(unittest.TestCase):
         self.cluster_id = "412110"
         self.account = self.cluster_id + "_B"
 
-    def persist_with_store(self, prepared_path, prepared_sha, store):
+    def persist_with_store(self, prepared_path, prepared_sha, store, *, publication_scope="report_date"):
         observed = {}
 
         @contextmanager
@@ -151,7 +151,7 @@ class CellFormatPipelineTests(unittest.TestCase):
         result = persist_cell_day(
             str(prepared_path), prepared_sha, database_password="synthetic-password",
             output_path=str(Path(prepared_path).with_name("cell_handoff_v1.json")),
-            target=self.target, session_factory=session,
+            publication_scope=publication_scope, target=self.target, session_factory=session,
         )
         self.assertEqual(observed["cluster"], self.cluster_id)
         self.assertEqual(observed["sheet_id"], "")
@@ -212,6 +212,103 @@ class CellFormatPipelineTests(unittest.TestCase):
         text = flow.read_text(encoding="utf-8")
         self.assertNotIn("configuration_sha256", text)
         self.assertNotIn("configuration:", text)
+
+    def test_cell_sources_copy_to_partitioned_legacy_named_inbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle, bundle_sha256 = source_bundle(root, CELL_START)
+            inbox = root / "finpay inbox"
+            result = copy_cell_sources_to_inbox(
+                bundle, bundle_sha256, CELL_START, self.cluster_id, inbox,
+            )
+            cells = configured_cells({
+                self.account: OBSERVED_CELL_ROSTER[self.account],
+            })
+            self.assertEqual(result["files_copied"], len(cells))
+            with zipfile.ZipFile(bundle) as archive:
+                for cell in cells:
+                    exported = (
+                        inbox / self.cluster_id / CELL_START
+                        / result["generation_sha256"] / cell.cell_code
+                        / expected_source_filename(self.cluster_id, CELL_START)
+                    )
+                    self.assertEqual(
+                        exported.read_bytes(),
+                        archive.read(f"{cell.account}-{cell.cell_code}.xlsx"),
+                    )
+                    self.assertEqual(exported.stat().st_mode & 0o777, 0o600)
+            cohort = inbox / self.cluster_id / CELL_START / result["generation_sha256"]
+            self.assertTrue(cohort.is_dir())
+
+    def test_cell_inbox_generation_ignores_zip_container_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle, bundle_sha256 = source_bundle(root, CELL_START)
+            with zipfile.ZipFile(bundle) as archive:
+                members = [(name, archive.read(name)) for name in archive.namelist()]
+            repacked = root / "repacked.zip"
+            with zipfile.ZipFile(repacked, "w", compression=zipfile.ZIP_STORED) as archive:
+                for name, contents in members:
+                    info = zipfile.ZipInfo(name, date_time=(2026, 1, 2, 0, 0, 0))
+                    info.compress_type = zipfile.ZIP_STORED
+                    archive.writestr(info, contents)
+            repacked_sha256 = hashlib.sha256(repacked.read_bytes()).hexdigest()
+            self.assertNotEqual(bundle_sha256, repacked_sha256)
+
+            inbox = root / "finpay inbox"
+            first = copy_cell_sources_to_inbox(
+                bundle, bundle_sha256, CELL_START, self.cluster_id, inbox,
+            )
+            second = copy_cell_sources_to_inbox(
+                repacked, repacked_sha256, CELL_START, self.cluster_id, inbox,
+            )
+            whitespace = copy_cell_sources_to_inbox(
+                bundle, bundle_sha256, CELL_START, f" {self.cluster_id} ", inbox,
+            )
+            self.assertEqual(first["generation_sha256"], second["generation_sha256"])
+            self.assertEqual(first["generation_sha256"], whitespace["generation_sha256"])
+
+    def test_cell_inbox_does_not_expose_partial_cohort_on_promotion_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle, bundle_sha256 = source_bundle(root, CELL_START)
+            inbox = root / "finpay inbox"
+            with patch(
+                "finpay_pipeline.cell_format.acquisition.os.replace",
+                side_effect=OSError("injected promotion failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "injected promotion failure"):
+                    copy_cell_sources_to_inbox(
+                        bundle, bundle_sha256, CELL_START, self.cluster_id, inbox,
+                    )
+            cohort_root = inbox / self.cluster_id / CELL_START
+            self.assertEqual(list(cohort_root.iterdir()), [])
+
+    def test_cell_inbox_rejects_symlinked_cluster_path_before_external_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle, bundle_sha256 = source_bundle(root, CELL_START)
+            inbox = root / "finpay inbox"
+            inbox.mkdir()
+            outside = root / "outside"
+            (inbox / self.cluster_id).symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlinks"):
+                copy_cell_sources_to_inbox(
+                    bundle, bundle_sha256, CELL_START, self.cluster_id, inbox,
+                )
+            self.assertFalse(outside.exists())
+
+    def test_cell_inbox_copy_rejects_changed_source_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle, bundle_sha256 = source_bundle(root, CELL_START)
+            bundle.write_bytes(bundle.read_bytes() + b"changed")
+            inbox = root / "finpay inbox"
+            with self.assertRaisesRegex(ValueError, "bundle checksum mismatch"):
+                copy_cell_sources_to_inbox(
+                    bundle, bundle_sha256, CELL_START, self.cluster_id, inbox,
+                )
+            self.assertFalse(inbox.exists())
 
     def test_previous_format_entrypoint_acquires_one_validated_cluster_day(self):
         content = b"synthetic validated workbook bytes"
@@ -309,7 +406,9 @@ class CellFormatPipelineTests(unittest.TestCase):
             handoff = json.loads((directory / "cell_handoff_v1.json").read_text(encoding="utf-8"))
             self.assertEqual(handoff["first_report_date"], CELL_START)
             self.assertEqual(handoff["last_report_date"], CELL_NEXT)
-            self.assertEqual(len(handoff["selected"]), 2 * len(OBSERVED_CELL_ROSTER[self.account]))
+            self.assertEqual(handoff["scope"], "report_date")
+            self.assertEqual({item["report_date"] for item in handoff["selected"]}, {CELL_NEXT})
+            self.assertEqual(len(handoff["selected"]), len(OBSERVED_CELL_ROSTER[self.account]))
             config = settings.report_config(self.cluster_id, CELL_START)
             facts = list(store.facts.values())
             report_days = build_cluster_report(config, facts, CELL_NEXT)["days"]
@@ -345,7 +444,7 @@ class CellFormatPipelineTests(unittest.TestCase):
             self.assertEqual(rerun["history_fingerprint"], outputs[-1]["history_fingerprint"])
             self.assertEqual(len(store.commits), 3)
 
-    def test_later_day_preprocesses_offline_but_cannot_initialize_history(self):
+    def test_later_day_persists_without_prior_history(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             bundle, bundle_sha = source_bundle(directory, CELL_NEXT)
@@ -360,15 +459,51 @@ class CellFormatPipelineTests(unittest.TestCase):
             self.assertEqual(len(batch), len(OBSERVED_CELL_ROSTER[self.account]))
 
             store = MemoryCellStore()
-            with self.assertRaisesRegex(ValueError, "missing cell coverage for report date 2026-10-01"):
-                self.persist_with_store(prepared_path, prepared["prepared_sha256"], store)
-            self.assertEqual(store.commits, [])
-            self.assertEqual(store.sources, {})
-            self.assertEqual(store.configurations, {})
-            self.assertEqual(store.dirty, set())
-            self.assertFalse((directory / "cell_handoff_v1.json").exists())
+            persisted, _ = self.persist_with_store(prepared_path, prepared["prepared_sha256"], store)
+            self.assertEqual(len(store.commits), 1)
+            self.assertEqual({day for day, _ in store.facts}, {CELL_NEXT})
+            handoff = json.loads((directory / "cell_handoff_v1.json").read_text(encoding="utf-8"))
+            self.assertEqual(handoff["scope"], "report_date")
+            self.assertEqual({item["report_date"] for item in handoff["selected"]}, {CELL_NEXT})
+            self.assertEqual(persisted["history_fingerprint"], handoff["history_fingerprint"])
 
-    def test_history_before_reporting_start_is_rejected_without_cleanup(self):
+    def test_range_scope_retains_full_history_validation_and_handoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def prepared(day, folder):
+                folder.mkdir()
+                bundle, digest = source_bundle(folder, day)
+                path = folder / "prepared.json"
+                result = preprocess_cell_day(str(bundle), digest, day, self.cluster_id, str(path))
+                return path, result["prepared_sha256"]
+
+            late_path, late_sha = prepared(CELL_NEXT, root / "late-only")
+            store = MemoryCellStore()
+            with self.assertRaisesRegex(ValueError, "missing cell coverage for report date 2026-10-01"):
+                self.persist_with_store(late_path, late_sha, store, publication_scope="history")
+            self.assertEqual(store.commits, [])
+            self.assertEqual(store.facts, {})
+
+            first_path, first_sha = prepared(CELL_START, root / "first")
+            self.persist_with_store(first_path, first_sha, store, publication_scope="history")
+            first_handoff = json.loads((root / "first/cell_handoff_v1.json").read_text())
+            self.assertEqual(first_handoff["scope"], "history")
+            self.assertEqual({item["report_date"] for item in first_handoff["selected"]}, {CELL_START})
+
+            next_path, next_sha = prepared(CELL_NEXT, root / "next")
+            self.persist_with_store(next_path, next_sha, store, publication_scope="history")
+            handoff = json.loads((root / "next/cell_handoff_v1.json").read_text())
+            self.assertEqual(handoff["scope"], "history")
+            self.assertEqual(handoff["last_report_date"], CELL_NEXT)
+            self.assertEqual({item["report_date"] for item in handoff["selected"]},
+                             {CELL_START, CELL_NEXT})
+            cluster_id, config = cell_pipeline._validate_handoff(handoff)
+            committed = cell_pipeline._verify_handoff_history(store, handoff, config)
+            self.assertEqual(cluster_id, self.cluster_id)
+            self.assertEqual(len(committed), 2 * len(OBSERVED_CELL_ROSTER[self.account]))
+
+    def test_day_persistence_preserves_unrelated_pre_boundary_data(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             bundle, bundle_sha = source_bundle(directory, CELL_START)
@@ -381,14 +516,10 @@ class CellFormatPipelineTests(unittest.TestCase):
                 for code in OBSERVED_CELL_ROSTER[self.account]
             })
             before = deepcopy(store.facts)
-            with self.assertRaisesRegex(ValueError, "predates the code-owned reporting start"):
-                self.persist_with_store(prepared_path, prepared["prepared_sha256"], store)
-            self.assertEqual(store.facts, before)
-            self.assertEqual(store.commits, [])
-            self.assertEqual(store.sources, {})
-            self.assertEqual(store.configurations, {})
-            self.assertEqual(store.dirty, set())
-            self.assertFalse((directory / "cell_handoff_v1.json").exists())
+            self.persist_with_store(prepared_path, prepared["prepared_sha256"], store)
+            self.assertTrue(all(store.facts[key] == value for key, value in before.items()))
+            self.assertEqual({day for day, _ in store.facts}, {"2026-09-30", CELL_START})
+            self.assertEqual(len(store.commits), 1)
 
     def test_dry_run_and_missing_sheet_targets_instantiate_no_clients(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -510,7 +641,7 @@ class CellFormatPipelineTests(unittest.TestCase):
                 blocks += 1
             self.assertGreater(blocks, 0, f"no inline script found in {name}")
 
-    def test_stale_handoff_fails_before_google_client_creation(self):
+    def test_changed_submitted_date_handoff_fails_before_google_client_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             store = MemoryCellStore()
@@ -524,7 +655,7 @@ class CellFormatPipelineTests(unittest.TestCase):
                     prepared_path, prepared["prepared_sha256"], store,
                 )
             handoff_path = directory / "cell_handoff_v1.json"
-            key = next(key for key in store.facts if key[0] == CELL_START)
+            key = next(key for key in store.facts if key[0] == CELL_NEXT)
             store.facts[key] = {**store.facts[key], "calculation_id": "stale-calculation"}
 
             worksheet_ids = {self.account: {role: 400 + index for index, role in enumerate(ROLES)}}
@@ -550,7 +681,7 @@ class CellFormatPipelineTests(unittest.TestCase):
                     )
                 sheet_client.assert_not_called()
 
-    def test_stale_history_and_submitted_cohorts_rollback_together(self):
+    def test_failed_single_date_commit_rolls_back_without_touching_other_dates(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             store = MemoryCellStore()
@@ -571,7 +702,7 @@ class CellFormatPipelineTests(unittest.TestCase):
             prepared = preprocess_cell_day(
                 str(bundle), bundle_sha, CELL_START, self.cluster_id, str(prepared_path),
             )
-            store.fail_on_commit = store.commit_calls + 2
+            store.fail_on_commit = store.commit_calls + 1
 
             @contextmanager
             def session(target, approved, cluster_id, sheet_id, **kwargs):

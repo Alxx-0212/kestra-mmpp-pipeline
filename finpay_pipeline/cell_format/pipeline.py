@@ -13,10 +13,12 @@ from ..cell_contracts import (
     CellIdentity, business_date, fingerprint, read_bounded_bytes, roster_fingerprint,
 )
 from ..cell_database import cell_publication_session, prepare_cell_day, validate_cluster_batch
+from ..cell_observability import cohort_counts, observed, report
 from ..cell_publication import ExistingSheetAdapter, _read_with_retry
 from ..cell_publication_v2 import (
     ROLES, build_cell_cluster_matrices_v2, cell_worksheet_title,
     preflight_unpublished_v2_sheet, publish_cell_cluster_v2, validate_output_targets,
+    validate_refresh_request_id,
 )
 from ..cell_workflow import MAX_BUNDLE_BYTES, _prepare_cell_bundle_with_configs, make_cell_sheet_client
 from .settings import (
@@ -372,6 +374,7 @@ def _resolve_cell_targets(store, workbook, cluster_id, configuration, publicatio
     return targets, adapters
 
 
+@observed("preprocess")
 def preprocess_cell_day(source_bundle: str, source_bundle_sha256: str, report_date: str,
                         cluster_id: str, output_path: str = "cell_prepared_v1.json") -> dict:
     """Validate a source bundle and calculate one complete cluster/date offline."""
@@ -383,8 +386,10 @@ def preprocess_cell_day(source_bundle: str, source_bundle_sha256: str, report_da
     if manifest["report_date"] != day or set(batches) != {config.account}:
         raise ValueError("cell bundle differs from requested date/cluster")
     batch = batches[config.account]
+    report("source_validated", count=len(batch))
     validate_cluster_batch(batch, config.cells)
-    build_cell_cluster_matrices_v2(config, batch, day, dummy=True)
+    build_cell_cluster_matrices_v2(config, batch, day, dummy=True,
+        first_report_date=day, calculate_saldo=False)
     roster_digest = roster_fingerprint(config.cells)
     prepared = {
         "schema_version": 1, "report_date": day, "cluster_id": cluster_id,
@@ -393,6 +398,7 @@ def preprocess_cell_day(source_bundle: str, source_bundle_sha256: str, report_da
     }
     digest, size = _write_json(output_path, prepared, MAX_PREPARED_BYTES)
     return {"report_date": day, "cluster_id": cluster_id,
+            "notification_summary": json.dumps(cohort_counts(batch), sort_keys=True),
             "prepared_sha256": digest, "prepared_bytes": size}
 
 
@@ -437,6 +443,13 @@ def _facts(config, rows):
     } for row in rows]
 
 
+def _prepared_facts(config, batch):
+    return [{"identity": item["identity"], "report_date": item["report_date"],
+        "generation_id": item["generation_id"], "calculation_id": item["calculation_id"],
+        "config_id": item["config_id"], "rules_version": config.rules_version,
+        "calculation": item["calculation"]} for item in batch]
+
+
 def _selection(facts):
     return sorted(({
         "account": fact["identity"]["account"],
@@ -462,7 +475,10 @@ def _validate_handoff(handoff):
     first = business_date(handoff.get("first_report_date", "")).isoformat()
     last = business_date(handoff.get("last_report_date", "")).isoformat()
     submitted = business_date(handoff.get("submitted_report_date", "")).isoformat()
-    if first != REPORTING_START_DATE or first > submitted or submitted > last:
+    scope = handoff.get("scope", "history")
+    if (scope not in ("history", "report_date") or first != REPORTING_START_DATE
+            or first > submitted or submitted > last
+            or (scope == "report_date" and last != submitted)):
         raise ValueError("cell Sheet handoff dates are inconsistent")
     config = _cell_config(cluster_id, first)
     if handoff.get("roster_fingerprint") != roster_fingerprint(config.cells):
@@ -493,6 +509,8 @@ def _validate_handoff(handoff):
         by_day.setdefault(day, set()).add(item["cell_code"])
     if any(codes != expected_cells for codes in by_day.values()):
         raise ValueError("cell Sheet handoff contains incomplete cluster-day coverage")
+    if scope == "report_date" and set(by_day) != {submitted}:
+        raise ValueError("date-scoped cell Sheet handoff must select only its submitted date")
     return cluster_id, config
 
 
@@ -505,28 +523,38 @@ def _current_history(store, config):
 
 
 def _verify_handoff_history(store, handoff, config):
+    if handoff.get("scope", "history") == "report_date":
+        submitted = handoff["submitted_report_date"]
+        committed = _facts(config, store.current_results(submitted, submitted))
+        if _selection(committed) != handoff["selected"]:
+            raise ValueError("stale cell Sheet handoff: persisted date selection changed")
+        return committed
     earliest = store.earliest_report_date()
     if earliest != handoff["first_report_date"]:
         raise ValueError("stale cell Sheet handoff: persisted history start changed")
     committed = _current_history(store, config)
     selected = _selection(committed)
     if (selected != handoff["selected"]
-            or fingerprint(selected) != handoff["history_fingerprint"]
             or store.latest_report_date() != handoff["last_report_date"]):
         raise ValueError("stale cell Sheet handoff: persisted source/calculation history changed")
     return committed
 
 
+@observed("persist")
 def persist_cell_day(prepared_path: str, prepared_sha256: str, *, database_password: str | None,
                      output_path: str = "cell_handoff_v1.json", dry_run: bool = False,
-                     target=None, session_factory=cell_publication_session) -> dict:
-    """Commit source/calculation rows only, then emit a history-bound handoff."""
+                     publication_scope: str = "report_date", target=None,
+                     session_factory=cell_publication_session) -> dict:
+    """Commit one date cohort and hand off either it or complete report history."""
     if type(dry_run) is not bool:
         raise ValueError("dry_run must be an explicit boolean")
+    if publication_scope not in ("report_date", "history"):
+        raise ValueError("publication_scope must be report_date or history")
     prepared, provisional, provisional_batch = _load_prepared(prepared_path, prepared_sha256)
     if dry_run:
         build_cell_cluster_matrices_v2(provisional, provisional_batch,
-                                       prepared["report_date"], dummy=True)
+            prepared["report_date"], dummy=True, first_report_date=prepared["report_date"],
+            calculate_saldo=False)
         return {"status": "DRY_RUN", "cluster_id": prepared["cluster_id"],
                 "report_date": prepared["report_date"], "selected_cells": len(provisional_batch)}
     if not database_password:
@@ -534,15 +562,12 @@ def persist_cell_day(prepared_path: str, prepared_sha256: str, *, database_passw
     target = database_target() if target is None else target
     cluster_id = prepared["cluster_id"]
     day = prepared["report_date"]
+    report("waiting_for_database_lock", cluster_id=cluster_id, report_date=day)
     with session_factory(
         target, {target}, cluster_id, "", password=database_password,
         approved_sheet_ids=set(), write_gsheet=False,
     ) as store:
-        earliest = store.earliest_report_date()
-        if earliest and earliest < REPORTING_START_DATE:
-            raise ValueError(
-                f"persisted cell history predates the code-owned reporting start {REPORTING_START_DATE}"
-            )
+        report("database_lock_acquired")
         first = REPORTING_START_DATE
         config = _cell_config(cluster_id, first)
         provisional_config, final_config = provisional.to_dict(), config.to_dict()
@@ -556,49 +581,75 @@ def persist_cell_day(prepared_path: str, prepared_sha256: str, *, database_passw
             item["calculation"], config.to_dict(), config.rules_version,
         ) for item in provisional_batch]
         validate_cluster_batch(batch, config.cells)
-        through = max(day, store.latest_report_date() or day)
-        history_batches = recalculate_stale_history(
-            store, config, through, submitted_dates={day},
-        )
-        keyed = {
-            (fact["report_date"], fact["identity"]["cell_code"]): fact
-            for fact in _facts(config, store.current_results(first, through))
-        }
-        for cohort in [*history_batches, batch]:
-            for fact in cohort:
-                keyed[(fact["report_date"], fact["identity"]["cell_code"])] = fact
-        candidate = list(keyed.values())
-        build_cell_cluster_matrices_v2(config, candidate, through, dummy=True)
+        if publication_scope == "report_date":
+            through = day
+            history_batches = []
+            candidate = _prepared_facts(config, batch)
+            build_cell_cluster_matrices_v2(config, candidate, day, dummy=True,
+                first_report_date=day, calculate_saldo=False)
+        else:
+            earliest = store.earliest_report_date()
+            if earliest and earliest < first:
+                raise ValueError("persisted cell history predates the code-owned reporting start")
+            through = max(day, store.latest_report_date() or day)
+            history_batches = recalculate_stale_history(
+                store, config, through, submitted_dates={day},
+            )
+            keyed = {
+                (fact["report_date"], fact["identity"]["cell_code"]): fact
+                for fact in _facts(config, store.current_results(first, through))
+            }
+            for cohort in [*history_batches, batch]:
+                for fact in _prepared_facts(config, cohort):
+                    keyed[(fact["report_date"], fact["identity"]["cell_code"])] = fact
+            candidate = list(keyed.values())
+            build_cell_cluster_matrices_v2(config, candidate, through, dummy=True)
 
         with store.connection.transaction():
-            for cohort in sorted([*history_batches, batch], key=lambda rows: rows[0]["report_date"]):
+            cohorts = [(batch, day), *((cohort, cohort[0]["report_date"])
+                                       for cohort in history_batches)]
+            cohorts.sort(key=lambda item: item[1])
+            for cohort, cohort_day in cohorts:
                 store.commit_cluster_day(cohort, config.cells)
-            through = store.latest_report_date()
-            committed = _current_history(store, config)
-            build_cell_cluster_matrices_v2(config, committed, through, dummy=True)
+                report("cohort_written_transaction_open", report_date=cohort_day, count=len(cohort))
+            if publication_scope == "report_date":
+                committed = _facts(config, store.current_results(day, day))
+                build_cell_cluster_matrices_v2(config, committed, day, dummy=True,
+                    first_report_date=day, calculate_saldo=False)
+                last = day
+            else:
+                last = store.latest_report_date()
+                committed = _current_history(store, config)
+                build_cell_cluster_matrices_v2(config, committed, last, dummy=True)
             selected = _selection(committed)
             handoff = {
                 "schema_version": HANDOFF_SCHEMA_VERSION, "cluster_id": cluster_id,
                 "account": config.account, "submitted_report_date": day,
-                "first_report_date": first, "last_report_date": through,
+                "first_report_date": first, "last_report_date": last,
+                "scope": publication_scope,
                 "roster_fingerprint": roster_fingerprint(config.cells),
                 "selected": selected, "history_fingerprint": fingerprint(selected),
             }
         digest, size = _write_json(output_path, handoff, MAX_HANDOFF_BYTES)
+        report("database_committed", cluster_id=cluster_id, report_date=day, count=len(batch))
     return {"status": "PERSISTED", "cluster_id": cluster_id, "report_date": day,
             "history_fingerprint": handoff["history_fingerprint"],
             "handoff_sha256": digest, "handoff_bytes": size}
 
 
+@observed("publish")
 def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_password: str | None,
                         credentials_info: dict | None, cluster_id: str | None = None,
                         dry_run: bool = False, target=None, session_factory=cell_publication_session,
-                        sheet_client_factory=make_cell_sheet_client) -> dict:
-    """Recheck persisted history under locks, then use the guarded four-tab writer."""
+                        sheet_client_factory=make_cell_sheet_client,
+                        refresh_request_id: str | None = None) -> dict:
+    """Recheck the selected source scope under locks, then publish guarded tabs."""
+    validate_refresh_request_id(refresh_request_id)
     if type(dry_run) is not bool:
         raise ValueError("dry_run must be an explicit boolean")
     handoff = _read_json(handoff_path, handoff_sha256, MAX_HANDOFF_BYTES)
     actual_cluster, config = _validate_handoff(handoff)
+    report("handoff_validated", cluster_id=actual_cluster)
     if cluster_id is not None and cluster_id != actual_cluster:
         raise ValueError("cell Sheet handoff cluster differs from task input")
     if dry_run:
@@ -632,16 +683,22 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
     if workbook_id == configuration.legacy_spreadsheet_id:
         raise ValueError("cell-format workbook must be distinct from the legacy workbook")
     approved_db = {target}
+    report("waiting_for_publication_lock")
     with session_factory(
         target, approved_db, actual_cluster, workbook_id, password=database_password,
         approved_sheet_ids={workbook_id}, write_gsheet=True,
     ) as store:
+        report("publication_lock_acquired")
         committed = _verify_handoff_history(store, handoff, config)
         publication = store.latest_publication(sheet_only=True)
         if publication and publication["status"] != "COMPLETE":
             raise RuntimeError("cell-format target has unresolved publication state")
+        date_scoped = handoff.get("scope", "history") == "report_date"
         build_cell_cluster_matrices_v2(
-            config, committed, handoff["last_report_date"], dummy=True,
+            config, committed, handoff["submitted_report_date"] if date_scoped else handoff["last_report_date"],
+            dummy=True,
+            first_report_date=handoff["submitted_report_date"] if date_scoped else None,
+            calculate_saldo=not date_scoped,
         )
 
         if client is None:
@@ -655,6 +712,9 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
         result = publish_cell_cluster_v2(
             store, workbook_id, targets, adapters, None, config,
             publication_only=True, preserve_manual_inputs=True,
+            refresh_request_id=refresh_request_id, date_scoped=date_scoped,
+            report_date=handoff["submitted_report_date"] if date_scoped else None,
         )
+        report("publication_verified", completed=4, total=4)
     return {"status": "COMPLETE", "cluster_id": actual_cluster,
             "history_fingerprint": handoff["history_fingerprint"], **result}

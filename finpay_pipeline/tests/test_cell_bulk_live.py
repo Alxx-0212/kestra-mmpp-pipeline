@@ -119,10 +119,43 @@ class BulkLiveBoundaryTests(unittest.TestCase):
         self.assertIn("_settings.CELL_FORMAT_WORKSHEET_IDS =", text)
         self.assertIn("create_worksheets_if_missing: false", text)
         self.assertIn("defaults: false", text)
+        self.assertNotIn("afterExecution:", text)
+        self.assertNotIn("TELEGRAM_BOT_TOKEN", text)
+        self.assertNotIn("TELEGRAM_CHAT_ID", text)
         scripts = re.findall(r"(?m)^    script: \|\n((?:^      .*\n|^\n)*)", text)
         self.assertEqual(len(scripts), 6)
         for script in scripts:
             ast.parse(textwrap.dedent(script))
+
+    def test_isolated_render_rejects_unrecognized_terminal_tasks(self):
+        source = Path(__file__).resolve().parents[1] / "workflows/finpay_cell_bulk_v1.yml"
+        directory = self.root / "workflows"
+        directory.mkdir()
+        (directory / source.name).write_text(
+            source.read_text() + "\n  - id: unapproved_terminal_task\n    type: io.kestra.plugin.core.log.Log\n    message: blocked\n",
+        )
+        live.ops.write_json(self.root / "state.json", {"state": "DATABASE_READY"})
+        (self.root / "ops").mkdir()
+        with patch.dict(os.environ, {"E2E_WORKFLOW_DIR": str(directory)}):
+            with self.assertRaisesRegex(live.ops.Blocked, "terminal_task_set_changed"):
+                live.render_flow()
+        self.assertFalse((self.root / "isolated-bulk-flow.yml").exists())
+
+    def test_isolated_render_rejects_flow_style_terminal_sections(self):
+        source = Path(__file__).resolve().parents[1] / "workflows/finpay_cell_bulk_v1.yml"
+        directory = self.root / "workflows"
+        directory.mkdir()
+        canonical_tasks = source.read_text().split("\nafterExecution:\n", 1)[0]
+        live.ops.write_json(self.root / "state.json", {"state": "DATABASE_READY"})
+        (self.root / "ops").mkdir()
+        for key in ("afterExecution", '"afterExecution"', "'afterExecution'"):
+            (directory / source.name).write_text(
+                canonical_tasks + "\n" + key + ": [{id: unapproved, type: io.kestra.plugin.core.log.Log, message: blocked}]\n",
+            )
+            with self.subTest(key=key), patch.dict(os.environ, {"E2E_WORKFLOW_DIR": str(directory)}):
+                with self.assertRaises(live.ops.Blocked):
+                    live.render_flow()
+            self.assertFalse((self.root / "isolated-bulk-flow.yml").exists())
 
 
 if __name__ == "__main__":

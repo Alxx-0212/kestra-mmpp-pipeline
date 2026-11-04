@@ -1,6 +1,7 @@
 """Synthetic multi-tab publication protocol tests; no Google/DB client is used."""
 import copy
 import json
+import re
 import unittest
 from datetime import date
 from unittest.mock import patch
@@ -22,6 +23,8 @@ class MultiTabStore:
         self.fail_audit = False
         self.adapters = {}
         self.source_commits = 0
+        self.sheet_mutations = 0
+        self.row_mutations = []
 
     def assert_alive(self):
         if not self.alive:
@@ -35,6 +38,12 @@ class MultiTabStore:
         epoch = max(available)
         item = available[epoch]
         return {"epoch": epoch, **copy.deepcopy(item)}
+
+    def publications_for_refresh_request(self, refresh_request_id):
+        self.assert_alive()
+        return [{"epoch": epoch, **copy.deepcopy(item)}
+                for epoch, item in sorted(self.publications.items())
+                if item["snapshot"].get("refresh_request_id") == refresh_request_id]
 
     def latest_report_date(self):
         return max((day for day, _ in self.facts), default=None)
@@ -162,6 +171,9 @@ class MultiTabAdapter:
     def read(self, rows, columns):
         return [row[:columns] for row in self.values[:rows]]
 
+    def read_range(self, start_row, end_row, columns):
+        return [row[:columns] for row in self.values[start_row:end_row]]
+
     def native_format(self, row, column):
         value = copy.deepcopy(self.styles.get((row, column), {}))
         for area in self.merges:
@@ -213,7 +225,58 @@ class MultiTabAdapter:
                     else:
                         target.pop(parts[-1], None)
 
+    def shift_rows(self, start, count, insert):
+        end = start + count
+        boundary, delta = (start, count) if insert else (end, -count)
+
+        def shift_formula(value):
+            if not isinstance(value, str) or not value.startswith("="):
+                return value
+            return re.sub(r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3})(\$?)(\d+)(?!\s*\()",
+                lambda match: match[1] + match[2] + str(
+                    int(match[3]) + delta if int(match[3]) > boundary else int(match[3])), value)
+
+        self.values = [[shift_formula(value) for value in row] for row in self.values]
+
+        def shift_range(area):
+            if "startRowIndex" not in area or "endRowIndex" not in area:
+                return
+            if insert:
+                if area["startRowIndex"] >= start:
+                    area["startRowIndex"] += count
+                if area["endRowIndex"] > start:
+                    area["endRowIndex"] += count
+            else:
+                first, last = area["startRowIndex"], area["endRowIndex"]
+                area["startRowIndex"] = first if first <= start else start if first < end else first - count
+                area["endRowIndex"] = last if last <= start else start if last < end else last - count
+
+        if insert:
+            while len(self.values) < start:
+                self.values.append([""] * self.grid["columnCount"])
+            self.values[start:start] = [[""] * self.grid["columnCount"] for _ in range(count)]
+            self.styles = {(row + count if row >= start else row, col): value
+                           for (row, col), value in self.styles.items()}
+            self.heights = {row + count if row >= start else row: value
+                            for row, value in self.heights.items()}
+        else:
+            del self.values[start:end]
+            self.styles = {(row - count if row >= end else row, col): value
+                           for (row, col), value in self.styles.items() if not start <= row < end}
+            self.heights = {row - count if row >= end else row: value
+                            for row, value in self.heights.items() if not start <= row < end}
+        for area in self.merges:
+            shift_range(area)
+        for item in self.banding:
+            shift_range(item["range"])
+        for item in self.protections:
+            if "range" in item:
+                shift_range(item["range"])
+            for area in item.get("unprotectedRanges", []):
+                shift_range(area)
+
     def batch_update(self, requests):
+        self.store.sheet_mutations += 1
         replies = []
         for request in requests:
             payload = next(iter(request.values()))
@@ -248,6 +311,20 @@ class MultiTabAdapter:
                 target = self.widths if area["dimension"] == "COLUMNS" else self.heights
                 for index in range(area["startIndex"], area["endIndex"]):
                     target[index] = payload["properties"]["pixelSize"]
+                replies.append({})
+                continue
+            elif "insertDimension" in request:
+                area = payload["range"]
+                self.store.row_mutations.append(("insert", area["sheetId"],
+                    area["startIndex"], area["endIndex"]))
+                self.shift_rows(area["startIndex"], area["endIndex"] - area["startIndex"], True)
+                replies.append({})
+                continue
+            elif "deleteDimension" in request:
+                area = payload["range"]
+                self.store.row_mutations.append(("delete", area["sheetId"],
+                    area["startIndex"], area["endIndex"]))
+                self.shift_rows(area["startIndex"], area["endIndex"] - area["startIndex"], False)
                 replies.append({})
                 continue
             elif "repeatCell" in request:
@@ -408,6 +485,235 @@ class CellPublicationV2Tests(unittest.TestCase):
         return publish_cell_cluster_v2(self.store, self.store.target_id, self.roles, self.adapters,
             self.batch, self.config, changed_dates=[self.batch[0]["report_date"]], **kwargs)
 
+    def publish_only(self, **kwargs):
+        return publish_cell_cluster_v2(
+            self.store, self.store.target_id, self.roles, self.adapters, None, self.config,
+            publication_only=True, preserve_manual_inputs=True, **kwargs,
+        )
+
+    def test_first_date_scoped_publication_needs_no_prior_history(self):
+        day = "2026-10-15"
+        for code in self.config.cell_codes:
+            item = self.fixture.prepare(code, [self.fixture.row(day=day)], day)
+            self.store.facts[(day, code)] = {
+                "identity": item["identity"], "generation_id": item["generation_id"],
+                "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                "calculation": item["calculation"],
+            }
+        result = self.publish_only(date_scoped=True, report_date=day,
+                                   refresh_request_id="first-independent-day")
+        snapshot = self.store.publications[result["epoch"]]["snapshot"]["worksheets"]
+        summary = snapshot["summary"]["matrix"]
+        self.assertEqual([item["report_date"] for item in summary["date_ranges"]], [day])
+        self.assertIn("SALDO UNVERIFIED", summary["values"][2][2])
+        day_range = summary["date_ranges"][0]
+        self.assertEqual(summary["values"][day_range["start_row"] - 1][2],
+                         "CUMULATIVE SALDO UNVERIFIED")
+        self.assertEqual(snapshot["invoice"]["matrix"]["dates"], [day])
+        marker = json.loads(self.adapters["summary"].metadata_entries[0]["metadataValue"])
+        self.assertEqual(marker["status"], "COMPLETE")
+
+    def test_daily_correction_keeps_existing_saldo_formula_chain(self):
+        target_day, later_day = "2026-10-14", "2026-10-15"
+
+        def replace_store_day(day, amount):
+            for code in self.config.cell_codes:
+                item = self.fixture.prepare(code,
+                    [self.fixture.row(day=day, amount=amount)], day)
+                self.store.facts[(day, code)] = {
+                    "identity": item["identity"], "generation_id": item["generation_id"],
+                    "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                    "calculation": item["calculation"],
+                }
+
+        replace_store_day(target_day, 100)
+        replace_store_day(later_day, 200)
+        full = self.publish(additional_batches=[
+            [self.fixture.prepare(code, [self.fixture.row(day=target_day, amount=100)], target_day)
+             for code in self.config.cell_codes],
+            [self.fixture.prepare(code, [self.fixture.row(day=later_day, amount=200)], later_day)
+             for code in self.config.cell_codes],
+        ])
+        previous = self.store.publications[full["epoch"]]["snapshot"]["worksheets"]["summary"]["matrix"]
+        saldo_columns = [block["end_column"] - 1 for block in previous["blocks"]]
+        target_range = next(item for item in previous["date_ranges"]
+                            if item["report_date"] == target_day)
+        later_range = next(item for item in previous["date_ranges"]
+                           if item["report_date"] == later_day)
+        previous_target = [[row[column] for column in saldo_columns]
+                           for row in previous["values"][target_range["start_row"] - 1:
+                                                         target_range["end_row"]]]
+        previous_later_formulas = [[row[column] for column in saldo_columns]
+            for row in previous["values"][later_range["start_row"] - 1:later_range["end_row"]]]
+        self.assertTrue(any(isinstance(value, str) and value.startswith("=")
+                            for row in previous_target for value in row))
+
+        replace_store_day(target_day, 900)
+        refreshed = self.publish_only(date_scoped=True, report_date=target_day,
+                                      refresh_request_id="daily-correction-with-saldo-chain")
+        current = self.store.publications[refreshed["epoch"]]["snapshot"]["worksheets"]["summary"]["matrix"]
+        target_range = next(item for item in current["date_ranges"]
+                            if item["report_date"] == target_day)
+        later_range = next(item for item in current["date_ranges"]
+                           if item["report_date"] == later_day)
+        current_target = [[row[column] for column in saldo_columns]
+                          for row in current["values"][target_range["start_row"] - 1:
+                                                       target_range["end_row"]]]
+        current_later_formulas = [[row[column] for column in saldo_columns]
+            for row in current["values"][later_range["start_row"] - 1:later_range["end_row"]]]
+        self.assertEqual(current_target, previous_target)
+        self.assertEqual(current_later_formulas, previous_later_formulas)
+        self.assertFalse(any("UNVERIFIED" in str(row[2]) for row in
+            current["values"][target_range["start_row"] - 1:target_range["end_row"]]))
+
+    def test_date_scoped_refresh_resizes_only_target_blocks_and_preserves_inputs(self):
+        from finpay_pipeline.cell_contracts import fingerprint
+
+        self.publish()
+        day = "2026-10-15"
+        before = self.store.publications[1]["snapshot"]["worksheets"]
+        old_summary = before["summary"]["matrix"]
+        old_date = old_summary["date_ranges"][0]
+        old_input = old_summary["editable_inputs"][0]
+        old_row, old_column = old_input["row"] - 1, old_input["column"] - 1
+        self.adapters["summary"].values[old_row][old_column] = 333
+        old_invoice = before["invoice"]["matrix"]
+        old_invoice_range = old_invoice["date_ranges"][0]
+        old_invoice_rows = copy.deepcopy(old_invoice["values"][
+            old_invoice_range["start_row"] - 1:old_invoice_range["end_row"]])
+
+        def set_date(report_date, row_count, qris=False):
+            batch = []
+            for code in self.config.cell_codes:
+                rows = [self.fixture.row(day=report_date) for _ in range(row_count)]
+                item = self.fixture.prepare(code, rows, report_date)
+                if qris:
+                    item["calculation"]["qris"] = [
+                        {"Disbursement Date": "2026-10-14", "Kredit": 100},
+                        {"Disbursement Date": "2026-10-15", "Kredit": 200},
+                    ]
+                    item["calculation_id"] = fingerprint({
+                        "generation_id": item["generation_id"], "config_id": item["config_id"],
+                        "rules_version": item["rules_version"], "calculation": item["calculation"],
+                    })
+                batch.append(item)
+                self.store.facts[(report_date, code)] = {
+                    "identity": item["identity"], "generation_id": item["generation_id"],
+                    "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                    "calculation": item["calculation"],
+                }
+            return batch
+
+        set_date(day, 3, qris=True)
+        inserted = self.publish_only(date_scoped=True, report_date=day,
+                                     refresh_request_id="independent-day-v1")
+        self.assertEqual(inserted["status"], "COMPLETE")
+        snapshot = self.store.publications[inserted["epoch"]]["snapshot"]["worksheets"]
+        summary = snapshot["summary"]["matrix"]
+        invoice = snapshot["invoice"]["matrix"]
+        self.assertEqual([item["report_date"] for item in summary["date_ranges"]],
+                         [self.config.first_report_date, day])
+        self.assertGreater(invoice["date_ranges"][1]["end_row"] -
+                           invoice["date_ranges"][1]["start_row"],
+                           old_invoice_range["end_row"] - old_invoice_range["start_row"])
+        self.assertEqual(self.adapters["summary"].values[old_row][old_column], 333)
+        target_range = summary["date_ranges"][1]
+        saldo_columns = [block["end_column"] - 1 for block in summary["blocks"]]
+        self.assertTrue(all(
+            all(row[column] == "" for column in saldo_columns)
+            for row in summary["values"][target_range["start_row"] - 1:target_range["end_row"]]
+        ))
+        self.assertGreater(snapshot["unusual"]["matrix"]["row_count"],
+                           before["unusual"]["matrix"]["row_count"])
+        target_input = next(item for item in summary["editable_inputs"] if item["report_date"] == day)
+        self.adapters["summary"].values[target_input["row"] - 1][target_input["column"] - 1] = 777
+
+        middle_day = "2026-10-14"
+        set_date(middle_day, 1)
+        middle = self.publish_only(date_scoped=True, report_date=middle_day,
+                                   refresh_request_id="independent-day-middle")
+        middle_snapshot = self.store.publications[middle["epoch"]]["snapshot"]["worksheets"]
+        self.assertEqual([item["report_date"] for item in
+                          middle_snapshot["summary"]["matrix"]["date_ranges"]],
+                         [self.config.first_report_date, middle_day, day])
+        moved_input = next(item for item in middle_snapshot["summary"]["matrix"]["editable_inputs"]
+                           if item["report_date"] == day)
+        self.assertEqual(self.adapters["summary"].values[moved_input["row"] - 1]
+                         [moved_input["column"] - 1], 777)
+
+        set_date(day, 1)
+        replaced = self.publish_only(date_scoped=True, report_date=day,
+                                     refresh_request_id="independent-day-v2")
+        self.assertEqual(replaced["status"], "COMPLETE")
+        snapshot = self.store.publications[replaced["epoch"]]["snapshot"]["worksheets"]
+        summary = snapshot["summary"]["matrix"]
+        invoice = snapshot["invoice"]["matrix"]
+        new_old_date = summary["date_ranges"][0]
+        self.assertEqual(summary["values"][new_old_date["start_row"] - 1:
+                                             new_old_date["end_row"]],
+                         [[*row[:old_column], 333, *row[old_column + 1:]]
+                          if index == old_row - (old_date["start_row"] - 1) else row
+                          for index, row in enumerate(old_summary["values"][
+                              old_date["start_row"] - 1:old_date["end_row"]])])
+        target_input = next(item for item in summary["editable_inputs"] if item["report_date"] == day)
+        self.assertEqual(self.adapters["summary"].values[target_input["row"] - 1][target_input["column"] - 1], 777)
+        self.assertEqual(invoice["values"][invoice["date_ranges"][0]["start_row"] - 1:
+                                            invoice["date_ranges"][0]["end_row"]], old_invoice_rows)
+        self.assertEqual([item["report_date"] for item in invoice["date_ranges"]],
+                         [self.config.first_report_date, middle_day, day])
+        middle_day_invoice = next(item for item in invoice["date_ranges"]
+                                  if item["report_date"] == middle_day)
+        final_day_invoice = next(item for item in invoice["date_ranges"]
+                                 if item["report_date"] == day)
+        original_day_invoice = next(item for item in middle_snapshot["invoice"]["matrix"]["date_ranges"]
+                                    if item["report_date"] == day)
+        self.assertLess(final_day_invoice["end_row"] - final_day_invoice["start_row"],
+                        original_day_invoice["end_row"] - original_day_invoice["start_row"])
+        self.assertGreater(middle_day_invoice["end_row"], middle_day_invoice["start_row"])
+        self.assertEqual(snapshot["unusual"]["matrix"]["row_count"],
+                         before["unusual"]["matrix"]["row_count"])
+
+    def test_row_shrink_fails_before_mutation_when_deleted_row_has_extra_data(self):
+        from finpay_pipeline.cell_publication_v2 import GUARD_PREFIX
+
+        day = "2026-10-15"
+        self.publish()
+
+        def set_source(count):
+            for code in self.config.cell_codes:
+                item = self.fixture.prepare(code,
+                    [self.fixture.row(day=day) for _ in range(count)], day)
+                self.store.facts[(day, code)] = {
+                    "identity": item["identity"], "generation_id": item["generation_id"],
+                    "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                    "calculation": item["calculation"],
+                }
+
+        set_source(3)
+        inserted = self.publish_only(date_scoped=True, report_date=day,
+                                     refresh_request_id="unusual-block-growth")
+        matrix = self.store.publications[inserted["epoch"]]["snapshot"]["worksheets"]["unusual"]["matrix"]
+        area = next(item for item in matrix["date_ranges"] if item["report_date"] == day)
+        row_index = area["start_row"] - 1
+        width = len(matrix["values"][0])
+        adapter = self.adapters["unusual"]
+        extra_value = "=1+1"
+        adapter.values[row_index].extend([""] * max(0, width + 2 - len(adapter.values[row_index])))
+        adapter.values[row_index][width + 1] = extra_value
+        rows_before = copy.deepcopy(adapter.values)
+        row_mutations_before = list(self.store.row_mutations)
+
+        set_source(1)
+        with self.assertRaisesRegex(ValueError, "outside the saved matrix width"):
+            self.publish_only(date_scoped=True, report_date=day,
+                              refresh_request_id="unusual-block-shrink")
+        self.assertEqual(self.store.row_mutations, row_mutations_before)
+        self.assertEqual(adapter.values, rows_before)
+        self.assertEqual(adapter.values[row_index][width + 1], extra_value)
+        self.assertEqual(max(self.store.publications), inserted["epoch"])
+        self.assertFalse(any(item.get("description", "").startswith(GUARD_PREFIX)
+                             for item in adapter.protections))
+
     def test_four_output_tabs_share_one_complete_epoch_and_cell_data(self):
         result = self.publish()
         self.assertEqual(result["status"], "COMPLETE")
@@ -512,6 +818,140 @@ class CellPublicationV2Tests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(self.store.events.count("sheets:summary"), writes)
         self.assertEqual(self.store.operation, "IDLE")
+        self.assertNotIn("refresh_request_id", self.store.publications[1]["snapshot"])
+
+    def test_distinct_refresh_ids_force_four_tab_rewrite_and_preserve_manual_inputs(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        first = self.publish_only(refresh_request_id="execution-1")
+        editable = self.store.publications[first["epoch"]]["snapshot"]["worksheets"]["summary"]["matrix"]["editable_inputs"][0]
+        row, column = editable["row"] - 1, editable["column"] - 1
+        self.adapters["summary"].values[row][column] = 333
+        prior_body_writes = {role: self.store.events.count("sheets:" + role) for role in self.adapters}
+        prior_mutations = self.store.sheet_mutations
+        start = len(self.store.events)
+
+        second = self.publish_only(refresh_request_id="execution-2")
+
+        self.assertEqual((first["epoch"], second["epoch"]), (1, 2))
+        self.assertEqual(self.store.publications[2]["snapshot"]["refresh_request_id"], "execution-2")
+        self.assertGreater(self.store.sheet_mutations, prior_mutations)
+        for role in self.adapters:
+            self.assertGreater(self.store.events.count("sheets:" + role), prior_body_writes[role])
+        self.assertEqual(self.adapters["summary"].values[row][column], 333)
+        self.assertNotIn("manual_audit", self.store.events[start:])
+
+    def test_same_refresh_id_retry_returns_complete_without_any_sheet_mutation(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        first = self.publish_only(refresh_request_id="execution-1")
+        prior_mutations = self.store.sheet_mutations
+        prior_epochs = len(self.store.publications)
+        prior_events = list(self.store.events)
+
+        retry = self.publish_only(refresh_request_id="execution-1")
+
+        self.assertEqual(retry, first)
+        self.assertEqual(self.store.sheet_mutations, prior_mutations)
+        self.assertEqual(len(self.store.publications), prior_epochs)
+        self.assertEqual(self.store.events, prior_events)
+
+    def test_same_refresh_id_retry_rejects_changed_report_body(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        self.publish_only(refresh_request_id="execution-1")
+        self.adapters["invoice"].values[0][0] = "changed report heading"
+        prior_mutations = self.store.sheet_mutations
+        with self.assertRaisesRegex(ValueError, "differs from its committed publication"):
+            self.publish_only(refresh_request_id="execution-1")
+        self.assertEqual(self.store.sheet_mutations, prior_mutations)
+
+    def test_same_refresh_id_retry_rejects_stale_values_outside_report(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        self.publish_only(refresh_request_id="execution-1")
+        self.adapters["invoice"].values.append(["stale tail"])
+        prior_mutations = self.store.sheet_mutations
+        with self.assertRaisesRegex(ValueError, "outside the committed report"):
+            self.publish_only(refresh_request_id="execution-1")
+        self.assertEqual(self.store.sheet_mutations, prior_mutations)
+
+    def test_old_refresh_id_is_rejected_after_a_newer_publication_without_mutation(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        self.publish_only(refresh_request_id="execution-old")
+        self.publish_only(refresh_request_id="execution-new")
+        prior_mutations = self.store.sheet_mutations
+        prior_epochs = len(self.store.publications)
+
+        with self.assertRaisesRegex(ValueError, "latest COMPLETE publication"):
+            self.publish_only(refresh_request_id="execution-old")
+
+        self.assertEqual(self.store.sheet_mutations, prior_mutations)
+        self.assertEqual(len(self.store.publications), prior_epochs)
+
+    def test_refresh_id_retry_rejects_changed_source_calculation_history(self):
+        self.store.facts = {
+            (item["report_date"], item["identity"]["cell_code"]): item
+            for item in self.batch
+        }
+        for code in self.config.cell_codes:
+            item = self.fixture.prepare(code, [self.fixture.row(day="2026-10-14")], day="2026-10-14")
+            self.store.facts[(item["report_date"], code)] = item
+        self.publish_only(refresh_request_id="execution-1")
+        self.store.facts[("2026-10-14", self.config.cell_codes[0])]["calculation_id"] += "-changed"
+        prior_mutations = self.store.sheet_mutations
+        prior_epochs = len(self.store.publications)
+
+        with self.assertRaisesRegex(ValueError, "changed source-calculation history"):
+            self.publish_only(refresh_request_id="execution-1")
+
+        self.assertEqual(self.store.sheet_mutations, prior_mutations)
+        self.assertEqual(len(self.store.publications), prior_epochs)
+
+    def test_refresh_id_retries_do_not_bypass_ambiguous_publication_states(self):
+        for status in ("PENDING", "IN_FLIGHT", "UNKNOWN"):
+            with self.subTest(status=status):
+                self.setUp()
+                self.store.facts = {
+                    (item["report_date"], item["identity"]["cell_code"]): item
+                    for item in self.batch
+                }
+                self.store.publications[1] = {
+                    "snapshot": {"refresh_request_id": "execution-1"},
+                    "status": status, "fingerprint": "synthetic-ambiguous",
+                }
+                prior_mutations = self.store.sheet_mutations
+
+                with self.assertRaisesRegex(RuntimeError, "unresolved publication state"):
+                    self.publish_only(refresh_request_id="execution-1")
+
+                self.assertEqual(self.store.sheet_mutations, prior_mutations)
+                self.assertEqual(len(self.store.publications), 1)
+
+    def test_refresh_request_id_validation_fails_before_preflight_or_mutation(self):
+        for request_id in ("", "a" * 129, "has whitespace", "unsafe/character", "snowman-\u2603", False):
+            with self.subTest(request_id=request_id):
+                prior_mutations = self.store.sheet_mutations
+                with self.assertRaisesRegex(ValueError, "refresh request ID"):
+                    self.publish_only(refresh_request_id=request_id)
+                self.assertEqual(self.store.sheet_mutations, prior_mutations)
+
+    def test_refresh_request_id_requires_already_persisted_history(self):
+        with self.assertRaisesRegex(ValueError, "requires committed publication-only history"):
+            self.publish(refresh_request_id="execution-1")
+        self.assertFalse(self.store.facts)
+        self.assertEqual(self.store.sheet_mutations, 0)
 
     def test_publication_of_new_artifact_with_unchanged_rows_preserves_bank_inputs(self):
         from finpay_pipeline.cell_contracts import CellIdentity

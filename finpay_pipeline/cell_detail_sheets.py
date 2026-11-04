@@ -202,8 +202,12 @@ def detail_format_requests(sheet_id: int, matrix: dict) -> list[dict]:
     ]
     # Explicit stripes are observable in effectiveFormat, unlike banding overlays.
     for row in range(1, height):
+        stripes = matrix.get("row_stripes", [])
+        stripe = stripes[row] if len(stripes) == height else None
+        background = white if stripe == "white" else light_blue if stripe == "stripe" else (
+            white if row % 2 else light_blue)
         requests.append({"repeatCell": {"range": grid(row, row + 1, 0, width),
-            "cell": {"userEnteredFormat": {"backgroundColor": white if row % 2 else light_blue}},
+            "cell": {"userEnteredFormat": {"backgroundColor": background}},
             "fields": "userEnteredFormat.backgroundColor"}})
     widths = {
         "REPORT DATE": 110, "CELL": 70 if matrix.get("layout_version") == 3 else 50, "NO": 70, "TRANSACTION DATE": 165,

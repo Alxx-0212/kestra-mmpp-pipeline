@@ -13,6 +13,7 @@ if __package__:
         fingerprint, parse_cell_amount, read_bounded_bytes, roster_fingerprint,
         sha256_file_bounded, validate_complete_manifest, validate_source_entry,
     )
+    from .cell_progress import Progress
     from .digipos_scraper import (
         BASE_URL, ENDPOINT_PATH, MAX_TABLE_ROWS,
         _read_xlsx_rows, _replace_datatables_length, _set_search_filters,
@@ -24,6 +25,7 @@ else:
         fingerprint, parse_cell_amount, read_bounded_bytes, roster_fingerprint,
         sha256_file_bounded, validate_complete_manifest, validate_source_entry,
     )
+    from cell_progress import Progress
     from digipos_scraper import (
         BASE_URL, ENDPOINT_PATH, MAX_TABLE_ROWS,
         _read_xlsx_rows, _replace_datatables_length, _set_search_filters,
@@ -177,77 +179,100 @@ def _download_cell(
     browser, identity, report_date, password, directory,
     googleapis_compatibility, expected_parentcodes,
 ):
-    context = browser.new_context(service_workers="block", accept_downloads=True)
-    try:
-        page = context.new_page()
-        if googleapis_compatibility:
-            _install_compatibility(page)
-        page.goto(BASE_URL + "/login", wait_until="domcontentloaded", timeout=90_000)
-        page.locator("#username").fill(identity.account)
-        page.locator("#password").fill(password)
-        page.evaluate("$('button:contains(\"Sign in\")').trigger('click')")
-        page.wait_for_url("**/home", timeout=30_000)
-        page.goto(BASE_URL + "/deposit/monitoring-riwayat", wait_until="domcontentloaded")
-        page.wait_for_function(
-            "() => typeof $ !== 'undefined' && $.fn.DataTable.isDataTable('#dataInput')"
-        )
-        options = page.evaluate(
-            "() => Array.from(document.querySelector('#parentPhoneNo_pick').options).map(o => o.value)"
-        )
-        concrete = sorted(v for v in options if v != identity.cluster_id)
-        if concrete != expected_parentcodes:
-            raise ValueError("live cell roster differs from configured roster")
-        _set_search_filters(page, business_date(report_date))
-        if identity.parentcode not in options:
-            raise ValueError("configured cell option missing")
-        selected = page.evaluate(
-            "v => { $('#parentPhoneNo_pick').val(v).trigger('change'); return $('#parentPhoneNo').val(); }",
-            identity.parentcode,
-        )
-        if selected != identity.parentcode:
-            raise ValueError("cell selection did not stick")
-        payload, request = _exchange(page, identity, report_date)
-        # Validate business success before waiting for an overlay caused by error.
-        if "statusCode" in payload and str(payload["statusCode"]) != "00":
-            raise ValueError("DigiPOS business response was not successful")
-        page.wait_for_function(
-            """() => !$('#loadingDialog').is(':visible') && !$('#modal-gagal').is(':visible')
-                && /of\\s+[\\d,]+\\s+entries/.test($('#dataInput_info').text())""",
-            timeout=180_000,
-        )
-        footer = parse_datatable_total(page.locator("#dataInput_info").inner_text())
-        validate_cell_payload(payload, request, footer, full=False)
-        result = {
-            **identity.to_dict(), "report_date": report_date,
-            "footer_total": footer, "validated_rows": footer,
-            "discovered_parentcodes": concrete,
-            "artifact": None, "source_sha256": None,
-            "status": "empty" if footer == 0 else "validated",
-        }
-        if footer == 0:
-            result["source_sha256"] = fingerprint({
-                **identity.to_dict(), "report_date": report_date, "data": [],
-            })
-            return result
-        payload, request = _exchange(page, identity, report_date, full_length=footer)
-        raw_rows = validate_cell_payload(payload, request, footer, full=True)
-        if any(not isinstance(row.get("wstransferid"), str) for row in raw_rows):
-            raise ValueError("transaction identifiers must be exact source text")
-        rows = [cell_row_to_cells(row, index) for index, row in enumerate(raw_rows, 1)]
-        name = f"{identity.account}-{identity.cell_code}.xlsx"
-        final = directory / name
-        pending = directory / ("." + name)
+    with Progress(
+        "cell_download", total=1, cluster_id=identity.cluster_id,
+        report_date=report_date, account=identity.account,
+        cell_code=identity.cell_code, role="download",
+    ) as progress:
+        progress.update("browser_session_start")
+        context = browser.new_context(service_workers="block", accept_downloads=True)
         try:
-            _write_xhr_export(pending, rows)
-            digest = sha256_file_bounded(pending, MAX_CELL_ARTIFACT_BYTES)
-            validate_export_rows(_read_xlsx_rows(pending), report_date, footer)
-            os.replace(pending, final)
+            page = context.new_page()
+            if googleapis_compatibility:
+                _install_compatibility(page)
+            progress.update("login_start")
+            page.goto(BASE_URL + "/login", wait_until="domcontentloaded", timeout=90_000)
+            page.locator("#username").fill(identity.account)
+            page.locator("#password").fill(password)
+            page.evaluate("$('button:contains(\"Sign in\")').trigger('click')")
+            page.wait_for_url("**/home", timeout=30_000)
+            progress.update("login_complete")
+
+            progress.update("monitoring_page_open_start")
+            page.goto(BASE_URL + "/deposit/monitoring-riwayat", wait_until="domcontentloaded")
+            page.wait_for_function(
+                "() => typeof $ !== 'undefined' && $.fn.DataTable.isDataTable('#dataInput')"
+            )
+            options = page.evaluate(
+                "() => Array.from(document.querySelector('#parentPhoneNo_pick').options).map(o => o.value)"
+            )
+            concrete = sorted(v for v in options if v != identity.cluster_id)
+            if concrete != expected_parentcodes:
+                raise ValueError("live cell roster differs from configured roster")
+            progress.update("cell_roster_verified", count=len(concrete))
+
+            _set_search_filters(page, business_date(report_date))
+            if identity.parentcode not in options:
+                raise ValueError("configured cell option missing")
+            selected = page.evaluate(
+                "v => { $('#parentPhoneNo_pick').val(v).trigger('change'); return $('#parentPhoneNo').val(); }",
+                identity.parentcode,
+            )
+            if selected != identity.parentcode:
+                raise ValueError("cell selection did not stick")
+            progress.update("search_request_start")
+            payload, request = _exchange(page, identity, report_date)
+            progress.update("search_response_received")
+            # Validate business success before waiting for an overlay caused by error.
+            if "statusCode" in payload and str(payload["statusCode"]) != "00":
+                raise ValueError("DigiPOS business response was not successful")
+            progress.update("table_settle_wait_start")
+            page.wait_for_function(
+                """() => !$('#loadingDialog').is(':visible') && !$('#modal-gagal').is(':visible')
+                    && /of\\s+[\\d,]+\\s+entries/.test($('#dataInput_info').text())""",
+                timeout=180_000,
+            )
+            footer = parse_datatable_total(page.locator("#dataInput_info").inner_text())
+            validate_cell_payload(payload, request, footer, full=False)
+            progress.update("table_settled", rows=footer)
+            result = {
+                **identity.to_dict(), "report_date": report_date,
+                "footer_total": footer, "validated_rows": footer,
+                "discovered_parentcodes": concrete,
+                "artifact": None, "source_sha256": None,
+                "status": "empty" if footer == 0 else "validated",
+            }
+            if footer == 0:
+                result["source_sha256"] = fingerprint({
+                    **identity.to_dict(), "report_date": report_date, "data": [],
+                })
+                progress.update("empty_cell_confirmed", rows=0)
+                return result
+
+            progress.update("full_export_request_start", rows=footer)
+            payload, request = _exchange(page, identity, report_date, full_length=footer)
+            raw_rows = validate_cell_payload(payload, request, footer, full=True)
+            if any(not isinstance(row.get("wstransferid"), str) for row in raw_rows):
+                raise ValueError("transaction identifiers must be exact source text")
+            progress.update("full_export_rows_received", rows=len(raw_rows))
+            rows = [cell_row_to_cells(row, index) for index, row in enumerate(raw_rows, 1)]
+            name = f"{identity.account}-{identity.cell_code}.xlsx"
+            final = directory / name
+            pending = directory / ("." + name)
+            try:
+                progress.update("xlsx_write_start", rows=len(rows))
+                _write_xhr_export(pending, rows)
+                digest = sha256_file_bounded(pending, MAX_CELL_ARTIFACT_BYTES)
+                validate_export_rows(_read_xlsx_rows(pending), report_date, footer)
+                progress.update("xlsx_validated", rows=len(rows), bytes=pending.stat().st_size)
+                os.replace(pending, final)
+            finally:
+                pending.unlink(missing_ok=True)
+            result.update(artifact=name, source_sha256=digest)
+            progress.update("cell_source_ready", rows=len(rows), bytes=final.stat().st_size)
+            return result
         finally:
-            pending.unlink(missing_ok=True)
-        result.update(artifact=name, source_sha256=digest)
-        return result
-    finally:
-        context.close()
+            context.close()
 
 
 def _resume_entry(entry, identity, report_date, directory):
@@ -279,59 +304,91 @@ def scrape_cell_roster(
     business_date(report_date)
     if not password or type(max_attempts) is not int or max_attempts < 1:
         raise ValueError("password and positive max_attempts are required")
-    directory = Path(output_dir) / report_date
-    directory.mkdir(parents=True, exist_ok=True)
-    state_path = directory / "cell_acquisition_state.json"
-    result = {
-        "schema_version": CELL_SCHEMA_VERSION, "report_date": report_date,
-        "roster_fingerprint": roster_fingerprint(cells), "cells": [],
-    }
-    if state_path.is_file():
-        previous = json.loads(read_bounded_bytes(state_path, 2 * 1024 * 1024))
-        if any(previous.get(key) != result[key] for key in result if key != "cells"):
-            raise ValueError("partial acquisition identity mismatch")
-        result["cells"] = previous["cells"]
-    from playwright.sync_api import sync_playwright
+    with Progress(
+        "cell_roster_acquisition", total=len(cells), report_date=report_date,
+        heartbeat_interval=None,
+    ) as progress:
+        directory = Path(output_dir) / report_date
+        directory.mkdir(parents=True, exist_ok=True)
+        state_path = directory / "cell_acquisition_state.json"
+        result = {
+            "schema_version": CELL_SCHEMA_VERSION, "report_date": report_date,
+            "roster_fingerprint": roster_fingerprint(cells), "cells": [],
+        }
+        if state_path.is_file():
+            previous = json.loads(read_bounded_bytes(state_path, 2 * 1024 * 1024))
+            if any(previous.get(key) != result[key] for key in result if key != "cells"):
+                raise ValueError("partial acquisition identity mismatch")
+            result["cells"] = previous["cells"]
+        from playwright.sync_api import sync_playwright
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        try:
-            for identity in cells:
-                existing = [item for item in result["cells"] if
-                            (item["account"], item["cell_code"]) == (identity.account, identity.cell_code)]
-                if existing:
-                    if len(existing) != 1:
-                        raise ValueError("duplicate partial acquisition entry")
-                    try:
-                        _resume_entry(existing[0], identity, report_date, directory)
-                    except Exception:
-                        # The cached evidence is unusable. Reacquire this cell,
-                        # while retaining checksum-validated peer artifacts.
-                        result["cells"].remove(existing[0])
-                    else:
-                        continue
-                for attempt in range(1, max_attempts + 1):
-                    try:
-                        expected = sorted(cell.parentcode for cell in cells if cell.account == identity.account)
-                        entry = _download_cell(
-                            browser, identity, report_date, password, directory,
-                            googleapis_compatibility, expected,
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                completed = 0
+                for identity in cells:
+                    existing = [item for item in result["cells"] if
+                                (item["account"], item["cell_code"]) == (identity.account, identity.cell_code)]
+                    if existing:
+                        if len(existing) != 1:
+                            raise ValueError("duplicate partial acquisition entry")
+                        try:
+                            _resume_entry(existing[0], identity, report_date, directory)
+                        except Exception:
+                            # The cached evidence is unusable. Reacquire this cell,
+                            # while retaining checksum-validated peer artifacts.
+                            result["cells"].remove(existing[0])
+                        else:
+                            completed += 1
+                            progress.update(
+                                "cell_resumed", completed=completed,
+                                account=identity.account, cell_code=identity.cell_code,
+                                rows=existing[0]["validated_rows"],
+                            )
+                            continue
+                    for attempt in range(1, max_attempts + 1):
+                        progress.update(
+                            "cell_attempt_started", completed=completed,
+                            account=identity.account, cell_code=identity.cell_code,
+                            attempt=attempt,
                         )
-                        if entry["discovered_parentcodes"] != expected:
-                            raise ValueError("live cell roster differs from configured roster")
-                        validate_source_entry(entry, identity, report_date)
-                        result["cells"].append(entry)
-                        pending = state_path.with_suffix(".pending.json")
-                        pending.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
-                        os.replace(pending, state_path)
-                        break
-                    except Exception as exc:
-                        if attempt == max_attempts:
-                            raise RuntimeError(
-                                f"cell {identity.account}/{identity.cell_code} acquisition failed: "
-                                f"{type(exc).__name__}"
-                            ) from None
-        finally:
-            browser.close()
-    validate_complete_manifest(result, cells)
-    return result
+                        try:
+                            expected = sorted(cell.parentcode for cell in cells if cell.account == identity.account)
+                            entry = _download_cell(
+                                browser, identity, report_date, password, directory,
+                                googleapis_compatibility, expected,
+                            )
+                            if entry["discovered_parentcodes"] != expected:
+                                raise ValueError("live cell roster differs from configured roster")
+                            validate_source_entry(entry, identity, report_date)
+                            result["cells"].append(entry)
+                            pending = state_path.with_suffix(".pending.json")
+                            pending.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+                            os.replace(pending, state_path)
+                            completed += 1
+                            progress.update(
+                                "cell_complete", completed=completed,
+                                account=identity.account, cell_code=identity.cell_code,
+                                attempt=attempt, rows=entry["validated_rows"],
+                            )
+                            break
+                        except Exception as exc:
+                            if attempt == max_attempts:
+                                progress.update(
+                                    "cell_attempt_failed", completed=completed,
+                                    account=identity.account, cell_code=identity.cell_code,
+                                    attempt=attempt,
+                                )
+                                raise RuntimeError(
+                                    f"cell {identity.account}/{identity.cell_code} acquisition failed: "
+                                    f"{type(exc).__name__}"
+                                ) from None
+                            progress.update(
+                                "cell_retry", completed=completed,
+                                account=identity.account, cell_code=identity.cell_code,
+                                attempt=attempt,
+                            )
+            finally:
+                browser.close()
+        validate_complete_manifest(result, cells)
+        return result

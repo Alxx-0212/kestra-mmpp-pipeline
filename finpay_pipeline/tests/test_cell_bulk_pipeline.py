@@ -306,11 +306,70 @@ class CellBulkPipelineTests(unittest.TestCase):
                 for name in old.namelist():
                     if name != "index.json":
                         new.writestr(name, old.read(name))
-            with self.assertRaisesRegex(ValueError, "member size/checksum mismatch"):
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                 preprocess_cell_range(
                     str(rewritten), hashlib.sha256(rewritten.read_bytes()).hexdigest(),
                     START, END, CLUSTER, str(root / "wrong-member-prepared.zip"),
                 )
+
+            with zipfile.ZipFile(source) as archive:
+                index = json.loads(archive.read("index.json"))
+                info = archive.getinfo(index["entries"][0]["path"])
+                offset = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+            corrupted = bytearray(source.read_bytes())
+            corrupted[offset] ^= 1
+            source.write_bytes(corrupted)
+            with self.assertRaises(zipfile.BadZipFile):
+                preprocess_cell_range(
+                    str(source), hashlib.sha256(corrupted).hexdigest(),
+                    START, END, CLUSTER, str(root / "corrupt-crc-prepared.zip"),
+                )
+
+    def test_bulk_archive_parses_the_verified_snapshot_if_path_is_replaced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, source_sha = _write_source_bulk(Path(temporary))
+            real_zip_file = zipfile.ZipFile
+
+            def replace_path_before_open(file, *args, **kwargs):
+                source.write_bytes(b"replacement after verification")
+                return real_zip_file(file, *args, **kwargs)
+
+            with patch.object(bulk_pipeline.zipfile, "ZipFile", side_effect=replace_path_before_open):
+                with bulk_pipeline._open_bulk_zip(source, source_sha, "source") as (_, _, start, end, clusters, _):
+                    self.assertEqual((start, end, clusters), (START, END, [CLUSTER]))
+            self.assertEqual(source.read_bytes(), b"replacement after verification")
+
+    def test_prepared_and_handoff_members_are_checked_before_clients_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, prepared_path, _ = self._preprocess(root)
+            handoff_path, _ = _make_handoff_bundle(root, [CLUSTER])
+
+            def corrupt_member_checksum(path):
+                with zipfile.ZipFile(path) as source:
+                    files = {name: source.read(name) for name in source.namelist()}
+                index = json.loads(files["index.json"])
+                index["entries"][0]["sha256"] = "0" * 64
+                files["index.json"] = json.dumps(index, sort_keys=True).encode()
+                with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as destination:
+                    for name, content in files.items():
+                        destination.writestr(name, content)
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+
+            database_factory, sheet_factory = Mock(), Mock()
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                persist_cell_range(
+                    str(prepared_path), corrupt_member_checksum(prepared_path),
+                    database_password="synthetic", target=TARGET, session_factory=database_factory,
+                )
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                publish_cell_range(
+                    str(handoff_path), corrupt_member_checksum(handoff_path),
+                    database_password="synthetic", credentials_info={"client_email": "writer@example.test"},
+                    target=TARGET, session_factory=database_factory, sheet_client_factory=sheet_factory,
+                )
+            database_factory.assert_not_called()
+            sheet_factory.assert_not_called()
 
     def test_range_commit_rebinds_config_and_emits_full_history_handoff(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -342,6 +401,29 @@ class CellBulkPipelineTests(unittest.TestCase):
             self.assertEqual(handoff["last_report_date"], END)
             self.assertEqual(len(handoff["selected"]), 4)
             self.assertEqual(result["committed_clusters"], 1)
+
+    def test_replaying_same_prepared_bundle_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, prepared_path, prepared = self._preprocess(root)
+            store = MemoryCellStore()
+            first_handoff = root / "first-handoff.zip"
+            second_handoff = root / "second-handoff.zip"
+
+            self._persist(prepared_path, prepared, store, output_path=first_handoff)
+            original_facts = deepcopy(store.facts)
+            original_sources = deepcopy(store.sources)
+            original_configurations = deepcopy(store.configurations)
+            original_dirty = set(store.dirty)
+
+            result = self._persist(prepared_path, prepared, store, output_path=second_handoff)
+
+            self.assertEqual(store.facts, original_facts)
+            self.assertEqual(store.sources, original_sources)
+            self.assertEqual(store.configurations, original_configurations)
+            self.assertEqual(store.dirty, original_dirty)
+            self.assertEqual(result["status"], "PERSISTED")
+            self.assertTrue(second_handoff.exists())
 
     def test_all_date_cohorts_rollback_together_when_one_commit_fails(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -459,14 +541,18 @@ class CellBulkPipelineTests(unittest.TestCase):
             database_factory.assert_not_called()
             sheet_factory.assert_not_called()
 
-    def test_publisher_runs_once_per_cluster_and_forwards_sheet_factory(self):
+    def test_publisher_runs_once_per_cluster_and_shares_the_paced_sheet_client(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             handoffs, digest = _make_handoff_bundle(root)
             sheet_factory = Mock()
             database_factory = Mock()
+            clients = []
 
             def fake_publish(path, sha256, **kwargs):
+                clients.append(kwargs["sheet_client_factory"](
+                    kwargs["credentials_info"], include_drive_file=True,
+                ))
                 return {"status": "COMPLETE", "cluster_id": kwargs["cluster_id"]}
 
             with patch.object(bulk_pipeline, "validate_cell_bulk_sheet_range"), \
@@ -479,13 +565,21 @@ class CellBulkPipelineTests(unittest.TestCase):
                     str(handoffs), digest, database_password="synthetic",
                     credentials_info={"client_email": "writer@example.test"}, target=TARGET,
                     session_factory=database_factory, sheet_client_factory=sheet_factory,
+                    refresh_request_id="execution-123",
                 )
             clusters = list(selected_clusters("ALL"))
             self.assertEqual([call.kwargs["cluster_id"] for call in publish.call_args_list], clusters)
+            self.assertTrue(all(call.kwargs["refresh_request_id"] == "execution-123"
+                                for call in publish.call_args_list))
             self.assertTrue(all(
-                call.kwargs["sheet_client_factory"] is sheet_factory
+                call.kwargs["sheet_client_factory"] is publish.call_args_list[0].kwargs["sheet_client_factory"]
                 for call in publish.call_args_list
             ))
+            sheet_factory.assert_called_once_with(
+                {"client_email": "writer@example.test"}, include_drive_file=True,
+            )
+            self.assertEqual(len(clients), len(clusters))
+            self.assertTrue(all(client is sheet_factory.return_value for client in clients))
             self.assertEqual(result["status"], "COMPLETE")
             self.assertEqual(len(result["publications"]), len(clusters))
 
@@ -539,8 +633,8 @@ class CellBulkPipelineTests(unittest.TestCase):
         workflow = Path(__file__).parents[1] / "workflows" / "finpay_cell_bulk_v1.yml"
         text = workflow.read_text(encoding="utf-8")
         ids = (
-            "preflight_cell_bulk_targets", "acquire_cell_bulk", "preprocess_cell_bulk",
-            "persist_cell_bulk", "publish_cell_bulk",
+            "preflight_cell_bulk_targets", "preflight_cell_database", "acquire_cell_bulk",
+            "preprocess_cell_bulk", "persist_cell_bulk", "publish_cell_bulk",
         )
         positions = [text.index(f"- id: {task_id}") for task_id in ids]
         self.assertEqual(positions, sorted(positions))
@@ -560,9 +654,36 @@ class CellBulkPipelineTests(unittest.TestCase):
                 current = None
         if current is not None:
             scripts.append("\n".join(current))
-        self.assertEqual(len(scripts), 6)
+        self.assertEqual(len(scripts), 7)
         for index, script in enumerate(scripts, 1):
             compile(script, f"finpay_cell_bulk_v1.yml:script-{index}", "exec")
+
+        retry_block = (
+            "    retry:\n"
+            "      type: exponential\n"
+            "      interval: PT15S\n"
+            "      maxInterval: PT60S\n"
+            "      maxAttempts: 3\n"
+        )
+        persist = text.split("  - id: persist_cell_bulk\n", 1)[1].split(
+            "  - id: publish_cell_bulk\n", 1,
+        )[0]
+        publish = text.split("  - id: publish_cell_bulk\n", 1)[1]
+        self.assertIn(retry_block, persist)
+        self.assertIn(retry_block, publish)
+
+    def test_bulk_reporting_tasks_explicitly_select_the_configured_network(self):
+        workflow = Path(__file__).parents[1] / "workflows" / "finpay_cell_bulk_v1.yml"
+        text = workflow.read_text(encoding="utf-8")
+        self.assertIn('  cell_reporting_network: "bridge"', text)
+        for task_id in (
+            "preflight_cell_bulk_targets", "preflight_cell_database",
+            "preprocess_cell_bulk", "persist_cell_bulk", "publish_cell_bulk",
+        ):
+            task = text.split(f"  - id: {task_id}\n", 1)[1].split("\n  - id:", 1)[0]
+            self.assertIn('      networkMode: "{{ vars.cell_reporting_network }}"', task)
+        acquire = text.split("  - id: acquire_cell_bulk\n", 1)[1].split("\n  - id:", 1)[0]
+        self.assertIn("      networkMode: host", acquire)
 
 
 if __name__ == "__main__":

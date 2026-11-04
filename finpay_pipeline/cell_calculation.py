@@ -256,12 +256,20 @@ def mandiri_measures(measures: dict, report_date: str) -> list[dict]:
     return rows
 
 
-def build_cluster_report(config: CellReportConfig, cell_days: list[dict], through_date: str) -> dict:
+def build_cluster_report(config: CellReportConfig, cell_days: list[dict], through_date: str, *,
+                         first_report_date: str | None = None,
+                         calculate_saldo: bool = True) -> dict:
     """Produce a contiguous cell/combined report with no DB or Google calls."""
     configuration = config.to_dict()
-    first, last = business_date(config.first_report_date), business_date(through_date)
-    if last < first:
+    boundary = business_date(config.first_report_date)
+    first = business_date(first_report_date or config.first_report_date)
+    last = business_date(through_date)
+    if type(calculate_saldo) is not bool:
+        raise ValueError("calculate_saldo must be an explicit boolean")
+    if first < boundary:
         raise ValueError("report range is before balance boundary")
+    if last < first:
+        raise ValueError("report through_date is before first_report_date")
     facts = {}
     known = {cell.cell_code for cell in config.cells}
     for item in cell_days:
@@ -283,7 +291,7 @@ def build_cluster_report(config: CellReportConfig, cell_days: list[dict], throug
         if not first <= business_date(item["report_date"]) <= last:
             raise ValueError("report facts outside requested coverage")
         facts[key] = item
-    balances = config.opening_balances.copy()
+    balances = config.opening_balances.copy() if calculate_saldo else {}
     output = []
     day = first
     while day <= last:
@@ -295,10 +303,11 @@ def build_cluster_report(config: CellReportConfig, cell_days: list[dict], throug
         for code in sorted(known):
             fact = facts[(date_string, code)]
             values = category_measures(fact["calculation"]["summary"])
-            opening = balances[code]
-            for _, key in detail_categories(date_string):
-                measure = values.get(key, {})
-                balances[code] += measure.get("debet", 0) - measure.get("kredit", 0)
+            opening = balances[code] if calculate_saldo else None
+            if calculate_saldo:
+                for _, key in detail_categories(date_string):
+                    measure = values.get(key, {})
+                    balances[code] += measure.get("debet", 0) - measure.get("kredit", 0)
             for key, measure in values.items():
                 combined.setdefault(key, {"debet": 0, "kredit": 0, "count": 0})
                 for field in ("debet", "kredit", "count"):
@@ -306,19 +315,23 @@ def build_cluster_report(config: CellReportConfig, cell_days: list[dict], throug
             cells.append({
                 "cell_code": code, "measures": values,
                 "mandiri": mandiri_measures(values, date_string),
-                "opening_saldo": opening, "closing_saldo": balances[code],
+                "opening_saldo": opening,
+                "closing_saldo": balances[code] if calculate_saldo else None,
                 "calculation_id": fact["calculation_id"], "generation_id": fact["generation_id"],
             })
         output.append({
             "report_date": date_string, "cells": cells,
             "combined": {
                 "measures": combined, "mandiri": mandiri_measures(combined, date_string),
-                "opening_saldo": sum(cell["opening_saldo"] for cell in cells),
-                "closing_saldo": sum(cell["closing_saldo"] for cell in cells),
+                "opening_saldo": (sum(cell["opening_saldo"] for cell in cells)
+                                  if calculate_saldo else None),
+                "closing_saldo": (sum(cell["closing_saldo"] for cell in cells)
+                                  if calculate_saldo else None),
             },
         })
         day += timedelta(days=1)
-    return {"configuration": configuration, "through_date": through_date, "days": output}
+    return {"configuration": configuration, "first_report_date": first.isoformat(),
+            "through_date": through_date, "balance_available": calculate_saldo, "days": output}
 
 
 def affected_publication_range(first_date: str, changed_dates: list[str], latest_date: str) -> tuple[str, str]:

@@ -392,9 +392,17 @@ def render_flow():
         return "  - id: " + identifier + "\n" + body
 
     header, task_source = text.split("\ntasks:\n", 1)
+    task_source, terminal_separator, terminal_source = task_source.partition("\nafterExecution:\n")
+    if terminal_separator:
+        terminal_ids = re.findall(r"(?m)^  - id: ([^\n]+)$", terminal_source)
+        if terminal_ids != ["notify_cell_bulk_result_telegram"]:
+            raise ops.Blocked("isolated_bulk_terminal_task_set_changed")
+        # The isolated canary never sends production-chat notifications.
     text = header + "\ntasks:\n" + re.sub(
         r"(?ms)^  - id: ([^\n]+)\n(.*?)(?=^  - id: |\Z)", task, task_source,
     )
+    if re.search(r"(?m)^[ \t]*(?:afterExecution|'afterExecution'|\"afterExecution\")[ \t]*:", text):
+        raise ops.Blocked("isolated_bulk_terminal_section_remaining")
     if tuple(seen) != BULK_TASKS:
         raise ops.Blocked("isolated_bulk_task_set_changed")
     ops.secure_file(root / "isolated-bulk-flow.yml", text.encode("utf-8"))

@@ -57,7 +57,7 @@ OBSERVED_CELL_ROSTER = {
 
 
 def fingerprint(value) -> str:
-    """Hash canonical JSON without execution timestamps or incidental row order."""
+    """Hash canonical JSON with sorted object keys and preserved list order."""
     data = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 

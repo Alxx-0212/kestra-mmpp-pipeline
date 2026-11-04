@@ -100,7 +100,8 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
     if not days:
         raise ValueError("matrix requires continuous report days")
     from datetime import timedelta
-    expected_day = business_date(config["first_report_date"])
+    expected_day = business_date(report.get("first_report_date", config["first_report_date"]))
+    balance_available = report.get("balance_available", True)
     for day in days:
         if business_date(day["report_date"]) != expected_day:
             raise ValueError("matrix report dates are not continuous and chronological")
@@ -137,10 +138,16 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
         title_column = 3 if slot == 0 else offset
         matrix[1][title_column] = preview[1][title_column] = title
         matrix[0][offset:offset + 6] = preview[0][offset:offset + 6] = list(REPORT_HEADERS)
-        opening = sum(config["opening_balances"].values()) if slot == 0 else config["opening_balances"][codes[slot - 1]]
-        matrix[2][offset:offset + 6] = [config["first_report_date"], "OPENING", "OPENING BALANCE", 0, 0, opening]
+        opening = (sum(config["opening_balances"].values()) if slot == 0 else
+                   config["opening_balances"][codes[slot - 1]]) if balance_available else ""
+        opening_label = "OPENING BALANCE" if balance_available else "SALDO UNVERIFIED"
+        matrix[2][offset:offset + 6] = [report.get("first_report_date", config["first_report_date"]),
+                                        "OPENING", opening_label, 0, 0, opening]
         preview[2][offset:offset + 6] = matrix[2][offset:offset + 6]
-    matrix[2][5] = "=SUM(" + ",".join(f"{column_letter(offset + 6)}3" for offset in offsets[1:]) + ")"
+    if balance_available:
+        matrix[2][5] = "=SUM(" + ",".join(f"{column_letter(offset + 6)}3" for offset in offsets[1:]) + ")"
+    else:
+        matrix[2][2] = "SALDO UNVERIFIED: PRIOR HISTORY NOT REQUIRED FOR DAILY DATA"
     prior_saldo_rows = {code: 3 for code in codes}
     prior_running = {code: 0 for code in codes}
     prior_bank = {code: 0 for code in codes}
@@ -157,11 +164,13 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
         states = {}
         for code in codes:
             cell = cells[code]
-            if day_index == 0:
+            if not balance_available:
+                expected_opening = None
+            elif day_index == 0:
                 expected_opening = config["opening_balances"][code]
             else:
                 expected_opening = next(c for c in days[day_index - 1]["cells"] if c["cell_code"] == code)["closing_saldo"]
-            if cell["opening_saldo"] != expected_opening:
+            if balance_available and cell["opening_saldo"] != expected_opening:
                 raise ValueError("matrix opening balance discontinuity")
             states[code] = {"saldo": expected_opening}
         start_row = len(matrix) + 1
@@ -177,12 +186,13 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
                 if key in {category for _, category in detail_categories(date_string)}:
                     measure = cell["measures"].get(key, {})
                     debit, credit = measure.get("debet", 0), measure.get("kredit", 0)
-                    if abs(state["saldo"] + debit) > MAX_EXACT_RUPIAH:
-                        raise ValueError("running saldo intermediate exceeds safe spreadsheet arithmetic")
-                    state["saldo"] += debit - credit
-                    saldo = state["saldo"]
-                    saldo_formula = f"={saldo_col}{prior_saldo_rows[code]}+{debit_col}{row_number}-{credit_col}{row_number}"
-                    prior_saldo_rows[code] = row_number
+                    if balance_available:
+                        if abs(state["saldo"] + debit) > MAX_EXACT_RUPIAH:
+                            raise ValueError("running saldo intermediate exceeds safe spreadsheet arithmetic")
+                        state["saldo"] += debit - credit
+                        saldo = state["saldo"]
+                        saldo_formula = f"={saldo_col}{prior_saldo_rows[code]}+{debit_col}{row_number}-{credit_col}{row_number}"
+                        prior_saldo_rows[code] = row_number
                 elif key == "purchase_count":
                     debit, credit = cell["measures"].get("PEMBELIAN RECHARGE OUT CLUSTER", {}).get("count", 0), ""
                 elif key == "expected_fee":
@@ -288,7 +298,7 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
             preview.append(numerical)
             row_keys.append(section + ":" + key)
         for code in codes:
-            if states[code]["saldo"] != cells[code]["closing_saldo"]:
+            if balance_available and states[code]["saldo"] != cells[code]["closing_saldo"]:
                 raise ValueError("rendered cell closing balance differs from calculated result")
             prior_running[code], prior_bank[code] = states[code]["running"], states[code]["bank"]
             prior_running_rows[code] = day_positions["cash:RUNNING TOTAL"]
@@ -379,6 +389,10 @@ def section_fill(matrix, row_index):
         return REFERENCE_COLORS["mandiri"]
     if key.startswith("CASH:"):
         return REFERENCE_COLORS["cash"]
+    stripes = matrix.get("row_stripes", [])
+    stripe = stripes[row_index - 1] if len(stripes) == len(matrix["values"]) else None
+    if stripe in ("detail", "white"):
+        return REFERENCE_COLORS["detail"] if stripe == "detail" else REFERENCE_COLORS["detail_alternate"]
     return REFERENCE_COLORS["detail"] if row_index % 2 == 0 else REFERENCE_COLORS["detail_alternate"]
 
 

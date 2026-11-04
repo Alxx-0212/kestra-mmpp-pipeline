@@ -49,6 +49,20 @@ class CellCalculationTests(unittest.TestCase):
         self.assertNotIn("Transaction", calculation["summary_ready"][0])
         self.assertEqual(calculation["summary_ready"][0]["processed_transaction_label"], "sellthru")
 
+    def test_date_report_does_not_need_prior_days_or_infer_opening_saldo(self):
+        day = "2026-10-15"
+        facts = [self.prepare(code, [self.row(day=day)], day) for code in self.config.cell_codes]
+        with self.assertRaisesRegex(ValueError, "missing cell coverage for report date 2026-10-13"):
+            build_cluster_report(self.config, facts, day)
+
+        report = build_cluster_report(self.config, facts, day,
+            first_report_date=day, calculate_saldo=False)
+        self.assertEqual(report["first_report_date"], day)
+        self.assertFalse(report["balance_available"])
+        self.assertEqual(len(report["days"]), 1)
+        self.assertTrue(all(cell["opening_saldo"] is None and cell["closing_saldo"] is None
+                            for cell in report["days"][0]["cells"]))
+
     def test_same_identifiers_in_different_cells_do_not_deduplicate_each_other(self):
         facts = [self.prepare(code, [self.row()]) for code in self.config.cell_codes]
         report = build_cluster_report(self.config, facts, "2026-10-13")

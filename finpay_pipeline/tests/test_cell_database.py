@@ -103,6 +103,11 @@ class FakeConnection:
             unknown = [epoch for epoch, pub in self.state["publications"].items()
                        if pub["status"] in ("IN_FLIGHT", "UNKNOWN")]
             return Result((max(unknown),) if unknown else None)
+        if "snapshot->>'refresh_request_id'=%s" in text:
+            matches = [(epoch, pub) for epoch, pub in sorted(self.state["publications"].items())
+                       if pub["snapshot"].get("refresh_request_id") == params[2]]
+            return Result(rows=[(epoch, pub["snapshot"], pub["status"], pub["fingerprint"])
+                                for epoch, pub in matches])
         if "INSERT INTO" in text and "finpay_cell_sources_v1" in text:
             key = params[0]
             if key in self.state["sources"]:
@@ -463,6 +468,23 @@ class CellDatabaseTests(unittest.TestCase):
             self.assertEqual(two["epoch"], 2)
             with self.assertRaisesRegex(ValueError, "superseded"):
                 store.begin_sheet_write(1)
+
+    def test_refresh_request_lookup_scans_scoped_snapshot_history(self):
+        self.database.state["publications"] = {
+            1: {"snapshot": {"refresh_request_id": "run-1"}, "status": "SUPERSEDED",
+                "fingerprint": "first"},
+            2: {"snapshot": {"refresh_request_id": "run-1"}, "status": "COMPLETE",
+                "fingerprint": "second"},
+            3: {"snapshot": {"refresh_request_id": "run-2"}, "status": "COMPLETE",
+                "fingerprint": "third"},
+        }
+        with self.session() as store:
+            found = store.publications_for_refresh_request("run-1")
+        self.assertEqual([row["epoch"] for row in found], [1, 2])
+        query, params = next((query, params) for query, params in self.database.calls
+                             if "snapshot->>'refresh_request_id'=%s" in query)
+        self.assertIn("cluster_id=%s AND target_id=%s", query)
+        self.assertEqual(params, ("412110", "dummy-sheet-only", "run-1"))
 
     def test_acknowledged_validation_failure_retains_pending_error_not_unknown(self):
         with self.session() as store:

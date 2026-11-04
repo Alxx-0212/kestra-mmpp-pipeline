@@ -480,6 +480,17 @@ class CellStore:
         return {"epoch": row[0], "snapshot": row[1], "status": row[2],
                 "fingerprint": row[3]} if row else None
 
+    def publications_for_refresh_request(self, refresh_request_id):
+        """Find every publication epoch associated with one execution ID."""
+        self.assert_alive()
+        rows = self._execute(self._query(
+            "SELECT epoch,snapshot,status,snapshot_fingerprint FROM {} WHERE cluster_id=%s AND target_id=%s "
+            "AND snapshot->>'refresh_request_id'=%s ORDER BY epoch",
+            "finpay_cell_publications_v1",
+        ), (self.cluster_id, self.target_id, refresh_request_id)).fetchall()
+        return [{"epoch": row[0], "snapshot": row[1], "status": row[2],
+                 "fingerprint": row[3]} for row in rows]
+
     def latest_report_date(self):
         self.assert_alive()
         row = self._execute(self._query(

@@ -7,7 +7,7 @@ from unittest.mock import Mock, call, patch
 from requests.exceptions import ConnectionError, Timeout
 
 from finpay_pipeline.cell_publication import ExistingSheetAdapter, _padded
-from finpay_pipeline.cell_workflow import make_cell_sheet_client
+from finpay_pipeline.cell_workflow import _CellSheetHTTPAdapter, make_cell_sheet_client
 
 
 class FakeResponse:
@@ -43,16 +43,98 @@ class CellSheetReadRetriesTests(unittest.TestCase):
         adapter = Mock()
 
         with patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=credentials), \
-             patch("google.auth.transport.requests.AuthorizedSession", return_value=session), \
-             patch("requests.adapters.HTTPAdapter", return_value=adapter) as http_adapter, \
+             patch("google.auth.transport.requests.AuthorizedSession", return_value=session) as authorized_session, \
+             patch("finpay_pipeline.cell_workflow._CellSheetHTTPAdapter", return_value=adapter) as http_adapter, \
              patch("gspread.Client", return_value=client) as gspread_client:
             result = make_cell_sheet_client({"client_email": "writer@example.test"})
 
         self.assertIs(result, client)
         session.mount.assert_called_once_with("https://", adapter)
-        http_adapter.assert_called_once_with(max_retries=0)
+        authorized_session.assert_called_once_with(
+            credentials, max_refresh_attempts=0, refresh_timeout=300,
+        )
+        http_adapter.assert_called_once_with()
         gspread_client.assert_called_once_with(auth=credentials, session=session)
-        client.set_timeout.assert_called_once_with((10, 120))
+        client.set_timeout.assert_called_once_with((30, 300))
+
+    def test_google_auth_refresh_uses_the_request_timeout(self):
+        credentials = Mock()
+        auth_request = Mock()
+        credentials.before_request.side_effect = (
+            lambda request, method, url, headers: request("https://oauth.example.test/token", method="POST")
+        )
+        response = Mock(status_code=200)
+        with patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=credentials), \
+             patch("google.auth.transport.requests.Request", return_value=auth_request), \
+             patch("gspread.Client") as gspread_client, \
+             patch("requests.sessions.Session.request", return_value=response) as request:
+            make_cell_sheet_client({"client_email": "writer@example.test"})
+            session = gspread_client.call_args.kwargs["session"]
+            self.assertIs(session.request("GET", "https://sheets.example.test/resource", timeout=(30, 300)), response)
+
+        auth_request.assert_called_once_with("https://oauth.example.test/token", method="POST", timeout=(30, 300))
+        self.assertEqual(request.call_args.kwargs["timeout"], (30, 300))
+        self.assertEqual(session._max_refresh_attempts, 0)
+
+    def test_https_attempts_are_spaced_across_read_and_write_requests(self):
+        adapter = _CellSheetHTTPAdapter()
+        now = [0.0]
+        starts = []
+        requests = [SimpleNamespace(method=method) for method in ("GET", "POST", "GET")]
+        response = object()
+
+        def send(request, **kwargs):
+            starts.append(now[0])
+            return response
+
+        with patch("finpay_pipeline.cell_workflow.time.monotonic", side_effect=lambda: now[0]), \
+             patch("finpay_pipeline.cell_workflow.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)) as sleep, \
+             patch("requests.adapters.HTTPAdapter.send", side_effect=send) as transport:
+            for request in requests:
+                self.assertIs(adapter.send(request, timeout=(30, 300)), response)
+
+        self.assertEqual(starts, [0.0, 1.25, 2.5])
+        self.assertEqual(sleep.call_args_list, [call(1.25), call(1.25)])
+        self.assertEqual(transport.call_args_list,
+                         [call(request, timeout=(30, 300)) for request in requests])
+        self.assertEqual(adapter.max_retries.total, 0)
+
+    def test_slow_response_already_satisfies_the_request_interval(self):
+        adapter = _CellSheetHTTPAdapter()
+        now = [0.0]
+
+        def send(request, **kwargs):
+            now[0] += 5
+
+        with patch("finpay_pipeline.cell_workflow.time.monotonic", side_effect=lambda: now[0]), \
+             patch("finpay_pipeline.cell_workflow.time.sleep") as sleep, \
+             patch("requests.adapters.HTTPAdapter.send", side_effect=send) as transport:
+            adapter.send(SimpleNamespace(method="POST"))
+            adapter.send(SimpleNamespace(method="GET"))
+
+        self.assertEqual(transport.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_failed_mutation_is_sent_once_and_consumes_a_pacing_slot(self):
+        adapter = _CellSheetHTTPAdapter()
+        now = [0.0]
+        write = SimpleNamespace(method="POST")
+        read = SimpleNamespace(method="GET")
+        error = Timeout("synthetic ambiguous mutation timeout")
+
+        with patch("finpay_pipeline.cell_workflow.time.monotonic", side_effect=lambda: now[0]), \
+             patch("finpay_pipeline.cell_workflow.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)) as sleep, \
+             patch("requests.adapters.HTTPAdapter.send", side_effect=[error, object()]) as transport:
+            with self.assertRaises(Timeout) as raised:
+                adapter.send(write, timeout=(30, 300))
+            self.assertIs(raised.exception, error)
+            transport.assert_called_once_with(write, timeout=(30, 300))
+            adapter.send(read, timeout=(30, 300))
+
+        sleep.assert_called_once_with(1.25)
+        self.assertEqual(transport.call_args_list,
+                         [call(write, timeout=(30, 300)), call(read, timeout=(30, 300))])
+        self.assertEqual(adapter.max_retries.total, 0)
 
     def test_value_read_retries_timeouts_connections_and_transient_statuses(self):
         self.worksheet.get.side_effect = [

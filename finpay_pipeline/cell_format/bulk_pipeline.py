@@ -16,6 +16,7 @@ from ..cell_contracts import (
     CellIdentity, business_date, fingerprint, roster_fingerprint, sha256_file_bounded,
 )
 from ..cell_database import cell_publication_session, prepare_cell_day, validate_cluster_batch
+from ..cell_observability import observed, report
 from ..cell_publication_v2 import build_cell_cluster_matrices_v2
 from ..cell_workflow import MAX_BUNDLE_BYTES, make_cell_sheet_client
 from . import pipeline as daily
@@ -86,24 +87,23 @@ def _read_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def _copy_member(archive: zipfile.ZipFile, name: str, destination: Path,
-                 expected_sha256: str, limit: int) -> tuple[str, int]:
-    info = archive.getinfo(name)
+def _stage_member(archive, entry, root: Path, limit: int) -> Path:
+    info = archive.getinfo(entry["path"])
     if info.file_size > limit:
         raise ValueError("cell bulk ZIP member exceeds size limit")
-    digest, total = hashlib.sha256(), 0
+    destination = root / "member.bin"
+    total = 0
     with archive.open(info) as source, destination.open("wb") as target:
         while chunk := source.read(1024 * 1024):
             total += len(chunk)
             if total > limit:
                 raise ValueError("cell bulk ZIP member exceeds size limit")
-            digest.update(chunk)
             target.write(chunk)
-    actual = digest.hexdigest()
-    if total != info.file_size or actual != expected_sha256:
+    if total != info.file_size:
         destination.unlink(missing_ok=True)
-        raise ValueError("cell bulk ZIP member size/checksum mismatch")
-    return actual, total
+        raise ValueError("cell bulk ZIP member size mismatch")
+    # ponytail: each immediate consumer verifies the member checksum once.
+    return destination
 
 
 def _parse_index(raw: bytes) -> dict:
@@ -186,9 +186,23 @@ def _validate_index(index: dict, kind: str):
 def _open_bulk_zip(path, expected_sha256: str, kind: str):
     limit = MAX_BULK_HANDOFF_BYTES if kind == "handoff" else MAX_BULK_BYTES
     expected_sha256 = _require_sha256(expected_sha256, "cell bulk artifact checksum")
-    if sha256_file_bounded(path, limit) != expected_sha256:
-        raise ValueError("cell bulk artifact checksum mismatch")
-    archive = zipfile.ZipFile(path, "r")
+    snapshot = tempfile.TemporaryFile()
+    try:
+        digest, size = hashlib.sha256(), 0
+        with Path(path).open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError("cell bulk artifact exceeds configured size limit")
+                digest.update(chunk)
+                snapshot.write(chunk)
+        if digest.hexdigest() != expected_sha256:
+            raise ValueError("cell bulk artifact checksum mismatch")
+        snapshot.seek(0)
+        archive = zipfile.ZipFile(snapshot, "r")
+    except BaseException:
+        snapshot.close()
+        raise
     try:
         infos = archive.infolist()
         names = [info.filename for info in infos]
@@ -229,12 +243,7 @@ def _open_bulk_zip(path, expected_sha256: str, kind: str):
         yield archive, index, start, end, clusters, entries
     finally:
         archive.close()
-
-
-def _stage_member(archive, entry, root: Path, limit: int) -> Path:
-    destination = root / "member.bin"
-    _copy_member(archive, entry["path"], destination, entry["sha256"], limit)
-    return destination
+        snapshot.close()
 
 
 def _atomic_zip(path: str | Path, writer, size_limit: int):
@@ -256,12 +265,14 @@ def _atomic_zip(path: str | Path, writer, size_limit: int):
     return digest, size
 
 
+@observed("bulk_preprocess")
 def preprocess_cell_range(source_bundle: str, source_bundle_sha256: str, start_date: str,
                           end_date: str, cluster_id: str,
                           output_path: str = "cell_bulk_prepared_v1.zip") -> dict:
     """Validate and calculate every source date/cluster offline before persistence."""
     start, end, requested_clusters, _ = _range(start_date, end_date, cluster_id)
     prepared_entries = []
+    counts = {"cells": 0, "rows": 0, "unusual_rows": 0, "unusual_cells": 0}
     with tempfile.TemporaryDirectory(prefix="finpay-cell-bulk-preprocess-") as scratch:
         scratch_dir = Path(scratch)
         with _open_bulk_zip(source_bundle, source_bundle_sha256, "source") as (
@@ -289,6 +300,8 @@ def preprocess_cell_range(source_bundle: str, source_bundle_sha256: str, start_d
                                     str(source_path), source_entry["sha256"], day, cluster,
                                     str(member_path),
                                 )
+                                for key, value in json.loads(result["notification_summary"]).items():
+                                    counts[key] += value
                                 digest = _require_sha256(
                                     result["prepared_sha256"], "prepared checksum",
                                 )
@@ -306,6 +319,8 @@ def preprocess_cell_range(source_bundle: str, source_bundle_sha256: str, start_d
                                 }
                                 output.write(member_path, arcname=item["path"])
                                 prepared_entries.append(item)
+                                report("cohort_preprocessed", cluster_id=cluster, report_date=day,
+                                       completed=len(prepared_entries), total=len(source_entries))
                                 source_path.unlink(missing_ok=True)
                                 member_path.unlink(missing_ok=True)
                     index = {
@@ -326,6 +341,7 @@ def preprocess_cell_range(source_bundle: str, source_bundle_sha256: str, start_d
         "cluster_id": cluster_id, "clusters": requested_clusters,
         "prepared_bundle_sha256": digest, "prepared_bundle_bytes": size,
         "prepared_entries": len(prepared_entries),
+        "notification_summary": json.dumps(counts, sort_keys=True),
     }
 
 
@@ -443,6 +459,7 @@ def validate_cell_bulk_sheet_range(start_date: str, end_date: str, cluster_id: s
     return {"clusters": clusters, "dates": days, "runs": days * len(clusters)}
 
 
+@observed("bulk_persist")
 def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
                        database_password: str | None,
                        output_path: str = "cell_bulk_handoffs_v1.zip",
@@ -469,6 +486,8 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
             target = database_target() if target is None else target
             handoff_paths = {}
             for cluster in clusters:
+                report("waiting_for_database_lock", cluster_id=cluster,
+                       completed=len(handoff_paths), total=len(clusters))
                 config = daily._cell_config(cluster, REPORTING_START_DATE)
                 with session_factory(
                     target, {target}, cluster, "", password=database_password,
@@ -535,6 +554,8 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
                         handoff_path = scratch_dir / f"handoff-{cluster}.json"
                         daily._write_json(handoff_path, handoff, daily.MAX_HANDOFF_BYTES)
                     handoff_paths[cluster] = handoff_path
+                report("cluster_committed", cluster_id=cluster,
+                       completed=len(handoff_paths), total=len(clusters))
             digest, size = _write_handoff_bundle(
                 output_path, start, end, index["cluster_id"], clusters, handoff_paths,
             )
@@ -557,14 +578,17 @@ def _validate_publication_targets(clusters, start, end, cluster_id, credentials_
         raise ValueError("Google credential identity differs from the configured cell writer")
 
 
+@observed("bulk_publish")
 def publish_cell_range(handoff_path: str, handoff_sha256: str, *,
                        database_password: str | None, credentials_info: dict | None,
                        dry_run: bool = False, target=None,
                        session_factory=cell_publication_session,
-                       sheet_client_factory=make_cell_sheet_client) -> dict:
+                       sheet_client_factory=make_cell_sheet_client,
+                       refresh_request_id: str | None = None) -> dict:
     """Publish once per cluster, serially, through the daily guarded publisher."""
     if type(dry_run) is not bool:
         raise ValueError("dry_run must be an explicit boolean")
+    daily.validate_refresh_request_id(refresh_request_id)
     results = []
     with tempfile.TemporaryDirectory(prefix="finpay-cell-bulk-publish-") as scratch:
         scratch_dir = Path(scratch)
@@ -588,16 +612,27 @@ def publish_cell_range(handoff_path: str, handoff_sha256: str, *,
                 clusters, start, end, index["cluster_id"], credentials_info,
             )
             target = database_target() if target is None else target
+            client = None
+
+            def shared_sheet_client(info, **kwargs):
+                nonlocal client
+                if client is None:
+                    client = sheet_client_factory(info, **kwargs)
+                return client
+
             for cluster in clusters:
                 entry = entries[cluster]
-                path, _ = _read_handoff_member(archive, entry, scratch_dir)
+                path = _stage_member(archive, entry, scratch_dir, daily.MAX_HANDOFF_BYTES)
                 result = daily.publish_cell_sheets(
                     str(path), entry["sha256"], database_password=database_password,
                     credentials_info=credentials_info, cluster_id=cluster, target=target,
                     session_factory=session_factory,
-                    sheet_client_factory=sheet_client_factory,
+                    sheet_client_factory=shared_sheet_client,
+                    refresh_request_id=refresh_request_id,
                 )
                 results.append(result)
+                report("cluster_published", cluster_id=cluster,
+                       completed=len(results), total=len(clusters))
                 path.unlink(missing_ok=True)
     return {
         "status": "COMPLETE", "start_date": start, "end_date": end,

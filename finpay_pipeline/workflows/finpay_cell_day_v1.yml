@@ -26,6 +26,12 @@ inputs:
   - id: write_gsheet
     type: BOOLEAN
     defaults: false
+  - id: publication_scope
+    type: STRING
+    defaults: "report_date"
+  - id: send_telegram
+    type: BOOLEAN
+    defaults: false
   - id: cell_spreadsheet_id
     type: STRING
     defaults: "{{ vars.cell_spreadsheet_id }}"
@@ -48,6 +54,7 @@ inputs:
 tasks:
   - id: validate_cell_sheet_targets
     type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
     containerImage: finpay-cell-reporting:2.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -67,7 +74,9 @@ tasks:
     script: |
       import os
       from finpay_pipeline.cell_format import validate_sheet_range
+      from finpay_pipeline.cell_observability import observed
 
+      validate_sheet_range = observed("target_validation")(validate_sheet_range)
       validate_sheet_range(
           os.environ["REPORT_DATE"], os.environ["REPORT_DATE"],
           os.environ["CLUSTER_ID"],
@@ -75,6 +84,7 @@ tasks:
 
   - id: preflight_cell_database
     type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
     containerImage: finpay-cell-reporting:2.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -91,7 +101,9 @@ tasks:
       from kestra import Kestra
       from finpay_pipeline.cell_database import preflight_cell_database
       from finpay_pipeline.cell_format.settings import database_target
+      from finpay_pipeline.cell_observability import observed
 
+      preflight_cell_database = observed("database_preflight")(preflight_cell_database)
       target = database_target()
       Kestra.outputs(preflight_cell_database(
           target, {target}, password=os.environ["FINPAY_DB_PASSWORD"],
@@ -99,13 +111,17 @@ tasks:
 
   - id: acquire_cell_cluster_day
     type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
     containerImage: finpay-digipos-cell-scraper:2.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
       networkMode: host
+      volumes:
+        - "/tmp/finpay inbox:/tmp/finpay inbox"
     timeout: PT6H
     env:
       DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
+      CELL_INBOX_DIR: "/tmp/finpay inbox"
       REPORT_DATE: "{{ inputs.report_date }}"
       CLUSTER_ID: "{{ inputs.cluster_id }}"
     outputFiles:
@@ -113,21 +129,35 @@ tasks:
     script: |
       import os
       from kestra import Kestra
-      from finpay_pipeline.cell_format import acquire_cell_day
+      from finpay_pipeline.cell_format import acquire_cell_day, copy_cell_sources_to_inbox
+      from finpay_pipeline.cell_observability import observed
 
+      copy_cell_sources_to_inbox = observed("inbox")(copy_cell_sources_to_inbox)
       try:
           result = acquire_cell_day(
               os.environ["REPORT_DATE"], os.environ["CLUSTER_ID"],
               os.environ["DIGIPOS_PASSWORD"], os.getcwd(),
           )
+          inbox = copy_cell_sources_to_inbox(
+              result["source_bundle"], result["source_bundle_sha256"],
+              os.environ["REPORT_DATE"], os.environ["CLUSTER_ID"],
+              os.environ["CELL_INBOX_DIR"],
+          )
       except Exception as exc:
-          raise RuntimeError("Cell acquisition failed: " + type(exc).__name__) from None
-      Kestra.outputs({key: result[key] for key in (
-          "report_date", "cluster_id", "account", "source_bundle_sha256", "cells",
-      )})
+          raise RuntimeError("Cell acquisition or inbox persistence failed: " + type(exc).__name__) from None
+      outputs = {
+          key: result[key]
+          for key in (
+            "report_date", "cluster_id", "account", "source_bundle_sha256", "cells",
+          )
+      }
+      outputs["inbox_files"] = inbox["files_copied"]
+      outputs["inbox_generation_sha256"] = inbox["generation_sha256"]
+      Kestra.outputs(outputs)
 
   - id: preprocess_cell_cluster_day
     type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
     containerImage: finpay-cell-reporting:2.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -156,16 +186,23 @@ tasks:
 
   - id: persist_cell_sources_and_calculations
     type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
     containerImage: finpay-cell-reporting:2.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     timeout: PT3H
+    retry:
+      type: exponential
+      interval: PT15S
+      maxInterval: PT60S
+      maxAttempts: 3
     runIf: "{{ inputs.dry_run == false }}"
     inputFiles:
       cell_prepared_v1.json: "{{ outputs.preprocess_cell_cluster_day.outputFiles['cell_prepared_v1.json'] }}"
     env:
       PREPARED_SHA256: "{{ outputs.preprocess_cell_cluster_day.vars.prepared_sha256 }}"
       DRY_RUN: "{{ inputs.dry_run }}"
+      PUBLICATION_SCOPE: "{{ inputs.publication_scope }}"
       FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
       FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
       FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
@@ -184,6 +221,7 @@ tasks:
               "cell_prepared_v1.json", os.environ["PREPARED_SHA256"],
               database_password=os.environ["FINPAY_DB_PASSWORD"],
               dry_run=os.environ["DRY_RUN"].lower() == "true",
+              publication_scope=os.environ["PUBLICATION_SCOPE"],
           )
       except Exception as exc:
           raise RuntimeError(
@@ -193,15 +231,22 @@ tasks:
 
   - id: publish_cell_four_tabs
     type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
     containerImage: finpay-cell-reporting:2.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     timeout: PT3H
+    retry:
+      type: exponential
+      interval: PT15S
+      maxInterval: PT60S
+      maxAttempts: 3
     runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
     inputFiles:
       cell_handoff_v1.json: "{{ outputs.persist_cell_sources_and_calculations.outputFiles['cell_handoff_v1.json'] }}"
     env:
       HANDOFF_SHA256: "{{ outputs.persist_cell_sources_and_calculations.vars.handoff_sha256 }}"
+      REFRESH_REQUEST_ID: "{{ execution.originalId ?? execution.id }}"
       CLUSTER_ID: "{{ inputs.cluster_id }}"
       FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
       FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
@@ -231,7 +276,37 @@ tasks:
               database_password=os.environ["FINPAY_DB_PASSWORD"],
               credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
               cluster_id=os.environ["CLUSTER_ID"],
+              refresh_request_id=os.environ["REFRESH_REQUEST_ID"],
           )
       except Exception as exc:
           raise RuntimeError("Cell Sheet publication failed: " + json.dumps(safe_cell_sheet_error(exc), sort_keys=True)) from None
       Kestra.outputs(result)
+
+afterExecution:
+  - id: notify_cell_result_telegram
+    type: io.kestra.plugin.scripts.python.Script
+    logLevel: INFO
+    containerImage: finpay-cell-reporting:2.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    timeout: PT2M
+    runIf: "{{ inputs.dry_run == false and inputs.send_telegram }}"
+    env:
+      TELEGRAM_BOT_TOKEN: "{{ secret('TELEGRAM_BOT_TOKEN') }}"
+      TELEGRAM_CHAT_ID: "{{ secret('TELEGRAM_CHAT_ID') }}"
+      EXECUTION_STATE: "{{ execution.state }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      FLOW_ID: "{{ flow.namespace }}.{{ flow.id }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
+      START_DATE: "{{ inputs.report_date }}"
+      END_DATE: "{{ inputs.report_date }}"
+      WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+      SUMMARY_JSON: "{{ outputs.preprocess_cell_cluster_day.vars.notification_summary ?? '{}' }}"
+    script: |
+      import os
+      from kestra import Kestra
+      from finpay_pipeline.cell_notifications import notify_from_environment
+      from finpay_pipeline.cell_observability import observed
+
+      notify = observed("telegram")(notify_from_environment)
+      Kestra.outputs(notify(os.environ))

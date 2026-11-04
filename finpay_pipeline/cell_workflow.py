@@ -8,8 +8,11 @@ import io
 import json
 import os
 import re
+import time
 import zipfile
 from pathlib import Path
+
+from requests.adapters import HTTPAdapter
 
 from .cell_calculation import CellReportConfig, build_cluster_report, calculate_cell_day, recalculate_stale_history
 from .cell_contracts import (
@@ -31,6 +34,25 @@ from .digipos_cells import scrape_cell_roster
 from .digipos_scraper import HEADERS, _read_xlsx_rows, validate_export_rows
 
 MAX_BUNDLE_BYTES = 256 * 1024 * 1024
+CELL_SHEET_TIMEOUT_SECONDS = (30, 300)
+CELL_SHEET_REQUEST_INTERVAL_SECONDS = 1.25
+
+
+class _CellSheetHTTPAdapter(HTTPAdapter):
+    """Pace the serial cell client's HTTPS attempts without retrying mutations."""
+
+    def __init__(self):
+        super().__init__(max_retries=0)
+        self._next_request_at = None
+
+    def send(self, request, **kwargs):
+        if self._next_request_at is not None:
+            delay = self._next_request_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+        # Failed attempts consume quota too; reserve the slot before sending.
+        self._next_request_at = time.monotonic() + CELL_SHEET_REQUEST_INTERVAL_SECONDS
+        return super().send(request, **kwargs)
 
 
 def _unique_json(pairs):
@@ -227,6 +249,8 @@ def prepare_cell_bundle(bundle_path, configuration_path, expected_configuration_
 
 
 def _prepare_cell_bundle_with_configs(bundle_path, expected_bundle_sha256, runtime, configs):
+    from .cell_observability import report
+
     data = _bounded_bytes(bundle_path, MAX_BUNDLE_BYTES)
     if len(data) > MAX_BUNDLE_BYTES or hashlib.sha256(data).hexdigest() != expected_bundle_sha256:
         raise ValueError("source bundle size/checksum mismatch")
@@ -247,7 +271,9 @@ def _prepare_cell_bundle_with_configs(bundle_path, expected_bundle_sha256, runti
             raise ValueError("source bundle has missing/unexpected artifacts")
         entries = {(entry["account"], entry["cell_code"]): entry for entry in manifest["cells"]}
         batches = {account: [] for account in configs}
-        for cell in cells:
+        for cell_index, cell in enumerate(cells):
+            report("cell_preprocess_started", cell_code=cell.cell_code,
+                   completed=cell_index, total=len(cells))
             entry = entries[(cell.account, cell.cell_code)]
             rows = []
             if entry["artifact"]:
@@ -263,6 +289,8 @@ def _prepare_cell_bundle_with_configs(bundle_path, expected_bundle_sha256, runti
                 validate_export_rows(exported, manifest["report_date"], entry["validated_rows"])
                 rows = [dict(zip(HEADERS, row)) for row in exported[2:] if any(value is not None for value in row)]
             batches[cell.account].append(calculate_cell_day(cell, entry, rows, configs[cell.account]))
+            report("cell_preprocessed", cell_code=cell.cell_code, rows=len(rows),
+                   completed=cell_index + 1, total=len(cells))
     return runtime, configs, manifest, batches
 
 
@@ -280,11 +308,10 @@ def prepare_cell_bundle_v2(bundle_path, configuration_path, expected_configurati
 
 
 def make_cell_sheet_client(credentials_info, *, include_drive_file=False):
-    """A dedicated no-write-retry client; legacy retry policy is not reused."""
+    """A paced no-write-retry client; legacy retry policy is not reused."""
     import gspread
     from google.auth.transport.requests import AuthorizedSession
     from google.oauth2.service_account import Credentials
-    from requests.adapters import HTTPAdapter
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -293,10 +320,14 @@ def make_cell_sheet_client(credentials_info, *, include_drive_file=False):
     if include_drive_file:
         scopes.append("https://www.googleapis.com/auth/drive.file")
     credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-    session = AuthorizedSession(credentials, max_refresh_attempts=0)
-    session.mount("https://", HTTPAdapter(max_retries=0))
+    session = AuthorizedSession(
+        credentials,
+        max_refresh_attempts=0,
+        refresh_timeout=CELL_SHEET_TIMEOUT_SECONDS[1],
+    )
+    session.mount("https://", _CellSheetHTTPAdapter())
     client = gspread.Client(auth=credentials, session=session)
-    client.set_timeout((10, 120))
+    client.set_timeout(CELL_SHEET_TIMEOUT_SECONDS)
     return client
 
 

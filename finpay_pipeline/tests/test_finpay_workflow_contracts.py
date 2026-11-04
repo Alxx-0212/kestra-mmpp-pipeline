@@ -322,10 +322,99 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                 with self.subTest(task=task_id, env=env_name):
                     self.assertIn(env_name + ":", task)
 
+    def test_cell_range_schedule_is_disabled_and_targets_previous_day(self):
+        flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
+        trigger = flow.split("\ntriggers:\n", 1)[1].split("\ninputs:\n", 1)[0]
+
+        self.assertIn("id: daily_cell_range_0500_wita", trigger)
+        self.assertIn("type: io.kestra.plugin.core.trigger.Schedule", trigger)
+        self.assertIn('cron: "0 5 * * *"', trigger)
+        self.assertIn("timezone: Asia/Makassar", trigger)
+        self.assertIn("disabled: true", trigger)
+        previous_day = "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+        self.assertIn(f'start_date: "{previous_day}"', trigger)
+        self.assertIn(f'end_date: "{previous_day}"', trigger)
+        self.assertIn('cluster_id: "ALL"', trigger)
+        self.assertIn("dry_run: false", trigger)
+        self.assertIn("write_gsheet: true", trigger)
+
+    def test_cell_day_retries_only_database_and_guarded_publication_tasks(self):
+        flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
+        retry_block = (
+            "    retry:\n"
+            "      type: exponential\n"
+            "      interval: PT15S\n"
+            "      maxInterval: PT60S\n"
+            "      maxAttempts: 3\n"
+        )
+
+        for task_id in ("persist_cell_sources_and_calculations", "publish_cell_four_tabs"):
+            with self.subTest(task=task_id):
+                self.assertIn(retry_block, _task_block(flow, task_id))
+        self.assertNotIn(retry_block, _task_block(flow, "acquire_cell_cluster_day"))
+
+    def test_cell_sheet_writers_use_stable_execution_refresh_ids(self):
+        for workflow, task_id in (
+            ("finpay_cell_day_v1.yml", "publish_cell_four_tabs"),
+            ("finpay_cell_bulk_v1.yml", "publish_cell_bulk"),
+        ):
+            with self.subTest(workflow=workflow):
+                flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / workflow).read_text()
+                task = _task_block(flow, task_id)
+                self.assertIn('REFRESH_REQUEST_ID: "{{ execution.originalId ?? execution.id }}"', task)
+                self.assertIn('refresh_request_id=os.environ["REFRESH_REQUEST_ID"]', task)
+
+    def test_cell_day_bind_mounts_and_copies_validated_source_exports(self):
+        flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
+        task = _task_block(flow, "acquire_cell_cluster_day")
+
+        self.assertIn('"/tmp/finpay inbox:/tmp/finpay inbox"', task)
+        self.assertIn('CELL_INBOX_DIR: "/tmp/finpay inbox"', task)
+        self.assertIn("copy_cell_sources_to_inbox(", task)
+        self.assertIn('outputs["inbox_files"]', task)
+        self.assertIn('outputs["inbox_generation_sha256"]', task)
+
+    def test_cell_notifications_are_terminal_opt_in_and_never_retried(self):
+        for filename, preprocess in (
+            ("finpay_cell_day_v1.yml", "preprocess_cell_cluster_day"),
+            ("finpay_cell_bulk_v1.yml", "preprocess_cell_bulk"),
+        ):
+            flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / filename).read_text()
+            with self.subTest(flow=filename):
+                self.assertIn("- id: send_telegram\n    type: BOOLEAN\n    defaults: false", flow)
+                terminal = flow.split("\nafterExecution:\n", 1)[1]
+                self.assertIn('runIf: "{{ inputs.dry_run == false and inputs.send_telegram }}"', terminal)
+                self.assertIn('EXECUTION_STATE: "{{ execution.state }}"', terminal)
+                self.assertIn(f"outputs.{preprocess}.vars.notification_summary ?? '{{}}'", terminal)
+                self.assertIn("notify_from_environment", terminal)
+                self.assertNotIn("retry:", terminal)
+                self.assertNotIn("FINPAY_DB_PASSWORD", terminal)
+                self.assertNotIn("GCP_SA_KEY", terminal)
+
+    def test_cell_range_logs_cohort_boundaries_and_forwards_notification_choice(self):
+        flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
+        self.assertIn("id: log_cell_cohort_started", flow)
+        self.assertIn("id: log_cell_cohort_completed", flow)
+        self.assertIn('send_telegram: "{{ inputs.send_telegram }}"', flow)
+        terminal = flow.split("\nafterExecution:\n", 1)[1]
+        self.assertIn("execution.state != 'SUCCESS'", terminal)
+        self.assertNotIn("outputs.expand_cell_range", terminal)
+        self.assertIn("inputs.dry_run == false and inputs.send_telegram", terminal)
+        self.assertNotIn("retry:", terminal)
+
+    def test_current_cell_python_tasks_keep_info_logs_visible(self):
+        for filename in ("finpay_cell_day_v1.yml", "finpay_cell_bulk_v1.yml", "finpay_cell_range_v1.yml"):
+            flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / filename).read_text()
+            for block in flow.split("type: io.kestra.plugin.scripts.python.Script")[1:]:
+                self.assertTrue(block.startswith("\n    logLevel: INFO\n"), filename)
+
     def test_cell_range_forwards_destination_settings_to_day_subflow(self):
         range_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
         day_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
         subflow = range_flow.split("flowId: finpay_cell_day_v1", 1)[1]
+        self.assertIn('publication_scope: "history"', subflow)
+        self.assertIn('- id: publication_scope\n    type: STRING\n    defaults: "report_date"', day_flow)
+        self.assertIn('PUBLICATION_SCOPE: "{{ inputs.publication_scope }}"', day_flow)
         settings = {
             "cell_spreadsheet_id": ("STRING", "CELL_FORMAT_SPREADSHEET_ID"),
             "cell_spreadsheet_name": ("STRING", "CELL_FORMAT_SPREADSHEET_NAME"),

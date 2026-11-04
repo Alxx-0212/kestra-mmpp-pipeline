@@ -514,6 +514,19 @@ class CellPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "governed dimensions"):
             list(adapter.read_style(100_001, 2))
 
+    def test_row_value_reader_uses_bounded_formula_rendered_range(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from finpay_pipeline.cell_publication import ExistingSheetAdapter
+
+        worksheet = SimpleNamespace(id=7, title="412110 Invoice",
+                                    get=Mock(return_value=[["=A1"]]))
+        adapter = ExistingSheetAdapter(SimpleNamespace(id="approved-book"), worksheet)
+        with patch("finpay_pipeline.cell_publication._read_with_retry", side_effect=lambda read: read()):
+            result = adapter.read_range(4, 6, 30)
+        self.assertEqual(result, [["=A1"]])
+        worksheet.get.assert_called_once_with("A5:AD6", value_render_option="FORMULA")
+
 
 if __name__ == "__main__":
     unittest.main()

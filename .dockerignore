@@ -1,6 +1,9 @@
 # Never send local secrets, source data, or repository metadata to Docker.
 .git
 .gitignore
+.kilo/
+.codex/
+.lavish/
 .env
 .env_encoded
 .env.*

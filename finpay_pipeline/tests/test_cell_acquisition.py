@@ -13,8 +13,9 @@ from finpay_pipeline.cell_contracts import (
     CellIdentity, configured_cells, fingerprint,
     roster_fingerprint, validate_complete_manifest,
 )
+from finpay_pipeline.cell_progress import Progress
 from finpay_pipeline.digipos_cells import (
-    _exchange, _request_fields, _resume_entry, cell_row_to_cells,
+    _download_cell, _exchange, _request_fields, _resume_entry, cell_row_to_cells,
     scrape_cell_roster, validate_cell_payload,
 )
 from finpay_pipeline.digipos_scraper import (
@@ -143,6 +144,57 @@ class CellAcquisitionTests(unittest.TestCase):
         self.assertEqual(payload["statusCode"], "00")
         page.unroute.assert_called_once()
 
+    def test_download_reports_internal_phases_without_source_rows_or_secret(self):
+        records = []
+        identity = self.identity
+        row = {
+            "tanggal": "13-10-2026 12:00:00", "wstransferid": "sensitive-row-identifier",
+            "transaction_type": "Credit", "wstransfertype": "SETOR",
+            "init_amount": "1000", "amount_in": "100", "amount_out": "0",
+            "last_amount": "1100", "sumber1": "490812345678", "wstransferdesc": "transfer",
+        }
+        page = Mock()
+        page.evaluate.side_effect = [
+            None, ["412110", "412110412111", "412110412112"], identity.parentcode,
+        ]
+        page.locator.return_value.inner_text.return_value = "Showing 1 to 1 of 1 entries"
+        context = Mock()
+        context.new_page.return_value = page
+        browser = Mock()
+        browser.new_context.return_value = context
+
+        def capture_progress(*args, **kwargs):
+            kwargs.update(logger=records.append, heartbeat_interval=None)
+            return Progress(*args, **kwargs)
+
+        def write_xlsx(path, rows):
+            path.write_bytes(b"synthetic xlsx bytes")
+
+        response = ({"statusCode": "00", "data": [row]}, {"draw": "1"})
+        with TemporaryDirectory() as directory, \
+                patch("finpay_pipeline.digipos_cells.Progress", side_effect=capture_progress), \
+                patch("finpay_pipeline.digipos_cells._exchange", return_value=response), \
+                patch("finpay_pipeline.digipos_cells._set_search_filters"), \
+                patch("finpay_pipeline.digipos_cells._write_xhr_export", side_effect=write_xlsx), \
+                patch("finpay_pipeline.digipos_cells._read_xlsx_rows", return_value=[]), \
+                patch("finpay_pipeline.digipos_cells.validate_export_rows"):
+            entry = _download_cell(
+                browser, identity, self.day, "synthetic-secret", Path(directory), False,
+                sorted(cell.parentcode for cell in self.cells),
+            )
+
+        events = [record["event"] for record in records]
+        self.assertIn("login_start", events)
+        self.assertIn("search_request_start", events)
+        self.assertIn("table_settle_wait_start", events)
+        self.assertIn("full_export_request_start", events)
+        self.assertIn("xlsx_write_start", events)
+        self.assertEqual(events[-1], "stage_complete")
+        self.assertEqual(entry["validated_rows"], 1)
+        serialized = json.dumps(records)
+        self.assertNotIn("sensitive-row-identifier", serialized)
+        self.assertNotIn("synthetic-secret", serialized)
+
     def test_source_strings_round_trip_verbatim_and_money_grouping_is_strict(self):
         raw = {"tanggal": "13-10-2026 12:00:00", "wstransferid": " 000123 ",
                "init_amount": "1,000", "amount_in": "200", "amount_out": "0", "last_amount": "1,200",
@@ -183,13 +235,20 @@ class CellAcquisitionTests(unittest.TestCase):
         def download(browser, identity, *args):
             attempts.append(identity.cell_code)
             if identity.cell_code == "412112":
-                raise RuntimeError("synthetic error")
+                raise RuntimeError("synthetic private error")
             return self.empty_entry(identity)
+
+        records = []
+
+        def capture_progress(*args, **kwargs):
+            kwargs.update(logger=records.append, heartbeat_interval=None)
+            return Progress(*args, **kwargs)
 
         with TemporaryDirectory() as directory, patch.dict(
             sys.modules, {"playwright.sync_api": fake_module, "playwright": SimpleNamespace()}
         ):
-            with patch("finpay_pipeline.digipos_cells._download_cell", side_effect=download):
+            with patch("finpay_pipeline.digipos_cells.Progress", side_effect=capture_progress), \
+                    patch("finpay_pipeline.digipos_cells._download_cell", side_effect=download):
                 with self.assertRaises(RuntimeError):
                     scrape_cell_roster(self.day, "synthetic-only", self.roster, directory, max_attempts=2)
             state = json.loads((Path(directory) / self.day / "cell_acquisition_state.json").read_text())
@@ -200,6 +259,10 @@ class CellAcquisitionTests(unittest.TestCase):
                 manifest = scrape_cell_roster(self.day, "synthetic-only", self.roster, directory)
             self.assertEqual(mocked.call_count, 1)
             validate_complete_manifest(manifest, self.cells)
+        events = [record["event"] for record in records]
+        self.assertIn("cell_retry", events)
+        self.assertIn("cell_attempt_failed", events)
+        self.assertNotIn("synthetic private error", json.dumps(records))
 
     def test_missing_or_corrupt_resumed_cell_is_reacquired_without_valid_peer(self):
         runtime = Mock()
