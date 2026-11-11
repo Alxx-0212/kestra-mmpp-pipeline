@@ -148,6 +148,12 @@ class MemoryCellStore:
 
     def commit_cluster_day(self, batch, expected_cells):
         validate_cluster_batch(batch, expected_cells)
+        return self._commit_batch(batch)
+
+    def _commit_prevalidated_cluster_day(self, batch):
+        return self._commit_batch(batch.items)
+
+    def _commit_batch(self, batch):
         self.commit_calls += 1
         if self.commit_calls == self.fail_on_commit:
             raise RuntimeError("injected date-cohort commit failure")
@@ -244,6 +250,61 @@ class CellBulkPipelineTests(unittest.TestCase):
                     content = archive.read(entry["path"])
                     self.assertEqual(hashlib.sha256(content).hexdigest(), entry["sha256"])
                     self.assertEqual(len(json.loads(content)["batch"]), 2)
+
+    def test_bulk_preflight_rebinds_each_cell_once_and_spool_checksum_is_enforced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, prepared_path, result = self._preprocess(root)
+            with patch.object(
+                bulk_pipeline, "prepare_cell_day", wraps=bulk_pipeline.prepare_cell_day,
+            ) as prepare:
+                self._persist(prepared_path, result, MemoryCellStore())
+            self.assertEqual(prepare.call_count, 4)
+
+            with bulk_pipeline._open_bulk_zip(
+                prepared_path, result["prepared_bundle_sha256"], "prepared",
+            ) as (archive, _, _, _, _clusters, entries):
+                config = bulk_pipeline.daily._cell_config(CLUSTER, REPORTING_START_DATE)
+                spool = bulk_pipeline._BulkSpool(root)
+                spooled = bulk_pipeline._preflight_prepared(
+                    archive, entries, root, {CLUSTER: config}, spool,
+                )
+            entry = spooled[(CLUSTER, START)]
+            trusted = spool.read(entry, config)
+            entry["path"].write_bytes(entry["path"].read_bytes() + b"x")
+            with self.assertRaisesRegex(ValueError, "spool size mismatch"):
+                spool.read(entry, config)
+
+            limited_root = root / "limited"
+            limited_root.mkdir()
+            limited = bulk_pipeline._BulkSpool(limited_root)
+            with patch.object(bulk_pipeline, "MAX_BULK_SPOOL_BYTES", 0):
+                with self.assertRaisesRegex(ValueError, "temporary-size bound"):
+                    limited.write(CLUSTER, START, config, list(trusted.items))
+
+    def test_bulk_member_rejects_batch_date_mismatched_with_index(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "mismatched.json"
+            config = bulk_pipeline.daily._cell_config(CLUSTER, REPORTING_START_DATE)
+            prepared = {
+                "schema_version": 1, "report_date": START, "batch": [
+                    {"report_date": END} for _ in config.cells
+                ],
+            }
+            content = json.dumps(prepared, sort_keys=True, separators=(",", ":"))
+            path.write_text(content)
+            entry = {
+                "cluster_id": CLUSTER, "report_date": START,
+                "sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "bytes": path.stat().st_size, "cells": len(config.cells),
+            }
+            with patch.object(bulk_pipeline, "_stage_member", return_value=path), patch.object(
+                bulk_pipeline.daily, "_load_prepared_for_rebind",
+                return_value=(prepared, config, prepared["batch"]),
+            ):
+                with self.assertRaisesRegex(ValueError, "date differs from indexed date"):
+                    bulk_pipeline._load_bulk_prepared_member(None, entry, root, config)
 
     def test_source_bundle_requires_exact_coverage_checksum_safe_paths_and_bounds(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -570,6 +631,8 @@ class CellBulkPipelineTests(unittest.TestCase):
             clusters = list(selected_clusters("ALL"))
             self.assertEqual([call.kwargs["cluster_id"] for call in publish.call_args_list], clusters)
             self.assertTrue(all(call.kwargs["refresh_request_id"] == "execution-123"
+                                for call in publish.call_args_list))
+            self.assertTrue(all(call.kwargs["publication_start_date"] == START
                                 for call in publish.call_args_list))
             self.assertTrue(all(
                 call.kwargs["sheet_client_factory"] is publish.call_args_list[0].kwargs["sheet_client_factory"]

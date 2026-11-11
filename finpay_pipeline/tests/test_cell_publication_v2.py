@@ -6,7 +6,7 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from finpay_pipeline.cell_publication import CellWorksheetTarget
+from finpay_pipeline.cell_publication import CellWorksheetTarget, GUARD_PREFIX
 from finpay_pipeline.cell_publication_v2 import publish_cell_cluster_v2, validate_output_targets
 
 
@@ -25,6 +25,7 @@ class MultiTabStore:
         self.source_commits = 0
         self.sheet_mutations = 0
         self.row_mutations = []
+        self.value_writes = []
 
     def assert_alive(self):
         if not self.alive:
@@ -152,6 +153,7 @@ class MultiTabAdapter:
         self.metadata_entries, self.protections = [], []
         self.next_id = sheet_id * 100
         self.fail_write = fail_write
+        self.grow_tail_after_guard = None
         self.events = []
         self.styles, self.widths, self.heights = {}, {}, {}
         self.merges, self.banding = [], []
@@ -171,8 +173,8 @@ class MultiTabAdapter:
     def read(self, rows, columns):
         return [row[:columns] for row in self.values[:rows]]
 
-    def read_range(self, start_row, end_row, columns):
-        return [row[:columns] for row in self.values[start_row:end_row]]
+    def read_range(self, start_row, end_row, columns, start_column=0):
+        return [row[start_column:columns] for row in self.values[start_row:end_row]]
 
     def native_format(self, row, column):
         value = copy.deepcopy(self.styles.get((row, column), {}))
@@ -383,6 +385,14 @@ class MultiTabAdapter:
                             if p["protectedRangeId"] == update["protectedRange"]["protectedRangeId"])
                 for field in update["fields"].split(","):
                     item[field] = copy.deepcopy(update["protectedRange"][field])
+                if (self.grow_tail_after_guard
+                        and item.get("description", "").startswith(GUARD_PREFIX)):
+                    row, row_count, value = self.grow_tail_after_guard
+                    self.grid["rowCount"] = row_count
+                    while len(self.values) <= row:
+                        self.values.append([""] * self.grid["columnCount"])
+                    self.values[row][0] = value
+                    self.grow_tail_after_guard = None
                 replies.append({})
             elif "deleteProtectedRange" in request:
                 self.protections = [item for item in self.protections
@@ -406,6 +416,7 @@ class MultiTabAdapter:
                 if self.fail_write:
                     raise TimeoutError("fake tab write failed")
                 grid = update["range"]
+                self.store.value_writes.append((self.role, grid["startRowIndex"], grid["endRowIndex"]))
                 self.store.events.append("sheets:" + self.role)
                 while len(self.values) < grid["endRowIndex"]:
                     self.values.append([""] * grid["endColumnIndex"])
@@ -490,6 +501,151 @@ class CellPublicationV2Tests(unittest.TestCase):
             self.store, self.store.target_id, self.roles, self.adapters, None, self.config,
             publication_only=True, preserve_manual_inputs=True, **kwargs,
         )
+
+    def test_bulk_suffix_write_preserves_prefix_and_starts_at_column_a_date(self):
+        from finpay_pipeline.cell_contracts import fingerprint
+        from finpay_pipeline.cell_publication_v2 import ROLES, _suffix_start_row
+
+        start_date, later_date = "2026-10-14", "2026-10-15"
+        batches = [[self.fixture.prepare(code,
+            [self.fixture.row(day=day, amount=amount)], day)
+            for code in self.config.cell_codes]
+            for day, amount in ((start_date, 100), (later_date, 200))]
+        self.publish(additional_batches=batches)
+
+        previous = self.store.publications[1]["snapshot"]["worksheets"]
+        suffix_starts = {role: _suffix_start_row(
+            previous[role]["matrix"], role, start_date,
+        ) for role in ROLES}
+        summary = previous["summary"]["matrix"]
+        manual = next(item for item in summary["editable_inputs"]
+                      if item["report_date"] == self.config.first_report_date)
+        self.adapters["summary"].values[manual["row"] - 1][manual["column"] - 1] = 333
+        prefix_values = {role: copy.deepcopy(self.adapters[role].values[:suffix_starts[role]])
+                         for role in ROLES}
+        previous_invoice_height = len(previous["invoice"]["matrix"]["values"])
+        row_mutations_before = len(self.store.row_mutations)
+
+        for day in (start_date, later_date):
+            for code in self.config.cell_codes:
+                item = self.fixture.prepare(code,
+                    [self.fixture.row(day=day, amount=900)], day)
+                if day == start_date:
+                    item["calculation"]["qris"] = [
+                        {"Disbursement Date": "2026-10-14", "Kredit": 100},
+                        {"Disbursement Date": "2026-10-15", "Kredit": 200},
+                    ]
+                    item["calculation_id"] = fingerprint({
+                        "generation_id": item["generation_id"], "config_id": item["config_id"],
+                        "rules_version": item["rules_version"], "calculation": item["calculation"],
+                    })
+                self.store.facts[(day, code)] = {
+                    "identity": item["identity"], "generation_id": item["generation_id"],
+                    "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                    "calculation": item["calculation"],
+                }
+
+        write_start = len(self.store.value_writes)
+        result = self.publish_only(write_from_date=start_date,
+                                   refresh_request_id="bulk-suffix-from-date")
+        self.assertEqual(result["status"], "COMPLETE")
+        writes = self.store.value_writes[write_start:]
+        self.assertTrue(writes)
+        for role in ROLES:
+            self.assertEqual(self.adapters[role].values[:suffix_starts[role]], prefix_values[role])
+            self.assertTrue(all(start >= suffix_starts[role]
+                                for written_role, start, _ in writes if written_role == role))
+        self.assertGreater(len(self.adapters["invoice"].values), previous_invoice_height)
+        self.assertTrue(any(operation == "insert" and sheet_id == self.roles["invoice"].worksheet_id
+                            for operation, sheet_id, _, _ in
+                            self.store.row_mutations[row_mutations_before:]))
+
+        append_date = "2026-10-16"
+        for code in self.config.cell_codes:
+            item = self.fixture.prepare(code,
+                [self.fixture.row(day=append_date, amount=300)], append_date)
+            self.store.facts[(append_date, code)] = {
+                "identity": item["identity"], "generation_id": item["generation_id"],
+                "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                "calculation": item["calculation"],
+            }
+        before_append = self.store.publications[max(self.store.publications)]["snapshot"]["worksheets"]
+        append_starts = {role: len(before_append[role]["matrix"]["values"]) for role in ROLES}
+        append_prefix = {role: copy.deepcopy(self.adapters[role].values[:append_starts[role]])
+                         for role in ROLES}
+        write_start = len(self.store.value_writes)
+        row_mutations_start = len(self.store.row_mutations)
+        appended = self.publish_only(write_from_date=append_date,
+                                     refresh_request_id="bulk-suffix-append")
+        self.assertEqual(appended["status"], "COMPLETE")
+        append_writes = self.store.value_writes[write_start:]
+        for role in ROLES:
+            self.assertEqual(self.adapters[role].values[:append_starts[role]], append_prefix[role])
+            self.assertTrue(all(start >= append_starts[role]
+                                for written_role, start, _ in append_writes if written_role == role))
+        self.assertTrue(any(operation == "insert" and sheet_id == self.roles["invoice"].worksheet_id
+                            and start == append_starts["invoice"]
+                            for operation, sheet_id, start, _ in
+                            self.store.row_mutations[row_mutations_start:]))
+
+    def test_bulk_suffix_refuses_to_leave_changed_prefix_sources_unpublished(self):
+        start_date, later_date = "2026-10-14", "2026-10-15"
+        batches = [[self.fixture.prepare(code,
+            [self.fixture.row(day=day, amount=100)], day)
+            for code in self.config.cell_codes]
+            for day in (start_date, later_date)]
+        self.publish(additional_batches=batches)
+
+        for code in self.config.cell_codes:
+            item = self.fixture.prepare(code,
+                [self.fixture.row(day=self.config.first_report_date, amount=900)],
+                self.config.first_report_date)
+            self.store.facts[(self.config.first_report_date, code)] = {
+                "identity": item["identity"], "generation_id": item["generation_id"],
+                "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                "calculation": item["calculation"],
+            }
+        epoch_before = max(self.store.publications)
+        writes_before, rows_before = list(self.store.value_writes), list(self.store.row_mutations)
+
+        with self.assertRaisesRegex(ValueError, "source history before publication start changed"):
+            self.publish_only(write_from_date=start_date, refresh_request_id="range-prefix-stale")
+
+        self.assertEqual(max(self.store.publications), epoch_before)
+        self.assertEqual(self.store.value_writes, writes_before)
+        self.assertEqual(self.store.row_mutations, rows_before)
+        self.assertFalse(any(item.get("description", "").startswith("finpay-cell-v2-guard:")
+                             for adapter in self.adapters.values() for item in adapter.protections))
+
+    def test_initial_bulk_suffix_requires_a_saved_prefix_or_reporting_start(self):
+        day = "2026-10-14"
+        for code in self.config.cell_codes:
+            item = self.fixture.prepare(code, [self.fixture.row(day=day)], day)
+            self.store.facts[(day, code)] = {
+                "identity": item["identity"], "generation_id": item["generation_id"],
+                "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                "calculation": item["calculation"],
+            }
+
+        with self.assertRaisesRegex(ValueError, "must start at the reporting boundary"):
+            self.publish_only(write_from_date=day, refresh_request_id="initial-mid-history-range")
+        self.assertEqual(self.store.publications, {})
+        self.assertEqual(self.store.sheet_mutations, 0)
+        self.assertEqual(self.store.row_mutations, [])
+
+    def test_bulk_suffix_rejects_pre_start_rows_added_after_saved_prefix(self):
+        from finpay_pipeline.cell_publication_v2 import merge_cell_suffix
+
+        day = "2026-10-14"
+        batch = [self.fixture.prepare(code, [self.fixture.row(day=day)], day)
+                 for code in self.config.cell_codes]
+        published = self.publish(additional_batches=[batch])
+        prior = self.store.publications[published["epoch"]]["snapshot"]["worksheets"]["summary"]["matrix"]
+        replacement = copy.deepcopy(prior)
+        replacement["values"].append([day] + [""] * (len(prior["values"][0]) - 1))
+
+        with self.assertRaisesRegex(ValueError, "new rows before the requested start date"):
+            merge_cell_suffix("summary", prior, replacement, "2026-10-15")
 
     def test_first_date_scoped_publication_needs_no_prior_history(self):
         day = "2026-10-15"
@@ -711,6 +867,44 @@ class CellPublicationV2Tests(unittest.TestCase):
         self.assertEqual(adapter.values, rows_before)
         self.assertEqual(adapter.values[row_index][width + 1], extra_value)
         self.assertEqual(max(self.store.publications), inserted["epoch"])
+        self.assertFalse(any(item.get("description", "").startswith(GUARD_PREFIX)
+                             for item in adapter.protections))
+
+    def test_suffix_append_fails_closed_on_data_below_saved_matrix(self):
+        from finpay_pipeline.cell_publication_v2 import GUARD_PREFIX
+
+        previous_day, append_day = "2026-10-14", "2026-10-15"
+        previous_batch = [self.fixture.prepare(code,
+            [self.fixture.row(day=previous_day)], previous_day)
+            for code in self.config.cell_codes]
+        self.publish(additional_batches=[previous_batch])
+        for code in self.config.cell_codes:
+            item = self.fixture.prepare(code, [self.fixture.row(day=append_day)], append_day)
+            self.store.facts[(append_day, code)] = {
+                "identity": item["identity"], "generation_id": item["generation_id"],
+                "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                "calculation": item["calculation"],
+            }
+
+        previous = self.store.publications[1]["snapshot"]["worksheets"]
+        matrix_height = len(previous["summary"]["values"])
+        adapter = self.adapters["summary"]
+        adapter.grid["rowCount"] = matrix_height
+        adapter.grow_tail_after_guard = (matrix_height, matrix_height + 8,
+                                         "operator data below report")
+        values_before = copy.deepcopy(adapter.values)
+        writes_before = list(self.store.value_writes)
+        row_mutations_before = list(self.store.row_mutations)
+        epoch_before = max(self.store.publications)
+
+        with self.assertRaisesRegex(ValueError, "below the saved matrix"):
+            self.publish_only(write_from_date=append_day,
+                              refresh_request_id="bulk-append-with-tail-data")
+        self.assertEqual(self.store.value_writes, writes_before)
+        self.assertEqual(self.store.row_mutations, row_mutations_before)
+        self.assertEqual(self.store.publications.keys(), {epoch_before})
+        self.assertEqual(adapter.values[:matrix_height], values_before[:matrix_height])
+        self.assertEqual(adapter.values[matrix_height][0], "operator data below report")
         self.assertFalse(any(item.get("description", "").startswith(GUARD_PREFIX)
                              for item in adapter.protections))
 

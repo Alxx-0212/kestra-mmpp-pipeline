@@ -12,7 +12,7 @@ from .cell_contracts import (
     MAX_EXACT_RUPIAH, CellIdentity, business_date, configured_cells, fingerprint, parse_cell_amount,
     roster_fingerprint, validate_source_entry,
 )
-from .cell_database import prepare_cell_day
+from .cell_database import _validate_cluster_batch_structure, prepare_cell_day
 from .classification import (
     _collect_validation_unusual_transactions, preprocess_transaction_labels,
 )
@@ -342,33 +342,62 @@ def affected_publication_range(first_date: str, changed_dates: list[str], latest
     return max(first, min(changed) - timedelta(days=1)).isoformat(), latest.isoformat()
 
 
-def recalculate_stale_history(store, config: CellReportConfig, through_date: str,
-                              *, submitted_dates: set[str]) -> list[list[dict]]:
+def stale_report_dates(current, config: CellReportConfig, submitted_dates: set[str]) -> set[str]:
+    expected_config = fingerprint(config.to_dict())
+    return {str(row["report_date"]) for row in current
+            if row["config_id"] != expected_config
+            and str(row["report_date"]) not in submitted_dates}
+
+
+def iter_recalculate_stale_history(store, config: CellReportConfig, through_date: str,
+                                   *, submitted_dates: set[str], current_results=None):
     """Recalculate old configurations from immutable source, without new downloads.
 
-    These complete date cohorts are prepared before any Google call. The caller
-    selects them with the submitted cohort in one outer database transaction.
+    Yield one complete date cohort at a time so callers can spool raw evidence
+    before selecting all stale dates in one outer database transaction.
     """
-    expected_config = fingerprint(config.to_dict())
-    current = store.current_results(config.first_report_date, through_date)
-    stale = {str(row["report_date"]) for row in current
-             if row["config_id"] != expected_config and str(row["report_date"]) not in submitted_dates}
+    current = (store.current_results(config.first_report_date, through_date)
+               if current_results is None else current_results)
+    stale = stale_report_dates(current, config, submitted_dates)
     if not stale:
-        return []
+        return
     by_identity = {(cell.account, cell.cell_code): cell for cell in config.cells}
-    cohorts = {day: [] for day in stale}
-    for source in store.current_source_rows(min(stale), max(stale)):
+    stale_days = sorted(stale)
+    sources = (store.iter_current_source_rows(min(stale), max(stale))
+               if hasattr(store, "iter_current_source_rows")
+               else iter(store.current_source_rows(min(stale), max(stale))))
+    current_day = None
+    cohort = []
+    day_index = 0
+    for source in sources:
         entry = source["manifest"]
-        if entry["report_date"] not in stale:
+        day = str(entry["report_date"])
+        if day not in stale:
             continue
+        if current_day != day:
+            if current_day is not None:
+                _validate_cluster_batch_structure(cohort, config.cells)
+                yield cohort
+                day_index += 1
+            if day_index >= len(stale_days) or stale_days[day_index] != day:
+                raise ValueError("historical source rows are not in complete date-cohort order")
+            current_day, cohort = day, []
         identity = by_identity.get((entry["account"], entry["cell_code"]))
         if identity is None:
             raise ValueError("historical roster change needs a separate cutover/mapping contract")
         raw = [{key: row[key] for key in HEADERS if key != "No"} for row in source["raw_rows"]]
-        cohorts[entry["report_date"]].append(calculate_cell_day(identity, entry, raw, config))
-    from .cell_database import validate_cluster_batch
-    result = []
-    for day in sorted(cohorts):
-        validate_cluster_batch(cohorts[day], config.cells)
-        result.append(cohorts[day])
-    return result
+        cohort.append(calculate_cell_day(identity, entry, raw, config))
+    if current_day is not None:
+        _validate_cluster_batch_structure(cohort, config.cells)
+        yield cohort
+        day_index += 1
+    if day_index != len(stale_days):
+        raise ValueError("stale calculation history is missing one or more source-date cohorts")
+
+
+def recalculate_stale_history(store, config: CellReportConfig, through_date: str,
+                              *, submitted_dates: set[str]) -> list[list[dict]]:
+    """Compatibility wrapper for callers that still require materialized cohorts."""
+    return list(iter_recalculate_stale_history(
+        store, config, through_date, submitted_dates=submitted_dates,
+    ))

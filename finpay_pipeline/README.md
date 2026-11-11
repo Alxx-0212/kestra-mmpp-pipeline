@@ -89,15 +89,14 @@ Flow defaults read `FINPAY_CELL_SPREADSHEET_NAME` and
 and `FINPAY_CELL_FINANCE_EMAILS` configure the writer/protection identity.
 A private deployment flow may set these values directly in its `variables` block.
 
-`finpay_cell_bulk_v1` accepts the inclusive date range and cluster selector plus
-optional `scrape_workers` (default 2, maximum 4). It validates the complete
-indexed account/date bundle before database writes, retries only failed
-acquisition chunks, and publishes once per cluster. Scraping is parallel across
-accounts with dates sequential per account; processing, PostgreSQL, and Sheet
-writes are serial. It consumes validated daily exports, not arbitrary
-unpartitioned multi-date CSV uploads. Day and range remain separate flow entry
-points. Acquisition retains per-cell/day portal login overhead; worker bounds
-do not remove that cost.
+`finpay_cell_bulk_v1` accepts inclusive dates, a cluster selector, and 1-4 scrape
+workers (default 2). It preflights every indexed export, retries only failed
+acquisition chunks, then commits each cluster in one database transaction and
+publishes once. A bounded checksummed cohort spool feeds persistence; PostgreSQL
+COPY inserts only new source generations. Scraping is parallel by account, but
+dates per account and database/Sheet writes stay serial. Use validated daily
+exports; day and range remain separate entry points, and portal login remains
+per cell/day.
 
 Range flows take `start_date`, `end_date` (inclusive `YYYY-MM-DD`,
 `Asia/Makassar`), and `cluster_id` (one configured numeric cluster, a
@@ -180,11 +179,16 @@ cell/date cohort. It does not require other dates or clear the current cohort if
 acquisition or validation fails; immutable source generations and row hashes are
 retained. A standalone daily Sheet publication patches only that date's block
 in each tab, resizing variable-height blocks as needed while preserving MANDIRI
-inputs and all other dates. The range flow passes full-history scope to each
-sequential day child and retains its complete-coverage checks and full-report
-publication. Before deleting rows, the daily writer refuses a block shrink if
-the affected rows contain values/formulas outside the governed matrix; resolve
-that extra content before retrying the persisted handoff. Daily database results
+inputs and all other dates. Bulk range publication still calculates full history,
+but writes only the suffix starting at the requested date in Summary, Invoice,
+Unusual, and Reversal; rows before it remain untouched. It fails closed if saved
+prefix source fingerprints or row layout differ; widen the range start to repair
+that prefix. The range flow passes
+full-history scope to each sequential day child and retains its full-report
+publication. Before deleting rows or rewriting a suffix, the writer refuses if
+affected rows contain off-matrix values/formulas or rows below the saved matrix
+contain data that a row shift would move; resolve that extra content before
+retrying the persisted handoff. Daily database results
 never store cumulative SALDO. If the corrected Sheet date already has an SALDO
 formula chain, preserve it so later dependent SALDO formulas may recalculate.
 Without an existing chain, the date's Summary block marks
@@ -196,9 +200,10 @@ checks; the date-scoped behavior applies to standalone day runs only.
 
 Bulk persistence and Sheet publication retry the whole task up to three times.
 Persistence reuses the same prepared bundle without duplicating evidence. A daily
-execution changes only its requested date block; range/bulk publication retains
-its full-report behavior. Finance MANDIRI inputs and unrelated date blocks remain
-intact during daily updates. The Kestra execution ID identifies the request:
+execution changes only its requested date block; a bulk range changes rows from
+its requested start date onward while preserving earlier rows. The separate
+range flow retains its full-report behavior. Finance MANDIRI inputs and unrelated
+date blocks remain intact. The Kestra execution ID identifies the request:
 retries verify already-completed clusters without rewriting them. An uncertain
 write remains blocked for reconciliation; it is never blindly retried.
 
@@ -310,10 +315,13 @@ CELL numbers 1-3, preserve semantic widths and muted stripes, and separate each
 visible date with a top border. Source full cell codes remain in evidence.
 
 Four-tab publication uses one epoch, target/cluster locks, temporary guards, and
-value/formula/style/protection readback before completion. Daily publication
-merges one date's Summary, Invoice, Unusual, and Reversal blocks into the saved
-workbook snapshot and writes only those rows; range/bulk publication remains a
-full-report write. Missing initial tabs are created only
+value/formula/style/protection readback before completion. Standalone daily
+publication merges one date's blocks and writes only those rows. Bulk range
+publication calculates full history but writes the suffix beginning at the first
+column-A date at or after the requested start date, preserving earlier dated
+rows. When appending to an existing Invoice tab, that suffix also includes its
+standard two blank separator rows before the first dated row. The separate range
+flow remains a full-report write. Missing initial tabs are created only
 when `create_worksheets_if_missing` is enabled. A missing worksheet ID with
 previous publication history fails closed rather than being rebound. A green
 tab/A1 note confirms Sheet verification only; success also requires the database
@@ -506,6 +514,11 @@ docker run --rm --pull never --network none \
   finpay-pipeline:3.11 python -m unittest discover -s finpay_pipeline/tests
 git diff --check
 ```
+
+The opt-in scale runner is `tests/run_cell_scale_benchmark.py --workload month`
+or `--workload year`. It requires `FINPAY_SCALE_TEST_DSN` for a guarded loopback
+PostgreSQL 18.4 database named `finpay_cell_scale_test`; it uses synthetic data
+and does not contact DigiPOS or Sheets.
 
 Validate workflow properties with the pinned native validator, not YAML alone:
 

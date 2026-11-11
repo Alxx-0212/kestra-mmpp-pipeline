@@ -246,13 +246,14 @@ class ExistingSheetAdapter:
         return _read_with_retry(lambda: self.worksheet.get(
             f"A1:{column_letter(columns)}{rows}", value_render_option="FORMULA"))
 
-    def read_range(self, start_row, end_row, columns):
+    def read_range(self, start_row, end_row, columns, start_column=0):
         if (type(start_row) is not int or type(end_row) is not int or type(columns) is not int
                 or start_row < 0 or not start_row < end_row <= 100_000
-                or not 0 < columns <= 100):
+                or type(start_column) is not int or not 0 <= start_column < columns <= 100):
             raise ValueError("bounded worksheet value range is invalid")
         return _read_with_retry(lambda: self.worksheet.get(
-            f"A{start_row + 1}:{column_letter(columns)}{end_row}", value_render_option="FORMULA"))
+            f"{column_letter(start_column + 1)}{start_row + 1}:{column_letter(columns)}{end_row}",
+            value_render_option="FORMULA"))
 
     def read_style(self, rows, columns):
         """Read bounded formatting metadata, never values, formulas or other tabs."""

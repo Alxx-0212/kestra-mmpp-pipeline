@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 from finpay_pipeline.cell_calculation import (
     CellReportConfig, affected_publication_range, build_cluster_report,
-    calculate_cell_day, category_measures, detail_categories, mandiri_measures,
+    calculate_cell_day, category_measures, detail_categories,
+    iter_recalculate_stale_history, mandiri_measures,
 )
 from finpay_pipeline.cell_contracts import fingerprint
 from finpay_pipeline.classification import _collect_validation_unusual_transactions
@@ -48,6 +49,48 @@ class CellCalculationTests(unittest.TestCase):
         self.assertNotIn("No", result["raw_rows"][0])
         self.assertNotIn("Transaction", calculation["summary_ready"][0])
         self.assertEqual(calculation["summary_ready"][0]["processed_transaction_label"], "sellthru")
+
+    def test_stale_recalculation_yields_date_cohorts_without_loading_full_raw_history(self):
+        days = ("2026-10-13", "2026-10-14", "2026-10-15")
+        sources = {
+            day: [self.prepare(code, [self.row(day=day)], day) for code in self.config.cell_codes]
+            for day in days
+        }
+
+        class Store:
+            def __init__(self, config_id):
+                self.config_id = config_id
+                self.source_rows_read = 0
+
+            def current_results(self, start, end):
+                return [{"report_date": day, "config_id": self.config_id} for day in days]
+
+            def iter_current_source_rows(self, start, end):
+                for day in days:
+                    for item in sources[day]:
+                        self.source_rows_read += 1
+                        yield {"manifest": item["manifest"], "raw_rows": item["raw_rows"]}
+
+        store = Store("old-config")
+        cohorts = iter_recalculate_stale_history(
+            store, self.config, days[-1], submitted_dates=set(),
+        )
+        first = next(cohorts)
+        self.assertEqual({item["report_date"] for item in first}, {days[0]})
+        self.assertEqual(store.source_rows_read, len(self.config.cells) + 1)
+        second = next(cohorts)
+        self.assertEqual({item["report_date"] for item in second}, {days[1]})
+        self.assertEqual(store.source_rows_read, len(self.config.cells) * 2 + 1)
+        third = next(cohorts)
+        self.assertEqual({item["report_date"] for item in third}, {days[2]})
+        with self.assertRaises(StopIteration):
+            next(cohorts)
+
+        current = Store(fingerprint(self.config.to_dict()))
+        current.iter_current_source_rows = lambda *_: self.fail("fresh history read raw ledger rows")
+        self.assertEqual(list(iter_recalculate_stale_history(
+            current, self.config, days[-1], submitted_dates=set(),
+        )), [])
 
     def test_date_report_does_not_need_prior_days_or_infer_opening_saldo(self):
         day = "2026-10-15"

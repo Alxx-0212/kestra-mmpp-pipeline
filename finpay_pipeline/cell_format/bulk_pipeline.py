@@ -1,6 +1,7 @@
 """Bounded date-range cell processing over checksummed ZIP artifacts."""
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -11,11 +12,19 @@ from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 
-from ..cell_calculation import recalculate_stale_history
+from ..cell_calculation import (
+    iter_recalculate_stale_history,
+    recalculate_stale_history as recalculate_stale_history,
+    stale_report_dates,
+)
 from ..cell_contracts import (
     CellIdentity, business_date, fingerprint, roster_fingerprint, sha256_file_bounded,
 )
-from ..cell_database import cell_publication_session, prepare_cell_day, validate_cluster_batch
+from ..cell_database import (
+    _validate_cluster_batch_structure, _validated_cluster_batch_from_spool,
+    cell_publication_session, prepare_cell_day,
+    validate_cluster_batch as validate_cluster_batch,
+)
 from ..cell_observability import observed, report
 from ..cell_publication_v2 import build_cell_cluster_matrices_v2
 from ..cell_workflow import MAX_BUNDLE_BYTES, make_cell_sheet_client
@@ -30,7 +39,76 @@ MAX_BULK_BYTES = 1024 * 1024 * 1024
 MAX_BULK_INDEX_BYTES = 16 * 1024 * 1024
 MAX_BULK_HANDOFF_BYTES = len(CELL_ROSTER) * daily.MAX_HANDOFF_BYTES
 MAX_BULK_ENTRIES = MAX_CELL_RUNS
+MAX_BULK_SPOOL_BYTES = 2 * MAX_BULK_BYTES
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
+
+
+class _BulkSpool:
+    """Checksummed compressed cohorts shared by report construction and persistence."""
+
+    def __init__(self, root: Path):
+        self.root = root / "validated-spool"
+        self.root.mkdir()
+        self.total_bytes = 0
+
+    def write(self, cluster: str, day: str, config, batch: list[dict]) -> dict:
+        _validate_cluster_batch_structure(batch, config.cells)
+        stem = f"{cluster}-{day}"
+        json_path = self.root / f"{stem}.json"
+        spool_path = self.root / f"{stem}.json.gz"
+        payload = {
+            "schema_version": 1, "cluster_id": cluster, "report_date": day,
+            "account": config.account, "roster_version": config.roster_version,
+            "roster_fingerprint": roster_fingerprint(config.cells), "batch": batch,
+        }
+        payload_sha256, payload_bytes = daily._write_json(
+            json_path, payload, daily.MAX_PREPARED_BYTES,
+        )
+        with json_path.open("rb") as source, spool_path.open("wb") as target:
+            with gzip.GzipFile(
+                filename="", fileobj=target, mode="wb", compresslevel=6, mtime=0,
+            ) as compressed:
+                while chunk := source.read(1024 * 1024):
+                    compressed.write(chunk)
+        json_path.unlink()
+        spool_bytes = spool_path.stat().st_size
+        if (spool_bytes > MAX_BULK_SPOOL_BYTES
+                or self.total_bytes + spool_bytes > MAX_BULK_SPOOL_BYTES):
+            spool_path.unlink(missing_ok=True)
+            raise ValueError("validated cell spool exceeds the configured temporary-size bound")
+        self.total_bytes += spool_bytes
+        return {
+            "cluster_id": cluster, "report_date": day, "path": spool_path,
+            "sha256": sha256_file_bounded(spool_path, MAX_BULK_SPOOL_BYTES),
+            "bytes": spool_bytes, "payload_sha256": payload_sha256,
+            "payload_bytes": payload_bytes,
+        }
+
+    def read(self, entry: dict, config):
+        path = Path(entry["path"])
+        if path.parent != self.root or path.is_symlink() or not path.is_file():
+            raise ValueError("validated cell spool path is invalid")
+        if path.stat().st_size != entry["bytes"]:
+            raise ValueError("validated cell spool size mismatch")
+        if sha256_file_bounded(path, MAX_BULK_SPOOL_BYTES) != entry["sha256"]:
+            raise ValueError("validated cell spool checksum mismatch")
+        with gzip.open(path, "rb") as compressed:
+            payload_bytes = compressed.read(daily.MAX_PREPARED_BYTES + 1)
+        if (len(payload_bytes) > daily.MAX_PREPARED_BYTES
+                or len(payload_bytes) != entry["payload_bytes"]
+                or hashlib.sha256(payload_bytes).hexdigest() != entry["payload_sha256"]):
+            raise ValueError("validated cell spool payload checksum or size mismatch")
+        payload = json.loads(payload_bytes, object_pairs_hook=daily._unique_json)
+        if (payload.get("schema_version") != 1
+                or payload.get("cluster_id") != entry["cluster_id"]
+                or payload.get("report_date") != entry["report_date"]
+                or payload.get("account") != config.account
+                or payload.get("roster_version") != config.roster_version
+                or payload.get("roster_fingerprint") != roster_fingerprint(config.cells)):
+            raise ValueError("validated cell spool cohort identity mismatch")
+        return _validated_cluster_batch_from_spool(
+            payload.get("batch"), config.cells, entry["sha256"],
+        )
 
 
 def _range(start_date: str, end_date: str, cluster_id: str):
@@ -345,16 +423,20 @@ def preprocess_cell_range(source_bundle: str, source_bundle_sha256: str, start_d
     }
 
 
-def _load_bulk_prepared_member(archive, entry, root: Path):
+def _load_bulk_prepared_member(archive, entry, root: Path, config):
     path = _stage_member(archive, entry, root, daily.MAX_PREPARED_BYTES)
     if path.stat().st_size != entry["bytes"]:
         raise ValueError("prepared cell member size differs from index")
-    prepared, provisional, batch = daily._load_prepared(
+    prepared, provisional, batch = daily._load_prepared_for_rebind(
         path, entry["sha256"], entry["cluster_id"], entry["report_date"],
     )
+    if (prepared.get("report_date") != entry["report_date"]
+            or any(not isinstance(item, dict)
+                   or item.get("report_date") != entry["report_date"] for item in batch)):
+        raise ValueError("prepared cell member date differs from indexed date")
     if len(batch) != entry["cells"]:
         raise ValueError("prepared cell member differs from indexed roster coverage")
-    return path, prepared, provisional, batch
+    return path, prepared, provisional, _rebind_batch(provisional, batch, config)
 
 
 def _rebind_batch(provisional, batch, config):
@@ -364,29 +446,58 @@ def _rebind_batch(provisional, batch, config):
         new_config.pop(key, None)
     if old_config != new_config:
         raise ValueError("prepared cell calculations cannot be rebound to the active config")
-    rebound = [prepare_cell_day(
-        CellIdentity(**item["identity"]), item["manifest"], item["raw_rows"],
-        item["calculation"], config.to_dict(), config.rules_version,
-    ) for item in batch]
-    validate_cluster_batch(rebound, config.cells)
+    if not isinstance(batch, list) or len(batch) != len(config.cells):
+        raise ValueError("prepared cell member differs from active roster coverage")
+    old_config_id = fingerprint(provisional.to_dict())
+    rebound = []
+    for item in batch:
+        if not isinstance(item, dict) or not isinstance(item.get("identity"), dict):
+            raise ValueError("prepared cell calculation is malformed")
+        identity = CellIdentity(**item["identity"])
+        if (item.get("configuration") != provisional.to_dict()
+                or item.get("config_id") != old_config_id
+                or item.get("rules_version") != provisional.rules_version
+                or not isinstance(item.get("calculation"), dict)):
+            raise ValueError("prepared calculation metadata differs from its provisional config")
+        expected_calculation_id = fingerprint({
+            "generation_id": item.get("generation_id"), "config_id": old_config_id,
+            "rules_version": provisional.rules_version, "calculation": item["calculation"],
+        })
+        if item.get("calculation_id") != expected_calculation_id:
+            raise ValueError("prepared calculation fingerprint mismatch")
+        prepared = prepare_cell_day(
+            identity, item.get("manifest"), item.get("raw_rows"), item["calculation"],
+            config.to_dict(), config.rules_version,
+        )
+        if set(item) != set(prepared) or any(
+            item.get(key) != prepared[key] for key in (
+                "identity", "report_date", "generation_id", "source_sha256",
+                "raw_fingerprint", "manifest", "raw_rows", "calculation",
+            )
+        ):
+            raise ValueError("prepared source evidence changed during config rebind")
+        rebound.append(prepared)
+    _validate_cluster_batch_structure(rebound, config.cells)
     return rebound
 
 
-def _preflight_prepared(archive, entries, scratch_dir: Path):
+def _preflight_prepared(archive, entries, scratch_dir: Path, configs, spool: _BulkSpool):
+    spooled = {}
     for cluster, day in sorted(entries, key=lambda key: (int(key[0]), key[1])):
         entry = entries[(cluster, day)]
-        path, _, _, _ = _load_bulk_prepared_member(archive, entry, scratch_dir)
+        path, _, _, batch = _load_bulk_prepared_member(
+            archive, entry, scratch_dir, configs[cluster],
+        )
+        spooled[(cluster, day)] = spool.write(cluster, day, configs[cluster], batch)
         path.unlink(missing_ok=True)
+    return spooled
 
 
-def _source_facts_for_cluster(archive, entries, cluster: str, days, config, scratch_dir: Path):
+def _source_facts_for_cluster(spool: _BulkSpool, entries, cluster: str, days, config):
     facts = []
     for day in days:
-        entry = entries[(cluster, day)]
-        path, _, provisional, batch = _load_bulk_prepared_member(archive, entry, scratch_dir)
-        rebound = _rebind_batch(provisional, batch, config)
-        facts.extend(_facts_from_batch(config, rebound))
-        path.unlink(missing_ok=True)
+        batch = spool.read(entries[(cluster, day)], config)
+        facts.extend(_facts_from_batch(config, batch.items))
     return facts
 
 
@@ -474,7 +585,14 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
             archive, index, start, end, clusters, entries,
         ):
             days = list(_dates(start, end))
-            _preflight_prepared(archive, entries, scratch_dir)
+            configs = {
+                cluster: daily._cell_config(cluster, REPORTING_START_DATE)
+                for cluster in clusters
+            }
+            spool = _BulkSpool(scratch_dir)
+            prepared_spools = _preflight_prepared(
+                archive, entries, scratch_dir, configs, spool,
+            )
             if dry_run:
                 return {
                     "status": "DRY_RUN", "start_date": start, "end_date": end,
@@ -488,7 +606,7 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
             for cluster in clusters:
                 report("waiting_for_database_lock", cluster_id=cluster,
                        completed=len(handoff_paths), total=len(clusters))
-                config = daily._cell_config(cluster, REPORTING_START_DATE)
+                config = configs[cluster]
                 with session_factory(
                     target, {target}, cluster, "", password=database_password,
                     approved_sheet_ids=set(), write_gsheet=False,
@@ -500,40 +618,49 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
                         )
                     through = max(end, store.latest_report_date() or end)
                     submitted_dates = set(days)
-                    history_batches = recalculate_stale_history(
-                        store, config, through, submitted_dates=submitted_dates,
-                    )
+                    stale_spools = {}
+                    current_rows = store.current_results(REPORTING_START_DATE, through)
+                    stale_dates = stale_report_dates(current_rows, config, submitted_dates)
                     keyed = {
                         (fact["report_date"], fact["identity"]["cell_code"]): fact
-                        for fact in daily._facts(
-                            config, store.current_results(REPORTING_START_DATE, through),
-                        )
+                        for fact in daily._facts(config, current_rows)
+                        if fact["report_date"] not in stale_dates
                     }
-                    for cohort in history_batches:
+                    # Drop stale calculation payloads before rebuilding them cohort by cohort.
+                    current_states = [
+                        {"report_date": row["report_date"], "config_id": row["config_id"]}
+                        for row in current_rows
+                    ]
+                    del current_rows
+                    cohort = None
+                    for cohort in iter_recalculate_stale_history(
+                        store, config, through, submitted_dates=submitted_dates,
+                        current_results=current_states,
+                    ):
+                        cohort_day = cohort[0]["report_date"]
+                        stale_spools[cohort_day] = spool.write(
+                            cluster, cohort_day, config, cohort,
+                        )
                         for fact in _facts_from_batch(config, cohort):
                             keyed[(fact["report_date"], fact["identity"]["cell_code"])] = fact
+                    cohort = None
+                    del current_states
                     for fact in _source_facts_for_cluster(
-                        archive, entries, cluster, days, config, scratch_dir,
+                        spool, prepared_spools, cluster, days, config,
                     ):
                         keyed[(fact["report_date"], fact["identity"]["cell_code"])] = fact
                     build_cell_cluster_matrices_v2(
                         config, list(keyed.values()), through, dummy=True,
                     )
 
-                    stale_by_day = {batch[0]["report_date"]: batch for batch in history_batches}
                     handoff = None
                     with store.connection.transaction():
-                        for day in sorted(set(stale_by_day) | submitted_dates):
-                            if day in stale_by_day:
-                                batch = stale_by_day[day]
+                        for day in sorted(set(stale_spools) | submitted_dates):
+                            if day in stale_spools:
+                                batch = spool.read(stale_spools[day], config)
                             else:
-                                entry = entries[(cluster, day)]
-                                path, _, provisional, provisional_batch = _load_bulk_prepared_member(
-                                    archive, entry, scratch_dir,
-                                )
-                                batch = _rebind_batch(provisional, provisional_batch, config)
-                                path.unlink(missing_ok=True)
-                            store.commit_cluster_day(batch, config.cells)
+                                batch = spool.read(prepared_spools[(cluster, day)], config)
+                            store._commit_prevalidated_cluster_day(batch)
                         committed_through = store.latest_report_date()
                         committed = daily._current_history(store, config)
                         build_cell_cluster_matrices_v2(
@@ -629,6 +756,7 @@ def publish_cell_range(handoff_path: str, handoff_sha256: str, *,
                     session_factory=session_factory,
                     sheet_client_factory=shared_sheet_client,
                     refresh_request_id=refresh_request_id,
+                    publication_start_date=start,
                 )
                 results.append(result)
                 report("cluster_published", cluster_id=cluster,

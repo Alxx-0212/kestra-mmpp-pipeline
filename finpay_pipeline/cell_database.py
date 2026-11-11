@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from .cell_contracts import (
     CellIdentity, business_date, fingerprint, validate_source_entry,
@@ -175,8 +177,12 @@ def prepare_cell_day(identity: CellIdentity, entry: dict, raw_rows: list[dict],
     }
 
 
-def validate_cluster_batch(batch: list[dict], expected_cells: tuple[CellIdentity, ...]) -> None:
+def _validate_cluster_batch_structure(
+    batch: list[dict] | tuple[dict, ...], expected_cells: tuple[CellIdentity, ...],
+) -> None:
     if not batch or not expected_cells:
+        raise ValueError("complete cluster cell batch is required")
+    if not isinstance(batch, (list, tuple)) or any(not isinstance(item, dict) for item in batch):
         raise ValueError("complete cluster cell batch is required")
     expected = [cell.to_dict() for cell in expected_cells]
     if len({cell.cluster_id for cell in expected_cells}) != 1:
@@ -188,6 +194,10 @@ def validate_cluster_batch(batch: list[dict], expected_cells: tuple[CellIdentity
         raise ValueError("cluster batch mixes report dates")
     if len({item["config_id"] for item in batch}) != 1:
         raise ValueError("cluster batch mixes configuration versions")
+
+
+def validate_cluster_batch(batch: list[dict], expected_cells: tuple[CellIdentity, ...]) -> None:
+    _validate_cluster_batch_structure(batch, expected_cells)
     # Recompute derived hashes and gates; callers cannot mutate a prepared batch.
     for item in batch:
         identity = CellIdentity(**item["identity"])
@@ -197,6 +207,28 @@ def validate_cluster_batch(batch: list[dict], expected_cells: tuple[CellIdentity
         )
         if recomputed != item:
             raise ValueError("prepared cluster batch was modified")
+
+
+_SPOOLED_BATCH_SEAL = object()
+
+
+@dataclass(frozen=True)
+class _PrevalidatedClusterBatch:
+    items: tuple[dict, ...]
+    expected_cells: tuple[CellIdentity, ...]
+    spool_sha256: str
+    seal: object
+
+
+def _validated_cluster_batch_from_spool(
+    batch: list[dict], expected_cells: tuple[CellIdentity, ...], spool_sha256: str,
+) -> _PrevalidatedClusterBatch:
+    if not re.fullmatch(r"[0-9a-f]{64}", spool_sha256):
+        raise ValueError("validated cluster spool checksum is invalid")
+    _validate_cluster_batch_structure(batch, expected_cells)
+    return _PrevalidatedClusterBatch(
+        tuple(batch), expected_cells, spool_sha256, _SPOOLED_BATCH_SEAL,
+    )
 
 
 class CellStore:
@@ -288,6 +320,18 @@ class CellStore:
 
     def commit_cluster_day(self, batch: list[dict], expected_cells: tuple[CellIdentity, ...]):
         validate_cluster_batch(batch, expected_cells)
+        return self._commit_cluster_day_items(batch, expected_cells)
+
+    def _commit_prevalidated_cluster_day(self, batch: _PrevalidatedClusterBatch):
+        """Commit a checksummed bulk spool batch without rescanning its raw rows."""
+        if (not isinstance(batch, _PrevalidatedClusterBatch)
+                or batch.seal is not _SPOOLED_BATCH_SEAL
+                or not re.fullmatch(r"[0-9a-f]{64}", batch.spool_sha256)):
+            raise ValueError("bulk persistence requires a verified cluster spool")
+        return self._commit_cluster_day_items(batch.items, batch.expected_cells)
+
+    def _commit_cluster_day_items(self, batch, expected_cells):
+        _validate_cluster_batch_structure(batch, expected_cells)
         if expected_cells[0].cluster_id != self.cluster_id:
             raise ValueError("cluster batch differs from session lock scope")
         self.assert_alive()
@@ -334,13 +378,7 @@ class CellStore:
                     _json(item["manifest"]),
                 )).fetchone()
                 if inserted:
-                    for position, row in enumerate(item["raw_rows"], 1):
-                        self._execute(self._query(
-                            "INSERT INTO {} (generation_id,source_position,transaction_id,"
-                            "row_fingerprint,raw_row) VALUES (%s,%s,%s,%s,%s::jsonb)",
-                            "finpay_cell_ledger_v1",
-                        ), (item["generation_id"], position, row["Transaction ID"],
-                            fingerprint(row), _json(row)))
+                    self._copy_new_generation_rows(item)
                 else:
                     existing = self._execute(self._query(
                         "SELECT raw_fingerprint,row_count FROM {} WHERE generation_id=%s",
@@ -373,6 +411,20 @@ class CellStore:
                 ), (self.cluster_id, batch[0]["report_date"],
                     fingerprint(sorted(item["calculation_id"] for item in batch)), reset_required))
         return [item["calculation_id"] for item in batch]
+
+    def _copy_new_generation_rows(self, item):
+        if not item["raw_rows"]:
+            return
+        with self.connection.cursor() as cursor:
+            with cursor.copy(self._query(
+                "COPY {} (generation_id,source_position,transaction_id,row_fingerprint,raw_row) "
+                "FROM STDIN", "finpay_cell_ledger_v1",
+            )) as copy:
+                for position, row in enumerate(item["raw_rows"], 1):
+                    copy.write_row((
+                        item["generation_id"], position, row["Transaction ID"],
+                        fingerprint(row), Jsonb(row),
+                    ))
 
     def current_results(self, start: str, end: str) -> list[dict]:
         self.assert_alive()
@@ -505,22 +557,30 @@ class CellStore:
         ), (self.cluster_id,)).fetchone()
         return row[0].isoformat() if row and row[0] else None
 
-    def current_source_rows(self, start, end):
+    def iter_current_source_rows(self, start, end):
         self.assert_alive()
         statement = sql.SQL(
-            "SELECT source.manifest, COALESCE(jsonb_agg(ledger.raw_row ORDER BY ledger.source_position) "
-            "FILTER (WHERE ledger.source_position IS NOT NULL), '[]'::jsonb) "
+            "SELECT source.manifest, COALESCE((SELECT jsonb_agg(ledger.raw_row "
+            "ORDER BY ledger.source_position) FROM {ledger} AS ledger "
+            "WHERE ledger.generation_id=source.generation_id), '[]'::jsonb) "
             "FROM {current} AS selected JOIN {sources} AS source ON selected.generation_id=source.generation_id "
-            "LEFT JOIN {ledger} AS ledger ON ledger.generation_id=source.generation_id "
             "WHERE selected.cluster_id=%s AND selected.report_date BETWEEN %s AND %s "
-            "GROUP BY source.generation_id,source.manifest,selected.report_date,selected.cell_code "
             "ORDER BY selected.report_date,selected.cell_code"
         ).format(**{key: sql.Identifier(self.target.schema, name) for key, name in {
             "current": "finpay_cell_current_v1", "sources": "finpay_cell_sources_v1",
             "ledger": "finpay_cell_ledger_v1",
         }.items()})
-        rows = self._execute(statement, (self.cluster_id, business_date(start), business_date(end))).fetchall()
-        return [{"manifest": row[0], "raw_rows": row[1]} for row in rows]
+        params = (self.cluster_id, business_date(start), business_date(end))
+        # A named cursor keeps raw history bounded to one cell/day cohort.
+        with self.connection.transaction():
+            with self.connection.cursor(name=f"cell_source_history_{uuid.uuid4().hex}") as cursor:
+                cursor.execute(statement, params)
+                while rows := cursor.fetchmany(1):
+                    manifest, raw_rows = rows[0]
+                    yield {"manifest": manifest, "raw_rows": raw_rows}
+
+    def current_source_rows(self, start, end):
+        return list(self.iter_current_source_rows(start, end))
 
     def dirty_dates(self, *, reset_only=False):
         self.assert_alive()

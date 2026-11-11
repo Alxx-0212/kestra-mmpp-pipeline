@@ -402,8 +402,8 @@ def preprocess_cell_day(source_bundle: str, source_bundle_sha256: str, report_da
             "prepared_sha256": digest, "prepared_bytes": size}
 
 
-def _load_prepared(path: str | Path, sha256: str, cluster_id: str | None = None,
-                   report_date: str | None = None) -> tuple[dict, object, list[dict]]:
+def _read_prepared_artifact(path: str | Path, sha256: str, cluster_id: str | None = None,
+                            report_date: str | None = None) -> tuple[dict, object, list[dict]]:
     prepared = _read_json(path, sha256, MAX_PREPARED_BYTES)
     if prepared.get("schema_version") != 1:
         raise ValueError("unsupported cell prepared-artifact schema")
@@ -419,8 +419,16 @@ def _load_prepared(path: str | Path, sha256: str, cluster_id: str | None = None,
             or prepared.get("roster_fingerprint") != roster_fingerprint(config.cells)):
         raise ValueError("prepared artifact roster identity mismatch")
     batch = prepared.get("batch")
+    if not isinstance(batch, list):
+        raise ValueError("prepared artifact batch must be a list")
+    return prepared, config, batch
+
+
+def _load_prepared(path: str | Path, sha256: str, cluster_id: str | None = None,
+                   report_date: str | None = None) -> tuple[dict, object, list[dict]]:
+    prepared, config, batch = _read_prepared_artifact(path, sha256, cluster_id, report_date)
     validate_cluster_batch(batch, config.cells)
-    if any(item["report_date"] != day for item in batch):
+    if any(item.get("report_date") != prepared["report_date"] for item in batch):
         raise ValueError("prepared artifact mixes report dates")
     configuration = config.to_dict()
     config_id = fingerprint(configuration)
@@ -429,6 +437,12 @@ def _load_prepared(path: str | Path, sha256: str, cluster_id: str | None = None,
            or item.get("rules_version") != config.rules_version for item in batch):
         raise ValueError("prepared calculations do not match the code-owned provisional config")
     return prepared, config, batch
+
+
+def _load_prepared_for_rebind(path: str | Path, sha256: str, cluster_id: str,
+                              report_date: str) -> tuple[dict, object, list[dict]]:
+    """Read a bulk member's envelope; row validation is performed by the single rebind pass."""
+    return _read_prepared_artifact(path, sha256, cluster_id, report_date)
 
 
 def _facts(config, rows):
@@ -642,13 +656,20 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
                         credentials_info: dict | None, cluster_id: str | None = None,
                         dry_run: bool = False, target=None, session_factory=cell_publication_session,
                         sheet_client_factory=make_cell_sheet_client,
-                        refresh_request_id: str | None = None) -> dict:
+                        refresh_request_id: str | None = None,
+                        publication_start_date: str | None = None) -> dict:
     """Recheck the selected source scope under locks, then publish guarded tabs."""
     validate_refresh_request_id(refresh_request_id)
     if type(dry_run) is not bool:
         raise ValueError("dry_run must be an explicit boolean")
     handoff = _read_json(handoff_path, handoff_sha256, MAX_HANDOFF_BYTES)
     actual_cluster, config = _validate_handoff(handoff)
+    if publication_start_date is not None:
+        if handoff.get("scope", "history") != "history":
+            raise ValueError("incremental Sheet publication requires a full-history handoff")
+        publication_start_date = business_date(publication_start_date).isoformat()
+        if publication_start_date > handoff["submitted_report_date"]:
+            raise ValueError("publication start date must not be after the submitted range end")
     report("handoff_validated", cluster_id=actual_cluster)
     if cluster_id is not None and cluster_id != actual_cluster:
         raise ValueError("cell Sheet handoff cluster differs from task input")
@@ -714,6 +735,7 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
             publication_only=True, preserve_manual_inputs=True,
             refresh_request_id=refresh_request_id, date_scoped=date_scoped,
             report_date=handoff["submitted_report_date"] if date_scoped else None,
+            write_from_date=publication_start_date,
         )
         report("publication_verified", completed=4, total=4)
     return {"status": "COMPLETE", "cluster_id": actual_cluster,

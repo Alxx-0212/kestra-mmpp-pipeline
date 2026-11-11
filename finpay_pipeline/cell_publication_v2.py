@@ -36,6 +36,7 @@ def cell_worksheet_title(account, role, naming_scheme="code"):
     alias = CLUSTER_ALIASES[account]
     return alias if role == "summary" else f"{alias} {role.title()}"
 STYLE_REVISION = "finpay-cell-invoice-bank-validation-20261018"
+MAX_SHEET_TAIL_SCAN_ROWS = 5_000
 # Pinned from the original PKY invoice/detail formatting, not from writer requests.
 STYLE_PALETTE = {
     "header": "1F4E78", "white": "FFFFFF", "black": "000000", "grid": "A5B2BF",
@@ -576,7 +577,10 @@ def _merge_summary_date(prior, replacement, report_date, preserve_saldo_chain):
         "report_fingerprint": fingerprint(values),
     }
     target = next(item for item in ranges if item["report_date"] == report_date)
-    patch = {"start_row": target["start_row"] - 1, "row_count": new_count}
+    patch = {"start_row": target["start_row"] - 1, "row_count": new_count,
+             "matrix_height_before": len(prior["values"]) if prior else 0,
+             "old_data_start": old_range[0] if old_range else insertion_index,
+             "old_data_count": old_count}
     patch.update(_row_operation(old_range, new_count, insertion_index))
     if prior is None:
         patch.update({"start_row": 0, "row_count": len(values), "initial": True})
@@ -655,7 +659,10 @@ def _merge_invoice_date(prior, replacement, report_date):
     }
     target = next(item for item in ranges if item["report_date"] == report_date)
     patch.update({"start_row": target["start_row"] - 1, "row_count": new_count,
-                  "spacer_ranges": spacer_ranges})
+                  "spacer_ranges": spacer_ranges,
+                  "matrix_height_before": len(prior["values"]) if prior else 0,
+                  "old_data_start": old_range[0] if old_range else insertion_index,
+                  "old_data_count": old_count})
     if old_range is None and old_groups and report_date > max(old_groups):
         patch["start_row"] = insertion_index + 2
     if prior is None:
@@ -702,7 +709,10 @@ def _merge_detail_date(role, prior, replacement, report_date):
     patch = _row_operation(old_range, new_count, insertion_index)
     target = next((item for item in ranges if item["report_date"] == report_date), None)
     patch.update({"start_row": target["start_row"] - 1 if target else insertion_index,
-                  "row_count": new_count})
+                  "row_count": new_count,
+                  "matrix_height_before": len(prior["values"]) if prior else 0,
+                  "old_data_start": old_range[0] if old_range else insertion_index,
+                  "old_data_count": old_range[1] if old_range else 0})
     if prior is None:
         patch.update({"start_row": 0, "row_count": len(values), "initial": True})
         patch.pop("insert_row", None)
@@ -723,9 +733,173 @@ def merge_cell_date_matrix(role, prior, replacement, report_date, *, preserve_sa
     raise ValueError("unknown cell worksheet role")
 
 
+def _suffix_start_row(matrix, role, start_date):
+    first_data_row = 3 if role == "summary" else 2 if role == "invoice" else 1
+    for index, row in enumerate(matrix["values"][first_data_row:], first_data_row):
+        day = _sheet_date(row[0]) if row else None
+        if day and day >= start_date:
+            return index
+    return len(matrix["values"])
+
+
+def _matrix_date_ranges(role, matrix):
+    return [{"report_date": day, "start_row": start + 1, "end_row": start + count}
+            for day, (start, count) in sorted(_date_groups(role, matrix).items())]
+
+
+def _prefix_layout(role, matrix, end_row):
+    values = matrix["values"][:end_row]
+    if role == "summary":
+        return [(row[0], matrix["row_keys"][index]) for index, row in enumerate(values)]
+    if role == "invoice":
+        sections = matrix.get("row_sections", [])
+        return [(row[0], sections[index] if index < len(sections) else None)
+                for index, row in enumerate(values)]
+    return [tuple(row[:3]) for row in values]
+
+
+def _require_unchanged_source_prefix(previous, current, start_date):
+    old_sources = previous.get("source_calculations")
+    new_sources = current.get("source_calculations")
+    if not isinstance(old_sources, dict) or not isinstance(new_sources, dict):
+        raise ValueError("incremental publication requires saved source fingerprints for the prefix")
+    old_prefix = {day: value for day, value in old_sources.items() if day < start_date}
+    new_prefix = {day: value for day, value in new_sources.items() if day < start_date}
+    if old_prefix != new_prefix:
+        raise ValueError("source history before publication start changed; widen the range start date")
+
+
+def merge_cell_suffix(role, prior, replacement, start_date, manual_values=None):
+    """Merge regenerated rows from column-A date onward, retaining the old prefix."""
+    start_date = business_date(start_date).isoformat()
+    old_start = _suffix_start_row(prior, role, start_date)
+    actual_new_start = _suffix_start_row(replacement, role, start_date)
+    if old_start == len(prior["values"]):
+        gap = replacement["values"][old_start:actual_new_start]
+        if role == "invoice" and _matrix_date_ranges(role, prior):
+            sections = replacement.get("row_sections", [])
+            if (len(gap) != 2 or any(value not in ("", None) for row in gap for value in row)
+                    or any(sections[index] is not None
+                           for index in range(old_start, actual_new_start))):
+                raise ValueError("new pre-start invoice rows exist after the saved prefix")
+        elif gap:
+            raise ValueError("new rows before the requested start date exist after the saved prefix")
+        new_start = old_start
+    else:
+        new_start = actual_new_start
+    if old_start != new_start or _prefix_layout(role, prior, old_start) != _prefix_layout(role, replacement, new_start):
+        raise ValueError("worksheet rows before publication start differ; widen the range start date")
+    if len(prior["values"][0]) != len(replacement["values"][0]):
+        raise ValueError("incremental worksheet width changed")
+
+    values = [row[:] for row in prior["values"][:old_start]]
+    values.extend(row[:] for row in replacement["values"][new_start:])
+    old_ranges, new_ranges = _matrix_date_ranges(role, prior), _matrix_date_ranges(role, replacement)
+    if role in ("summary", "invoice"):
+        old_suffix_dates = [item["report_date"] for item in old_ranges
+                            if item["report_date"] >= start_date]
+        new_suffix_dates = [item["report_date"] for item in new_ranges
+                            if item["report_date"] >= start_date]
+        if old_suffix_dates and (not new_suffix_dates or max(old_suffix_dates) > max(new_suffix_dates)):
+            raise ValueError("saved Sheet history extends beyond current report history; refusing to truncate it")
+    ranges = ([item for item in old_ranges if item["report_date"] < start_date] +
+              [item for item in new_ranges if item["report_date"] >= start_date])
+    matrix = {**replacement, "values": values, "date_ranges": ranges,
+              "dates": [item["report_date"] for item in ranges]}
+
+    if role == "summary":
+        old_stripes = prior.get("row_stripes", [
+            "detail" if index % 2 else "white" for index in range(len(prior["values"]))
+        ])
+        new_stripes = replacement.get("row_stripes", [
+            "detail" if index % 2 else "white" for index in range(len(replacement["values"]))
+        ])
+        matrix.update({
+            "numeric_preview": ([row[:] for row in prior["numeric_preview"][:old_start]] +
+                                [row[:] for row in replacement["numeric_preview"][new_start:]]),
+            "row_keys": prior["row_keys"][:old_start] + replacement["row_keys"][new_start:],
+            "row_stripes": old_stripes[:old_start] + new_stripes[new_start:],
+            "editable_inputs": ([item for item in prior["editable_inputs"]
+                                 if item["report_date"] < start_date] +
+                                [item for item in replacement["editable_inputs"]
+                                 if item["report_date"] >= start_date]),
+            "manual_reset_audit": [],
+        })
+        for entry in matrix["editable_inputs"]:
+            if entry["report_date"] >= start_date:
+                continue
+            key = (entry["report_date"], entry["cell_code"])
+            if key in (manual_values or {}):
+                row, column = entry["row"] - 1, entry["column"] - 1
+                matrix["values"][row][column] = manual_values[key]
+                matrix["numeric_preview"][row][column] = manual_values[key]
+        matrix["report_fingerprint"] = fingerprint(values)
+    elif role == "invoice":
+        old_sections = prior.get("row_sections", [None] * len(prior["values"]))
+        new_sections = replacement.get("row_sections", [None] * len(replacement["values"]))
+        matrix.update({
+            "row_sections": old_sections[:old_start] + new_sections[new_start:],
+            "section_ranges": ([item for item in prior.get("section_ranges", [])
+                                if item.get("report_date", "") < start_date] +
+                               [item for item in replacement.get("section_ranges", [])
+                                if item.get("report_date", "") >= start_date]),
+            "qris_subtitle_rows": ([row for row in prior.get("qris_subtitle_rows", [])
+                                    if row <= old_start] +
+                                   [row for row in replacement.get("qris_subtitle_rows", [])
+                                    if row > new_start]),
+            "qris_child_rows": ([row for row in prior.get("qris_child_rows", [])
+                                 if row <= old_start] +
+                                [row for row in replacement.get("qris_child_rows", [])
+                                 if row > new_start]),
+            "fingerprint": fingerprint(values),
+        })
+    else:
+        old_stripes = prior.get("row_stripes", [
+            "white" if index % 2 else "stripe" for index in range(len(prior["values"]))
+        ])
+        new_stripes = replacement.get("row_stripes", [
+            "white" if index % 2 else "stripe" for index in range(len(replacement["values"]))
+        ])
+        matrix.update({
+            "rows": values,
+            "row_stripes": old_stripes[:old_start] + new_stripes[new_start:],
+            "day_separator_rows": [item["start_row"] for item in ranges],
+            "row_count": len(values) - 1,
+            "empty": len(values) == 1,
+        })
+
+    old_count, new_count = len(prior["values"]) - old_start, len(replacement["values"]) - new_start
+    patch = {"start_row": old_start, "row_count": new_count, "old_row_count": old_count,
+             "matrix_height_before": len(prior["values"]), "old_data_start": old_start,
+             "old_data_count": old_count, "range_suffix": True}
+    if role == "invoice" and old_start == len(prior["values"]):
+        first_date_row = _suffix_start_row(replacement, role, start_date)
+        if first_date_row > new_start:
+            patch["spacer_ranges"] = [(new_start, first_date_row)]
+    if new_count > old_count:
+        patch.update({"insert_row": len(prior["values"]), "insert_count": new_count - old_count})
+    elif new_count < old_count:
+        patch.update({"delete_row": old_start + new_count, "delete_count": old_count - new_count})
+    matrix = bind_cell_style_contract(role, matrix)
+    return matrix, patch
+
+
 def _date_format_requests(role, target, matrix, patch):
     start, end = patch["start_row"], patch["start_row"] + patch["row_count"]
-    intervals = [(start, end), *patch.get("spacer_ranges", [])]
+    spacers = sorted(patch.get("spacer_ranges", []))
+    intervals = [(start, end)]
+    for first, last in spacers:
+        remainder = []
+        for interval_start, interval_end in intervals:
+            if last <= interval_start or first >= interval_end:
+                remainder.append((interval_start, interval_end))
+            else:
+                if interval_start < first:
+                    remainder.append((interval_start, first))
+                if last < interval_end:
+                    remainder.append((last, interval_end))
+        intervals = remainder
+    intervals = sorted(set(intervals + spacers))
     requests = (_format_requests(target.sheet_target(), matrix) if role == "summary" else
         invoice_format_requests(target.worksheet_id, matrix) if role == "invoice" else
         detail_format_requests(target.worksheet_id, matrix))
@@ -786,26 +960,41 @@ def _source_calculation_history(rows):
 def _validate_deleted_row_tails(saved, adapters, metadata, call):
     for role in ROLES:
         patch = saved[role].get("patch", {})
-        delete_count = patch.get("delete_count", 0)
-        if not delete_count:
+        data_count = patch.get("old_data_count", 0)
+        shifts_rows = bool(patch.get("insert_count", 0) or patch.get("delete_count", 0))
+        if not data_count and not shifts_rows:
             continue
         grid = metadata[role].get("properties", {}).get("gridProperties", {})
         columns = grid.get("columnCount")
         width = len(saved[role]["values"][0])
         if type(columns) is not int or columns < width:
-            raise ValueError("cannot verify the worksheet width before deleting rows")
+            raise ValueError("cannot verify worksheet dimensions before row changes")
         if columns > 100:
-            raise ValueError("cannot safely inspect off-matrix cells before deleting rows")
-        if columns == width:
-            continue
-        start = patch["delete_row"]
-        end = start + delete_count
+            raise ValueError("cannot safely inspect off-matrix cells before row changes")
         reader = getattr(adapters[role], "read_range", None)
-        values = (call(reader, start, end, columns) if reader else
-                  call(adapters[role].read, end, columns)[start:end])
-        rows = _padded(values, delete_count, columns)
-        if any(value not in ("", None) for row in rows for value in row[width:]):
-            raise ValueError("row deletion would remove unmanaged cells outside the saved matrix width")
+        if data_count and columns > width:
+            start = patch["old_data_start"]
+            end = start + data_count
+            values = (call(reader, start, end, columns, width) if reader else
+                      [row[width:] for row in call(adapters[role].read, end, columns)[start:end]])
+            rows = _padded(values, data_count, columns - width)
+            if any(value not in ("", None) for row in rows for value in row):
+                raise ValueError("range rewrite would affect unmanaged cells outside the saved matrix width")
+        if shifts_rows:
+            grid_rows = grid.get("rowCount")
+            matrix_height = patch.get("matrix_height_before")
+            if (type(grid_rows) is not int or type(matrix_height) is not int
+                    or matrix_height < 0 or matrix_height > grid_rows):
+                raise ValueError("cannot verify the worksheet tail before shifting rows")
+            tail_count = grid_rows - matrix_height
+            if tail_count > MAX_SHEET_TAIL_SCAN_ROWS:
+                raise ValueError("worksheet tail is too large to verify safely before shifting rows")
+            if tail_count:
+                values = (call(reader, matrix_height, grid_rows, columns, 0) if reader else
+                          call(adapters[role].read, grid_rows, columns)[matrix_height:grid_rows])
+                rows = _padded(values, tail_count, columns)
+                if any(value not in ("", None) for row in rows for value in row):
+                    raise ValueError("row change would reflow unmanaged cells below the saved matrix")
 
 
 def _restore_prior_guards(prior, targets, adapters, guarded, guards, previous, send, call):
@@ -1054,6 +1243,7 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                             changed_dates=None, additional_batches=None, configuration_only=False,
                             rows_per_request=200, publication_only=False,
                             preserve_manual_inputs=False, date_scoped=False, report_date=None,
+                            write_from_date: str | None = None,
                             refresh_request_id: str | None = None):
     """Publish four tabs; an optional refresh ID makes same-execution retries write-free."""
     from psycopg import InterfaceError, OperationalError
@@ -1065,11 +1255,17 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
     )):
         raise ValueError("publication mode flags must be explicit booleans")
     if date_scoped:
-        if not publication_only or report_date is None:
+        if not publication_only or report_date is None or write_from_date is not None:
             raise ValueError("date-scoped publication requires a persisted date handoff")
         submitted_date = business_date(report_date).isoformat()
     elif report_date is not None:
         raise ValueError("report_date is only valid for a date-scoped publication")
+    if write_from_date is not None:
+        if not publication_only:
+            raise ValueError("suffix publication requires committed full-history input")
+        write_from_date = business_date(write_from_date).isoformat()
+        if write_from_date < config.first_report_date:
+            raise ValueError("suffix publication start precedes the reporting boundary")
     if refresh_request_id is not None and not publication_only:
         raise ValueError("refresh request ID requires committed publication-only history")
     if publication_only:
@@ -1078,6 +1274,8 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
         submitted = submitted_date if date_scoped else store.latest_report_date()
         if not submitted:
             raise ValueError("publication-only mode requires committed cell history")
+        if write_from_date is not None and write_from_date > submitted:
+            raise ValueError("suffix publication start is after the latest report date")
         additional_batches = []
     else:
         validate_cluster_batch(batch, config.cells)
@@ -1181,6 +1379,9 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             return {"epoch": publication["epoch"], "fingerprint": publication["fingerprint"],
                     "status": "COMPLETE", "roles": list(ROLES)}
     prior = previous["snapshot"]["worksheets"] if previous else None
+    if (write_from_date is not None and prior is None
+            and write_from_date > config.first_report_date):
+        raise ValueError("a new bulk Sheet must start at the reporting boundary before suffix updates")
     metadata = {role: call(adapters[role].metadata) for role in ROLES}
     operation_id = uuid.uuid4().hex
     store.begin_target_operation(operation_id)
@@ -1292,6 +1493,10 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                 set(session.dirty_dates(reset_only=True)) if preserve_manual_inputs else
                 (set() if configuration_only else {submitted}) | set(session.dirty_dates(reset_only=True))
             )
+            if write_from_date is not None:
+                if any(day < write_from_date for day in reset):
+                    raise ValueError("dirty report dates precede publication start; widen the range start date")
+                reset = [day for day in reset if day >= write_from_date]
             report = build_cluster_report(config, days, through)
             matrices = build_cell_cluster_matrices_v2(config, days, through, summary_manual_values=manual,
                 summary_reset_dates=mandiri_reset_dates(report, reset) if reset and prior else set())
@@ -1305,14 +1510,25 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             }
             if refresh_request_id is not None:
                 snapshot["refresh_request_id"] = refresh_request_id
+            if write_from_date is not None and prior is not None:
+                _require_unchanged_source_prefix(previous["snapshot"], snapshot, write_from_date)
+                worksheets = snapshot["worksheets"]
+                for role in ROLES:
+                    matrix, patch = merge_cell_suffix(
+                        role, prior[role]["matrix"], matrices[role], write_from_date, manual,
+                    )
+                    worksheets[role]["values"] = matrix["values"]
+                    worksheets[role]["matrix"] = matrix
+                    worksheets[role]["patch"] = patch
+                snapshot["write_from_date"] = write_from_date
             return {"start": config.first_report_date, "end": through, "snapshot": snapshot,
                     "refresh_audit_required": bool(audits)}
 
         if publication_only:
             rendered = render_committed(store)
-            if date_scoped:
+            if date_scoped or (write_from_date is not None and prior is not None):
                 _validate_deleted_row_tails(
-                    rendered["snapshot"]["worksheets"], adapters, metadata, call,
+                    rendered["snapshot"]["worksheets"], adapters, guarded, call,
                 )
             staged = store.stage_publication(
                 rendered["start"], rendered["end"], rendered["snapshot"],
@@ -1328,6 +1544,7 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                                       audit["previous_value"], audit["replacement_value"])
         marker = {"status": "PENDING", "epoch": staged["epoch"], "fingerprint": staged["fingerprint"]}
         report("publication_staged")
+        incremental_range = write_from_date is not None and prior is not None
         if staged["status"] != "COMPLETE":
             setup = []
             for role in ROLES:
@@ -1348,7 +1565,7 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             send(setup)
             for role in ROLES:
                 _verify_marker(call(adapters[role].metadata), marker)
-            if date_scoped:
+            if date_scoped or incremental_range:
                 _write_date_snapshot(saved, targets, adapters, store, staged["epoch"],
                                      mutate, send_formatting, report, rows_per_request)
             else:

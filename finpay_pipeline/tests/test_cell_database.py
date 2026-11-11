@@ -28,6 +28,41 @@ class Result:
         return self.rows
 
 
+class FakeCopy:
+    def __init__(self, connection, query):
+        self.connection = connection
+        self.query = query
+        self.written = 0
+
+    def __enter__(self):
+        self.connection.calls.append((self.query.as_string(), ()))
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def write_row(self, params):
+        if self.connection.fail_ledger and self.written:
+            raise RuntimeError("synthetic COPY failure after a partial generation")
+        raw_row = getattr(params[4], "obj", params[4])
+        self.connection.state["ledger"].append((*params[:4], raw_row))
+        self.written += 1
+
+
+class FakeCursor:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def copy(self, query):
+        return FakeCopy(self.connection, query)
+
+
 class FakeConnection:
     def __init__(self):
         self.closed = False
@@ -173,6 +208,9 @@ class FakeConnection:
     def close(self):
         self.closed = True
 
+    def cursor(self, name=None):
+        return FakeCursor(self)
+
 
 class CellDatabaseTests(unittest.TestCase):
     def test_cluster_publication_route_cannot_fork_across_workbooks(self):
@@ -312,8 +350,11 @@ class CellDatabaseTests(unittest.TestCase):
         self.assertEqual(len(self.database.state["ledger"]), 4)
         for row in self.database.state["ledger"]:
             self.assertEqual(row[2], "000123")
-            self.assertNotIn("No", json.loads(row[4]))
+            self.assertNotIn("No", row[4])
         self.assertEqual(self.database.commits, 2)
+        self.assertEqual(
+            sum(query.startswith("COPY ") for query, _ in self.database.calls), 2,
+        )
 
     def test_correction_empty_replaces_only_its_cell_and_retains_old_generations(self):
         first = [self.prepared(cell) for cell in self.cells]
@@ -336,6 +377,8 @@ class CellDatabaseTests(unittest.TestCase):
             for batch in (valid[:1], [valid[0]] * 2):
                 with self.assertRaises(ValueError):
                     store.commit_cluster_day(batch, self.cells)
+            with self.assertRaisesRegex(ValueError, "verified cluster spool"):
+                store._commit_prevalidated_cluster_day(valid)
             modified = copy.deepcopy(valid)
             modified[0]["calculation"]["summary"]["credit"] = 999
             with self.assertRaises(ValueError):
