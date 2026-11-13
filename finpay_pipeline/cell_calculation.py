@@ -196,7 +196,9 @@ def calculate_cell_day(identity: CellIdentity, entry: dict, raw_rows: list[dict]
             preprocessed, comparison_frame=comparison,
         )
         validation_unusual, excluded, _ = _collect_validation_unusual_transactions(
-            deduplicated, cell_policy=True,
+            deduplicated,
+            cell_policy=True,
+            allow_unknown_disbursement_remarks=True,
         )
         parts = [frame for frame in (validation_unusual, duplicates) if not frame.empty]
         unusual = pd.concat(parts, ignore_index=True, sort=False) if parts else validation_unusual

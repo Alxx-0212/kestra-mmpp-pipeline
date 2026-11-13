@@ -244,6 +244,26 @@ class UnknownTransactionContractTest(unittest.TestCase):
             set(classification.KNOWN_TRANSACTION_REMARK_PATTERNS),
         )
 
+    def test_disbursement_remains_summary_eligible_with_unrecognized_remarks(self):
+        df = _non_reversal_rows(["DISBURSEMENT"])
+        df.loc[0, "Remarks"] = "Legacy v5 Disbursement description"
+        preprocessed = classification.preprocess_transaction_labels(df)
+
+        unusual = classification.flag_unusual_transactions(
+            preprocessed,
+            allow_unknown_disbursement_remarks=True,
+        )
+        summary_ready, summary_unusual = (
+            classification.prepare_reversal_summary_transactions(
+                preprocessed,
+                allow_unknown_disbursement_remarks=True,
+            )
+        )
+
+        self.assertTrue(unusual.empty)
+        self.assertTrue(summary_unusual.empty)
+        self.assertEqual(summary_ready["Transaction"].tolist(), ["DISBURSEMENT"])
+
     def test_fee_transaksi_remains_known_after_case_insensitive_normalization(self):
         df = _non_reversal_rows(["FeeTransaksi"])
         df.loc[0, "Transaction"] = "fEeTrAnSaKsI"
@@ -1339,6 +1359,21 @@ class FinPayMonthlyTransactionContractTest(unittest.TestCase):
             loaded_source_dates=expected_dates,
             source_fingerprint="fingerprint-1",
         )
+
+    def test_unrecognized_disbursement_remarks_remain_ineligible_monthly(self):
+        result = self._preview([{
+            "transaction_date": pd.Timestamp("2026-08-01 10:00:00"),
+            "transaction_id": "DISB1",
+            "raw_transaction_label": "DISBURSEMENT",
+            "remarks": "Legacy v5 Disbursement description",
+            "kredit": 500,
+            "debet": 0,
+        }], ["2026-08-01"])
+
+        self.assertEqual(len(result["unusual_rows"]), 1)
+        self.assertEqual(result["unusual_rows"][0]["Transaction"], "DISBURSEMENT")
+        self.assertFalse(result["transaction_rows"][0]["eligible"])
+        self.assertEqual(result["category_rows"], [])
 
     def test_complete_exact_id_reversal_cancels_original_once(self):
         result = self._preview([

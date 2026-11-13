@@ -599,13 +599,15 @@ def _unknown_remark_reason(transaction_value: object) -> str:
 
 def _collect_unknown_transaction_or_remark_unusual_transactions(
     df: pd.DataFrame,
+    *,
+    allow_unknown_disbursement_remarks: bool = False,
 ) -> tuple[pd.DataFrame, set[int]]:
     """
     Return rows whose Transaction label or normalized Remarks are not known.
 
-    The summary sheet writes a fixed set of transaction labels. Unknown labels
-    and known labels with unrecognized remark structures are therefore flagged
-    and excluded instead of silently disappearing from the user-facing report.
+    The summary sheet writes a fixed set of labels. Unknown labels and
+    non-authoritative labels with unrecognized remark structures are excluded.
+    Daily v5 and cell callers may treat DISBURSEMENT as label-authoritative.
     """
     source = df.copy()
     if 'base_id' not in source.columns:
@@ -619,6 +621,8 @@ def _collect_unknown_transaction_or_remark_unusual_transactions(
     normalized_remarks = source['Remarks'].map(_normalize_remark_pattern)
     remark_mismatch_mask = pd.Series(False, index=source.index)
     for transaction, known_patterns in KNOWN_TRANSACTION_REMARK_PATTERNS.items():
+        if allow_unknown_disbursement_remarks and transaction == 'DISBURSEMENT':
+            continue
         transaction_mask = transactions.eq(transaction)
         remark_mismatch_mask |= (
             transaction_mask & ~normalized_remarks.isin(known_patterns)
@@ -1046,10 +1050,14 @@ def _collect_validation_unusual_transactions(
     df: pd.DataFrame,
     *,
     cell_policy: bool = False,
+    allow_unknown_disbursement_remarks: bool = False,
 ) -> tuple[pd.DataFrame, set[int], dict[str, int]]:
     """Evaluate all non-duplicate rows through one shared disposition path."""
     unknown_unusual_df, unknown_excluded_indices = (
-        _collect_unknown_transaction_or_remark_unusual_transactions(df)
+        _collect_unknown_transaction_or_remark_unusual_transactions(
+            df,
+            allow_unknown_disbursement_remarks=allow_unknown_disbursement_remarks,
+        )
     )
     known_result = (
         df.drop(index=sorted(unknown_excluded_indices))
@@ -1113,11 +1121,16 @@ def _collect_validation_unusual_transactions(
 
 def prepare_reversal_summary_transactions(
     df: pd.DataFrame,
+    *,
+    allow_unknown_disbursement_remarks: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Prepare summary rows and unusual rows through one shared evaluator."""
     result = ensure_reversal_labels_prepared(df)
     unusual_df, all_excluded_indices, categorized_counts = (
-        _collect_validation_unusual_transactions(result)
+        _collect_validation_unusual_transactions(
+            result,
+            allow_unknown_disbursement_remarks=allow_unknown_disbursement_remarks,
+        )
     )
     summary_ready = (
         result.drop(index=sorted(all_excluded_indices)).reset_index(drop=True)
@@ -1183,7 +1196,11 @@ def _flag_fee_rule_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
+def flag_unusual_transactions(
+    df: pd.DataFrame,
+    *,
+    allow_unknown_disbursement_remarks: bool = False,
+) -> pd.DataFrame:
     """
     Flag all unusual rows after transaction-label preprocessing.
 
@@ -1193,7 +1210,8 @@ def flag_unusual_transactions(df: pd.DataFrame) -> pd.DataFrame:
     """
     deduplicated_df, duplicate_unusual_df = deduplicate_rows_by_minute_with_report(df)
     validation_unusual_df, _, _ = _collect_validation_unusual_transactions(
-        deduplicated_df
+        deduplicated_df,
+        allow_unknown_disbursement_remarks=allow_unknown_disbursement_remarks,
     )
 
     unusual_parts = [

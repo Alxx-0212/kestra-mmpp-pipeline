@@ -395,7 +395,7 @@ Kredit and Debet nonzero; both zero is allowed. Keep raw DigiPOS balances even
 though the date-scoped daily Sheet leaves cumulative SALDO unverified.
 
 - Preserve `raw_transaction_label`, source IDs, amounts, and `Remarks`; diagnostics belong in `unusual_reason`.
-- Evaluate a transaction family consistently for unusual output and summary eligibility. Unknown labels/remarks quarantine the complete family.
+- Evaluate a transaction family consistently for unusual output and summary eligibility. Unknown labels/remarks quarantine the complete family. DISBURSEMENT is label-authoritative in v5 and cell summaries; its Remarks do not gate inclusion.
 - Run unusual detection before calculation deduplication; some unusual families remain included for Finance review.
 - Dedup compares all relevant columns except `No`, with timestamps at minute precision; it does not delete immutable evidence.
 - Raw `RECHARGE` with the complete normalized remark `transaksi sellthru` is the no-companion SELLTHRU exception. Direct SELLTHRU does not inherit it; companions quarantine the standalone family.

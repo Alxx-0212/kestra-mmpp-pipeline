@@ -513,9 +513,11 @@ confirmation, or stale handoffs: stop and retain evidence. Never clear status
 rows, erase immutable history, reset protections, or blindly retry. Require an
 approved attributable reconciliation. Image rollback does not undo DB/Sheet data.
 
-Clean up only the temporary resources created by an E2E run after evidence
-capture. Retain approved backups/sanitized receipts; remove temporary credentials.
-Never delete shared volumes or apply test cleanup as production rollback.
+Clean up temporary E2E resources after evidence capture. A dev-only volume reset
+requires exact user approval, stopped consumers, and a verified backup/restore
+plan for every database and Kestra store in the named volumes; no-backup reset
+requires explicit approval. Never use `docker volume prune` or apply this rule to
+production/shared volumes. Remove temporary credentials.
 
 ## Local Bulk Canary Result
 

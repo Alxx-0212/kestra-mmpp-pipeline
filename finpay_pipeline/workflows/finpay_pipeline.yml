@@ -353,7 +353,9 @@ tasks:
       dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
 
       df = pd.read_parquet("preprocessed.parquet")
-      unusual_df = flag_unusual_transactions(df)
+      unusual_df = flag_unusual_transactions(
+          df, allow_unknown_disbursement_remarks=True,
+      )
       unusual_df.to_parquet("unusual.parquet", index=False)
 
       unusual_groups = int(unusual_df["base_id"].nunique()) if not unusual_df.empty else 0
@@ -584,7 +586,9 @@ tasks:
                       dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
 
                       df = pd.read_parquet("deduplicated.parquet")
-                      summary_ready_df, _ = prepare_reversal_summary_transactions(df)
+                      summary_ready_df, _ = prepare_reversal_summary_transactions(
+                          df, allow_unknown_disbursement_remarks=True,
+                      )
                       qrisduwit_df = prepare_transaction_detail_export(
                           summary_ready_df,
                           transaction="QRISDUWIT",
@@ -902,7 +906,9 @@ tasks:
                       df = pd.read_parquet("deduplicated.parquet")
                       before_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
 
-                      df, summary_unusual_df = prepare_reversal_summary_transactions(df)
+                      df, summary_unusual_df = prepare_reversal_summary_transactions(
+                          df, allow_unknown_disbursement_remarks=True,
+                      )
                       after_counts = {str(k): int(v) for k, v in df["Transaction"].value_counts().items()}
                       out_cluster_rows = int(
                           df["Transaction"].isin([

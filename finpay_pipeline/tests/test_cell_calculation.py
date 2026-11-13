@@ -50,6 +50,17 @@ class CellCalculationTests(unittest.TestCase):
         self.assertNotIn("Transaction", calculation["summary_ready"][0])
         self.assertEqual(calculation["summary_ready"][0]["processed_transaction_label"], "sellthru")
 
+    def test_disbursement_remains_in_cell_summary_with_unrecognized_remarks(self):
+        result = self.prepare("412111", [
+            self.row(label="Disbursement", amount=500, remarks="Legacy v5 description"),
+        ])
+        calculation = result["calculation"]
+
+        self.assertEqual(calculation["calculation_row_count"], 1)
+        self.assertEqual(calculation["summary"][0]["Transaction"], "DISBURSEMENT")
+        self.assertEqual(calculation["summary"][0]["Sum_of_Kredit"], 500)
+        self.assertEqual(calculation["unusual"], [])
+
     def test_stale_recalculation_yields_date_cohorts_without_loading_full_raw_history(self):
         days = ("2026-10-13", "2026-10-14", "2026-10-15")
         sources = {
