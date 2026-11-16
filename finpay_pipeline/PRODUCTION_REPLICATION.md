@@ -301,7 +301,22 @@ registering the flow. It targets the previous day at 05:00 `Asia/Makassar` for
 `ALL` clusters; activation requires separate approval. Do not enable monthly
 publication or schedules as an incidental deployment step.
 
-Start with this single-cluster range, whose date endpoints are inclusive:
+### Execute A Per-Day Range
+
+`finpay_cell_range_v1` is the sequential range wrapper; it starts one
+`finpay_cell_day_v1` child for each cluster/date cohort and passes
+`publication_scope=history`. Keep its scheduled trigger disabled and execute it
+manually from the Kestra UI:
+
+Before running, set the flow variable `cell_reporting_network` to the exact
+shared Docker network that can resolve the configured database host. This is a
+flow variable, not an execution input; the range forwards it to each day child.
+Do not assume the default `bridge` resolves Compose-local service names.
+
+1. Open `finance.finpay.finpay_cell_range_v1` and choose **Execute**. Enter ISO
+   dates in `start_date` and `end_date`; both endpoints are inclusive.
+2. For a first validation, use one configured cluster and one date with
+   `dry_run=true`, `write_gsheet=false`, and `send_telegram=false`:
 
 ```text
 start_date: 2026-10-01
@@ -309,11 +324,31 @@ end_date:   2026-10-01
 cluster_id: 412110
 dry_run: true
 write_gsheet: false
+send_telegram: false
 ```
 
-`412110` selects `412110_B`, cells `412111` and `412112`. Acquisition still
-contacts DigiPOS during a dry run; only DB/Google writes are skipped. Use
-synthetic or captured artifacts for a genuinely offline check.
+`412110` selects account alias `412110_B` and DigiPOS cells `412111` and
+`412112`.
+
+3. Submit the execution and monitor the parent range plus its child execution.
+   Acquisition still contacts DigiPOS during a dry run; DB and Google writes are
+   skipped. Use synthetic or captured artifacts for a genuinely offline check.
+4. Only after target and data-write approval in the test environment, set
+   `dry_run=false` and `write_gsheet=true`. Keep `send_telegram=false` unless
+   notifications are intentionally enabled. Start with one date/cluster, then
+   expand `cluster_id` to a comma-separated group or `ALL` and widen the date
+   range after verifying the first cohort.
+5. Confirm the parent and every child reach terminal `SUCCESS`, then verify DB
+   publication status and the four role tabs. A green tab alone is not proof of
+   DB completion. Any `PENDING`, `IN_FLIGHT`, or `UNKNOWN` publication stops
+   automatic recovery and requires reconciliation.
+
+For live Sheet writes, the range pauses 30 seconds after each successful
+cluster/date cohort. Each cell Sheets client spaces HTTPS requests by five seconds.
+Failed operational tasks retry up to five times after the initial attempt, with
+exponential waits of 30 seconds, 60 seconds, then a 120-second cap. After the
+child exhausts its retries, the parent stops rather than restarting the entire
+day. Retries do not clear or blindly repeat an ambiguous Sheet write.
 
 For a full alias-named range use `finpay_cell_bulk_v1`, not the per-day range
 wrapper:
@@ -454,6 +489,52 @@ fingerprints, protections, and unchanged pre-existing worksheet metadata/content
 and workbook sharing. The historical approval did not authorize a scheduler,
 production deployment, commit, push, or registry publication.
 
+### 6.2 One-Time 2026-11-15 Development Reset Authorization
+
+Status: approved by the current user; volume reset and schema recreation completed
+on 2026-11-15. The first range execution failed in the day-child database preflight
+before acquisition, persistence, or Sheet publication. The failed child used Docker's
+default bridge and could not resolve the Compose-local `postgres` hostname. No cell
+data or Sheet writes occurred. This is a one-time authorization for the current
+confirmed non-production stack and workbook; it does not authorize any later reset.
+
+- Scope: run `finpay_cell_range_v1` for `2026-10-01` through `2026-11-14`
+  inclusive with `cluster_id=ALL`, `dry_run=false`, `write_gsheet=true`, and
+  `send_telegram=false`. This is 45 dates across the eight configured clusters.
+  `DISBURSEMENT` remains included whenever present in the source labels.
+- Volume reset: after full external backups and successful restore tests, remove
+  only `mmpp-finpay-replication-20261021_postgres-data` and
+  `mmpp-finpay-replication-20261021_kestra-data`. The user explicitly accepts
+  loss of every database and Kestra execution/flow record in those volumes for
+  this dev reset. Preserve the `mmpp-finpay-awsdx` and
+  `mmpp-finpay-synthetic-20261021` projects and the exited provisioner's
+  anonymous volume. Do not use a global volume/image prune.
+- Manual values: the user explicitly authorizes discarding prior dev-only MANDIRI
+  manual inputs from the reset state. This does not authorize discarding manual
+  inputs from any other workbook or environment.
+- Workbook: retain the same verified non-production spreadsheet and its sharing.
+  Preserve the exact saved 32 worksheet IDs/titles, styles generated by the cell
+  publisher, and the unrelated pre-existing tab. Do not publish until the pinned
+  worksheet-ID map is configured and the native flow validator passes.
+- Backups: the current external private backup includes a full PostgreSQL-cluster
+  dump, Kestra storage archive, workbook XLSX/grid/metadata/permissions snapshot,
+  worksheet identity map, and the prior manual-input snapshot. The PostgreSQL
+  restore test covered all seven databases; the Kestra store restore test matched
+  all 143 archived entries. Keep these backups through final acceptance.
+- Runtime: Kestra is stopped during reset. Re-provision the project databases,
+  apply only `003_finpay_cell_reporting_v1.sql` to `finpay`, and deploy only the
+  range/day flows with verified current images. Set and forward
+  `cell_reporting_network` to `mmpp-finpay-replication-20261021_mmpp-finance-network`
+  on Docker reporting task runners; DigiPOS acquisition retains its host network.
+  Keep the range schedule disabled; do not run the broad flow-deployer that also
+  publishes LinkAja flows.
+- Failure handling: an execution that fails before acquisition and has verified
+  no DB or Sheet writes may be resubmitted in this same approved scope after fixing
+  configuration; do not reset again. Any `UNKNOWN` publication or ambiguous Sheet
+  write requires a stop and fresh authorization before reconciliation or retry.
+  Unpinned worksheet identities, failed preflight, changed sharing, or extra
+  resources remain hard stops.
+
 For the production canary, obtain approval for the account/date, exact four tabs,
 DB target, migration, and planned writes. Limit it to the approved DB/Sheet
 publication for that scope; do not run destructive tests, resets, or cleanup, or
@@ -512,6 +593,26 @@ For `IN_FLIGHT`, `UNKNOWN`, lost locks, ambiguous Google writes, failed final DB
 confirmation, or stale handoffs: stop and retain evidence. Never clear status
 rows, erase immutable history, reset protections, or blindly retry. Require an
 approved attributable reconciliation. Image rollback does not undo DB/Sheet data.
+
+### Owner-Cleared Published Worksheets
+
+The bulk flow's `restore_missing_published_worksheets` input is opt-in and
+defaults from `create_worksheets_if_missing`. It may recreate a missing worksheet
+only from the exact ID/title in the latest `COMPLETE` publication snapshot, after
+confirming that the target is blank and has no unmanaged metadata/protections.
+Same-title/different-ID sheets, nonempty targets, and unresolved database guards
+remain blocked. Restored tabs use their original IDs; the prior publication epoch
+is retained, manual Summary inputs come from its committed snapshot, and the full
+current snapshot is staged as a new epoch. The flow does not delete or rebind
+history.
+
+For production, take and checksum-verify an external `finpay` database backup and
+a read-only workbook snapshot before enabling this recovery. Record the failed
+execution, target/cluster/date scope, saved worksheet identity counts, backup
+receipt, and owner approval. If the original worksheet IDs cannot be recreated,
+stop and restore the original workbook structure from an approved backup/version;
+never silently adopt new IDs. A restoration does not itself authorize a subsequent
+bulk execution or Sheet publication.
 
 Clean up temporary E2E resources after evidence capture. A dev-only volume reset
 requires exact user approval, stopped consumers, and a verified backup/restore

@@ -1731,6 +1731,37 @@ class Epoch5RecoveryTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             policy.epoch = 4
 
+    def test_epoch6_pins_only_the_dev_readback_reconciliation(self):
+        policy = recovery_module._policy_for_profile(CellRecoveryProfile.EPOCH6)
+        epoch4 = recovery_module._policy_for_profile(CellRecoveryProfile.EPOCH4)
+        self.assertEqual(policy.report_range, ("2026-10-01", "2026-11-12"))
+        self.assertEqual(policy.epoch, 6)
+        self.assertEqual(policy.cluster_id, "412110")
+        self.assertEqual(policy.expected_error, "ReadTimeout")
+        self.assertEqual(policy.failed_flow_revision, 15)
+        self.assertEqual(policy.workbook_sheet_count, 5)
+        self.assertEqual(policy.database_toc_count, 61)
+        self.assertEqual(policy.database_listed_entry_count, 56)
+        self.assertEqual(policy.database_target, epoch4.database_target)
+        self.assertEqual(policy.workbook_id_sha256, epoch4.workbook_id_sha256)
+        self.assertEqual(policy.owner_set_sha256, epoch4.owner_set_sha256)
+        self.assertEqual(policy.finance_set_sha256, epoch4.finance_set_sha256)
+        self.assertEqual(policy.reader_set_sha256, epoch4.reader_set_sha256)
+        self.assertEqual(policy.writer_set_sha256, epoch4.writer_set_sha256)
+        self.assertEqual(policy.operator_reference,
+                         "current-user-authorized-dev-readback-reconciliation-20261115")
+        self.assertEqual(dict(policy.scope_inputs), {
+            "start_date": "2026-10-01",
+            "end_date": "2026-11-12",
+            "cluster_id": "ALL",
+            "scrape_workers": 2,
+            "dry_run": False,
+            "write_gsheet": True,
+            "send_telegram": False,
+            "restore_missing_published_worksheets": True,
+        })
+        self.assertEqual(set(recovery_module._RECOVERY_POLICIES), set(CellRecoveryProfile))
+
     def test_public_api_rejects_arbitrary_profile_without_database_access(self):
         self.assertIs(
             inspect.Parameter.empty,

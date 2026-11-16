@@ -36,11 +36,18 @@ validation/calculation utilities without routing cell sources into legacy tables
 
 `finpay_cell_range_v1` defines a disabled daily schedule for 05:00
 `Asia/Makassar`. If separately commissioned and enabled, it processes the previous
-day for `ALL` clusters serially through the per-cluster/day flow. Database persistence
-and guarded Sheet publication retry up to three total attempts with exponential
-backoff, reusing the checked cohort artifacts. `PENDING`, `IN_FLIGHT`, or `UNKNOWN`
-publication states still require operator reconciliation; retries do not issue
-blind Sheet writes or automatically clear those states.
+day for `ALL` clusters serially through the per-cluster/day flow. Each operational
+day task retries up to six total attempts (one initial attempt plus five retries)
+with exponential delays of 30s, 60s, then a 120s cap. The range expander and cohort
+progress logs use the same retry policy. A recovered task resets its future retry
+sequence to the 30s minimum. The range parent does not replay a day subflow after
+the child exhausts its retries, and terminal Telegram notifications remain
+single-attempt. `PENDING`, `IN_FLIGHT`, or `UNKNOWN` publication states still
+require operator reconciliation; retries do not issue blind Sheet writes or
+automatically clear those states. After each successful live date/cluster cohort,
+the range waits 30s before starting the next cohort; this also preserves spacing
+when a new per-cohort Sheets client is created. Dry runs and database-only runs
+skip this wait.
 The schedule is dormant by default; local workflow edits do not authorize production
 activation.
 
@@ -82,6 +89,16 @@ tab IDs stable across title-only migrations; arbitrary retargeting to another
 workbook or role is rejected. Assign each cluster to only one destination flow;
 cross-workbook routing for a cluster with publication history is blocked. Give
 each copied flow a unique ID.
+
+The bulk flow's `restore_missing_published_worksheets` input defaults to
+`create_worksheets_if_missing`. When enabled for a previously published workbook,
+it restores only the exact worksheet IDs and titles in the latest `COMPLETE`
+snapshot, and only when each missing/recreated tab is empty and has no unmanaged
+metadata or protections. It preserves prior epochs and manual Summary inputs, then
+publishes a full snapshot as a new epoch. A title that exists with a different ID,
+nonempty content, an unresolved publication, or an active target operation blocks
+restoration; the workflow never adopts a new worksheet ID. Production restoration
+requires a verified backup and explicit owner approval.
 
 Flow defaults read `FINPAY_CELL_SPREADSHEET_NAME` and
 `FINPAY_LEGACY_SPREADSHEET_ID` from Kestra secrets; optional
@@ -159,13 +176,14 @@ configured target and runtime role's schema/table privileges; it creates no
 schema or tables and applies no DDL or migration. Cell schema setup remains an
 explicit operation.
 
-Bulk reporting tasks explicitly use the `cell_reporting_network` flow variable
-(default `bridge`). For a Compose-local database hostname such as `postgres`, set
-this variable to the exact shared Docker network name before running the flow.
-`kestra.plugins.configurations` does not set this runner-instance property;
-`networkMode` must be explicit on each nested `taskRunner`. Acquisition retains
-its separate host network. The selected
-reporting network must resolve the database host and allow Google HTTPS access.
+Bulk and range/day reporting tasks explicitly use the `cell_reporting_network`
+flow variable (default `bridge`). For a Compose-local database hostname such as
+`postgres`, set this variable to the exact shared Docker network name before
+running either entry point; the range parent forwards it to each day child.
+`kestra.plugins.configurations` does not set this runner-instance property, so
+every nested reporting `taskRunner` must declare `networkMode`. Cell acquisition
+retains its separate host network. The selected reporting network must resolve
+the database host and allow Google HTTPS access.
 
 Cell artifacts are size-bounded, with SHA-256 checks performed by application
 code at specific task boundaries. Persistence does not create a Google client;
@@ -291,8 +309,11 @@ Workflows may be copied per destination: set the copied flow's `cell_spreadsheet
 and `cell_cluster_group` (a single code, comma-separated group, or `ALL`).
 If a file name resolves to no spreadsheet and creation is enabled, publication
 creates it and shares the new file with configured Finance editors. Existing
-file sharing is unchanged. Missing role tabs are added by alias; populated
-unmanaged tabs or missing tabs with prior publication history fail closed.
+file sharing is unchanged. Missing role tabs on an unpublished workbook are added
+by alias. For prior publication history, the bulk-only restore input can recreate
+missing tabs using the saved IDs/titles and last committed snapshot, but it blocks
+conflicting IDs/titles, nonempty tabs, and unmanaged protections. Other flows
+remain fail-closed.
 
 The existing v3/v2 compatibility pair requires a schema-v2 configuration FILE,
 its checksum, and the independent `FINPAY_CELL_CONFIG_SHA256` deployment pin.
@@ -323,7 +344,12 @@ rows. When appending to an existing Invoice tab, that suffix also includes its
 standard two blank separator rows before the first dated row. The separate range
 flow remains a full-report write. Missing initial tabs are created only
 when `create_worksheets_if_missing` is enabled. A missing worksheet ID with
-previous publication history fails closed rather than being rebound. A green
+previous publication history fails closed by default; the bulk-only
+`restore_missing_published_worksheets` input may recreate the exact saved IDs/titles
+from a `COMPLETE` snapshot after an empty/unmanaged-free check. It preserves saved
+manual inputs and prior epochs, forces a full-snapshot write and a new publication
+epoch, and never rebinds a different ID. Production use requires a verified
+database/Sheet backup and explicit approval. A green
 tab/A1 note confirms Sheet verification only; success also requires the database
 completion record. A failed or ambiguous DB confirmation requires operator
 reconciliation even when the tabs look complete.
@@ -337,9 +363,9 @@ total job deadline, and cannot fix a broken VPN or network route.
 
 Clusters and writes remain sequential. A bulk publication lazily shares one
 client across its clusters so pacing does not reset between them. HTTPS request
-attempts within each cell client are spaced at least 1.25 seconds apart, including
+attempts within each cell client are spaced at least 5 seconds apart, including
 metadata, paged style readback, and writes. Fast calls sleep for the remaining interval; slow calls
-already satisfy it. This limits one serial client to approximately 48 requests
+already satisfy it. This limits one serial client to approximately 12 requests
 per minute, below Sheets' 60-per-user-per-project read and write quotas. It does
 not coordinate quota across other client instances, even in the same process,
 or across separate processes/stacks using the same service account. Do not run

@@ -307,11 +307,20 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         self.assertIn("legacy_spreadsheet_id: \"{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}\"", flow)
         self.assertIn("create_spreadsheet_if_missing: true", flow)
         self.assertIn("create_worksheets_if_missing: true", flow)
+        self.assertIn(
+            '- id: restore_missing_published_worksheets\n    type: BOOLEAN\n'
+            '    defaults: "{{ vars.create_worksheets_if_missing }}"',
+            flow,
+        )
         self.assertIn('defaults: "{{ vars.cell_cluster_group }}"', flow)
         self.assertIn("comma-separated cluster group", flow)
         self.assertIn("CELL_FORMAT_SPREADSHEET_NAME: \"{{ vars.cell_spreadsheet_name }}\"", flow)
         self.assertIn("CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING", flow)
         self.assertIn("CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING", flow)
+        self.assertIn(
+            'CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS: "{{ inputs.restore_missing_published_worksheets }}"',
+            _task_block(flow, "publish_cell_bulk"),
+        )
         for task_id in ("preflight_cell_bulk_targets", "publish_cell_bulk"):
             task = flow.split(f"  - id: {task_id}\n", 1)[1].split("\n  - id:", 1)[0]
             for env_name in (
@@ -338,20 +347,37 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         self.assertIn("dry_run: false", trigger)
         self.assertIn("write_gsheet: true", trigger)
 
-    def test_cell_day_retries_only_database_and_guarded_publication_tasks(self):
+    def test_cell_day_processing_tasks_use_six_attempt_exponential_retries(self):
         flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
         retry_block = (
-            "    retry:\n"
+            "retry:\n"
             "      type: exponential\n"
-            "      interval: PT15S\n"
-            "      maxInterval: PT60S\n"
-            "      maxAttempts: 3\n"
+            "      interval: PT30S\n"
+            "      maxInterval: PT120S\n"
+            "      maxAttempts: 6"
         )
 
-        for task_id in ("persist_cell_sources_and_calculations", "publish_cell_four_tabs"):
+        for task_id in (
+            "validate_cell_sheet_targets", "preflight_cell_database", "acquire_cell_cluster_day",
+            "preprocess_cell_cluster_day", "persist_cell_sources_and_calculations", "publish_cell_four_tabs",
+        ):
             with self.subTest(task=task_id):
                 self.assertIn(retry_block, _task_block(flow, task_id))
-        self.assertNotIn(retry_block, _task_block(flow, "acquire_cell_cluster_day"))
+
+    def test_cell_range_retries_its_tasks_and_pauses_between_live_cohorts(self):
+        flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
+        retry_policy = r"retry:\s+type: exponential\s+interval: PT30S\s+maxInterval: PT120S\s+maxAttempts: 6"
+        for task_id in (
+            "expand_cell_range", "log_cell_cohort_started", "log_cell_cohort_completed", "pause_after_cell_cohort",
+        ):
+            with self.subTest(task=task_id):
+                self.assertRegex(_task_block(flow, task_id), retry_policy)
+        self.assertNotIn("retry:", _task_block(flow, "process_cell_day"))
+        pause = _task_block(flow, "pause_after_cell_cohort")
+        self.assertIn("type: io.kestra.plugin.core.flow.Sleep", pause)
+        self.assertIn('runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"', pause)
+        self.assertIn("duration: PT30S", pause)
+        self.assertNotIn("retry:", flow.split("\nafterExecution:\n", 1)[1])
 
     def test_cell_sheet_writers_use_stable_execution_refresh_ids(self):
         for workflow, task_id in (
@@ -434,6 +460,39 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                     task = _task_block(day_flow, task_id)
                     self.assertIn(f'{environment_name}: "{{{{ inputs.{name} }}}}"', task)
 
+        self.assertIn('cell_reporting_network: "{{ vars.cell_reporting_network }}"', subflow)
+        self.assertIn(
+            '- id: cell_reporting_network\n    type: STRING\n'
+            '    defaults: "{{ vars.cell_reporting_network }}"',
+            day_flow,
+        )
+
+    def test_cell_range_day_reporting_tasks_use_configured_compose_network(self):
+        range_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
+        day_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
+
+        self.assertIn('cell_reporting_network: "bridge"', range_flow)
+        self.assertIn(
+            'networkMode: "{{ vars.cell_reporting_network }}"',
+            _task_block(range_flow, "expand_cell_range"),
+        )
+        for task_id in (
+            "validate_cell_sheet_targets",
+            "preflight_cell_database",
+            "preprocess_cell_cluster_day",
+            "persist_cell_sources_and_calculations",
+            "publish_cell_four_tabs",
+        ):
+            with self.subTest(task=task_id):
+                self.assertIn(
+                    'networkMode: "{{ inputs.cell_reporting_network }}"',
+                    _task_block(day_flow, task_id),
+                )
+        self.assertIn(
+            'networkMode: host',
+            _task_block(day_flow, "acquire_cell_cluster_day"),
+        )
+
     def test_current_cell_script_tasks_use_the_container_image_runner(self):
         workflow_tasks = {
             "finpay_cell_day_v1.yml": (
@@ -469,12 +528,19 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                 self.assertLess(task_ids.index("preflight_cell_database"), task_ids.index(acquisition_task_id))
 
                 task = _task_block(flow, "preflight_cell_database")
-                self.assertIn("containerImage: finpay-cell-reporting:2.0", task)
-                self.assertIn('runIf: "{{ inputs.dry_run == false }}"', task)
-                self.assertIn(
-                    "taskRunner:\n      type: io.kestra.plugin.scripts.runner.docker.Docker",
-                    task,
+                expected_image = (
+                    "finpay-cell-reporting:dev-cell-range-20261115"
+                    if workflow_name == "finpay_cell_day_v1.yml"
+                    else "finpay-cell-reporting:2.0"
                 )
+                self.assertIn(f"containerImage: {expected_image}", task)
+                self.assertIn('runIf: "{{ inputs.dry_run == false }}"', task)
+                expected_network = (
+                    'networkMode: "{{ inputs.cell_reporting_network }}"'
+                    if workflow_name == "finpay_cell_day_v1.yml"
+                    else 'networkMode: "{{ vars.cell_reporting_network }}"'
+                )
+                self.assertIn(expected_network, task)
                 for name in ("HOST", "PORT", "NAME", "USER", "PASSWORD"):
                     self.assertIn(
                         f"FINPAY_DB_{name}: \"{{{{ secret('FINPAY_DB_{name}') }}}}\"",

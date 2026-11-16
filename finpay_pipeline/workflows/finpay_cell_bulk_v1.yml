@@ -40,6 +40,10 @@ inputs:
   - id: send_telegram
     type: BOOLEAN
     defaults: false
+  - id: restore_missing_published_worksheets
+    type: BOOLEAN
+    defaults: "{{ vars.create_worksheets_if_missing }}"
+    description: "Restore only missing published worksheet IDs from the committed snapshot when the target tabs are empty."
 
 tasks:
   - id: preflight_cell_bulk_targets
@@ -251,6 +255,7 @@ tasks:
       CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: "{{ vars.create_spreadsheet_if_missing }}"
       CELL_FORMAT_WORKSHEET_IDS: "{{ vars.cell_worksheet_ids_json }}"
       CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ vars.create_worksheets_if_missing }}"
+      CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS: "{{ inputs.restore_missing_published_worksheets }}"
     script: |
       import json
       import os

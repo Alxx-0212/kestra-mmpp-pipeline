@@ -6,6 +6,7 @@ concurrency:
   behavior: QUEUE
 
 variables:
+  cell_reporting_network: "bridge"
   cell_spreadsheet_id: ""
   cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
   legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"
@@ -32,6 +33,9 @@ inputs:
   - id: send_telegram
     type: BOOLEAN
     defaults: false
+  - id: cell_reporting_network
+    type: STRING
+    defaults: "{{ vars.cell_reporting_network }}"
   - id: cell_spreadsheet_id
     type: STRING
     defaults: "{{ vars.cell_spreadsheet_id }}"
@@ -55,10 +59,16 @@ tasks:
   - id: validate_cell_sheet_targets
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.cell_reporting_network }}"
     timeout: PT1M
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT120S
+      maxAttempts: 6
     runIf: "{{ inputs.write_gsheet }}"
     env:
       REPORT_DATE: "{{ inputs.report_date }}"
@@ -85,10 +95,16 @@ tasks:
   - id: preflight_cell_database
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.cell_reporting_network }}"
     timeout: PT1M
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT120S
+      maxAttempts: 6
     runIf: "{{ inputs.dry_run == false }}"
     env:
       FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
@@ -112,13 +128,18 @@ tasks:
   - id: acquire_cell_cluster_day
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-digipos-cell-scraper:2.0
+    containerImage: finpay-digipos-cell-scraper:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
       networkMode: host
       volumes:
         - "/tmp/finpay inbox:/tmp/finpay inbox"
     timeout: PT6H
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT120S
+      maxAttempts: 6
     env:
       DIGIPOS_PASSWORD: "{{ secret('DIGIPOS_PASSWORD') }}"
       CELL_INBOX_DIR: "/tmp/finpay inbox"
@@ -158,10 +179,16 @@ tasks:
   - id: preprocess_cell_cluster_day
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.cell_reporting_network }}"
     timeout: PT3H
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT120S
+      maxAttempts: 6
     inputFiles:
       cell_sources_v2.zip: "{{ outputs.acquire_cell_cluster_day.outputFiles['cell_sources_v2.zip'] }}"
     env:
@@ -187,15 +214,16 @@ tasks:
   - id: persist_cell_sources_and_calculations
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.cell_reporting_network }}"
     timeout: PT3H
     retry:
       type: exponential
-      interval: PT15S
-      maxInterval: PT60S
-      maxAttempts: 3
+      interval: PT30S
+      maxInterval: PT120S
+      maxAttempts: 6
     runIf: "{{ inputs.dry_run == false }}"
     inputFiles:
       cell_prepared_v1.json: "{{ outputs.preprocess_cell_cluster_day.outputFiles['cell_prepared_v1.json'] }}"
@@ -232,15 +260,16 @@ tasks:
   - id: publish_cell_four_tabs
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.cell_reporting_network }}"
     timeout: PT3H
     retry:
       type: exponential
-      interval: PT15S
-      maxInterval: PT60S
-      maxAttempts: 3
+      interval: PT30S
+      maxInterval: PT120S
+      maxAttempts: 6
     runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
     inputFiles:
       cell_handoff_v1.json: "{{ outputs.persist_cell_sources_and_calculations.outputFiles['cell_handoff_v1.json'] }}"
@@ -286,9 +315,10 @@ afterExecution:
   - id: notify_cell_result_telegram
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.cell_reporting_network }}"
     timeout: PT2M
     runIf: "{{ inputs.dry_run == false and inputs.send_telegram }}"
     env:

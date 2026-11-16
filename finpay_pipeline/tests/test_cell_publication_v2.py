@@ -502,6 +502,76 @@ class CellPublicationV2Tests(unittest.TestCase):
             publication_only=True, preserve_manual_inputs=True, **kwargs,
         )
 
+    def test_restored_published_worksheets_use_saved_manual_values_and_full_write(self):
+        from finpay_pipeline.cell_publication_v2 import ROLES
+
+        first = self.publish()
+        prior = self.store.publications[first["epoch"]]["snapshot"]["worksheets"]
+        editable = prior["summary"]["matrix"]["editable_inputs"][0]
+        manual_row, manual_column = editable["row"] - 1, editable["column"] - 1
+        self.adapters["summary"].values[manual_row][manual_column] = 333
+
+        manual_publication = self.publish(configuration_only=True)
+        manual_snapshot = copy.deepcopy(self.store.publications[manual_publication["epoch"]]["snapshot"])
+        expected_manual = manual_snapshot["worksheets"]["summary"]["values"][manual_row][manual_column]
+        self.assertEqual(expected_manual, 333)
+
+        for adapter in self.adapters.values():
+            adapter.values = []
+            adapter.metadata_entries = []
+            adapter.protections = []
+            adapter.styles = {}
+            adapter.widths = {}
+            adapter.heights = {}
+            adapter.merges = []
+            adapter.banding = []
+
+        write_start = len(self.store.value_writes)
+        restored = self.publish_only(
+            write_from_date=self.config.first_report_date,
+            restored_roles=set(ROLES),
+            restore_missing_published_worksheets=True,
+            refresh_request_id="restore-cleared-published-tabs",
+        )
+
+        self.assertEqual(restored["status"], "COMPLETE")
+        self.assertEqual(restored["epoch"], manual_publication["epoch"] + 1)
+        self.assertEqual(self.store.publications[manual_publication["epoch"]]["snapshot"], manual_snapshot)
+        saved = self.store.publications[restored["epoch"]]["snapshot"]["worksheets"]
+        self.assertEqual(saved["summary"]["values"][manual_row][manual_column], expected_manual)
+        self.assertGreater(len(self.store.value_writes), write_start)
+        for role in ROLES:
+            self.assertEqual(self.adapters[role].values, saved[role]["values"])
+            self.assertTrue(any(item["metadataValue"] for item in self.adapters[role].metadata_entries))
+
+    def test_restoration_refuses_a_nonempty_recreated_tab(self):
+        from finpay_pipeline.cell_publication_v2 import ROLES
+
+        self.publish()
+        for adapter in self.adapters.values():
+            adapter.values = []
+            adapter.metadata_entries = []
+            adapter.protections = []
+            adapter.styles = {}
+            adapter.widths = {}
+            adapter.heights = {}
+            adapter.merges = []
+            adapter.banding = []
+        self.adapters["invoice"].values = [["unexpected"]]
+        previous_epoch = max(self.store.publications)
+        previous_writes = list(self.store.value_writes)
+
+        with self.assertRaisesRegex(ValueError, "not empty"):
+            self.publish_only(
+                write_from_date=self.config.first_report_date,
+                restored_roles=set(ROLES),
+                restore_missing_published_worksheets=True,
+                refresh_request_id="refuse-nonempty-restored-tab",
+            )
+
+        self.assertEqual(max(self.store.publications), previous_epoch)
+        self.assertEqual(self.store.value_writes, previous_writes)
+
     def test_bulk_suffix_write_preserves_prefix_and_starts_at_column_a_date(self):
         from finpay_pipeline.cell_contracts import fingerprint
         from finpay_pipeline.cell_publication_v2 import ROLES, _suffix_start_row
@@ -907,6 +977,30 @@ class CellPublicationV2Tests(unittest.TestCase):
         self.assertEqual(adapter.values[matrix_height][0], "operator data below report")
         self.assertFalse(any(item.get("description", "").startswith(GUARD_PREFIX)
                              for item in adapter.protections))
+
+    def test_restored_empty_tabs_skip_suffix_tail_scan(self):
+        from finpay_pipeline.cell_publication_v2 import ROLES, _validate_deleted_row_tails
+
+        saved = {
+            role: {
+                "values": [[""] * 8],
+                "patch": {"old_data_count": 0, "insert_count": 1,
+                          "delete_count": 0, "matrix_height_before": 1001},
+            }
+            for role in ROLES
+        }
+        metadata = {
+            role: {"properties": {"gridProperties": {"rowCount": 1000, "columnCount": 26}}}
+            for role in ROLES
+        }
+        unexpected_read = lambda *args: self.fail("restored tabs were scanned as prior row tails")
+
+        with self.assertRaisesRegex(ValueError, "cannot verify the worksheet tail"):
+            _validate_deleted_row_tails(saved, self.adapters, metadata, unexpected_read)
+
+        _validate_deleted_row_tails(
+            saved, self.adapters, metadata, unexpected_read, restored_roles=set(ROLES),
+        )
 
     def test_four_output_tabs_share_one_complete_epoch_and_cell_data(self):
         result = self.publish()

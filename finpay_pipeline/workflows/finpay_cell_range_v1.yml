@@ -7,6 +7,7 @@ concurrency:
 
 variables:
   cell_cluster_group: "ALL"
+  cell_reporting_network: "bridge"
   cell_spreadsheet_id: ""
   cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
   legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"
@@ -52,10 +53,16 @@ tasks:
   - id: expand_cell_range
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ vars.cell_reporting_network }}"
     timeout: PT1M
+    retry:
+      type: exponential
+      interval: PT30S
+      maxInterval: PT120S
+      maxAttempts: 6
     env:
       START_DATE: "{{ inputs.start_date }}"
       END_DATE: "{{ inputs.end_date }}"
@@ -93,6 +100,11 @@ tasks:
     tasks:
       - id: log_cell_cohort_started
         type: io.kestra.plugin.core.log.Log
+        retry:
+          type: exponential
+          interval: PT30S
+          maxInterval: PT120S
+          maxAttempts: 6
         message: "Starting cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}; open the child execution for live cell progress and estimated remaining time."
       - id: process_cell_day
         type: io.kestra.plugin.core.flow.Subflow
@@ -111,19 +123,36 @@ tasks:
           cell_spreadsheet_name: "{{ vars.cell_spreadsheet_name }}"
           legacy_spreadsheet_id: "{{ vars.legacy_spreadsheet_id }}"
           cell_worksheet_ids_json: "{{ vars.cell_worksheet_ids_json }}"
+          cell_reporting_network: "{{ vars.cell_reporting_network }}"
           create_spreadsheet_if_missing: "{{ vars.create_spreadsheet_if_missing }}"
           create_worksheets_if_missing: "{{ vars.create_worksheets_if_missing }}"
       - id: log_cell_cohort_completed
         type: io.kestra.plugin.core.log.Log
+        retry:
+          type: exponential
+          interval: PT30S
+          maxInterval: PT120S
+          maxAttempts: 6
         message: "Completed cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}"
+
+      - id: pause_after_cell_cohort
+        type: io.kestra.plugin.core.flow.Sleep
+        runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
+        duration: PT30S
+        retry:
+          type: exponential
+          interval: PT30S
+          maxInterval: PT120S
+          maxAttempts: 6
 
 afterExecution:
   - id: notify_cell_range_failure_telegram
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-cell-reporting:2.0
+    containerImage: finpay-cell-reporting:dev-cell-range-20261115
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ vars.cell_reporting_network }}"
     timeout: PT2M
     runIf: "{{ inputs.dry_run == false and inputs.send_telegram and execution.state != 'SUCCESS' }}"
     env:

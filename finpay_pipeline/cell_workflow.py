@@ -35,7 +35,7 @@ from .digipos_scraper import HEADERS, _read_xlsx_rows, validate_export_rows
 
 MAX_BUNDLE_BYTES = 256 * 1024 * 1024
 CELL_SHEET_TIMEOUT_SECONDS = (30, 300)
-CELL_SHEET_REQUEST_INTERVAL_SECONDS = 1.25
+CELL_SHEET_REQUEST_INTERVAL_SECONDS = 5
 
 
 class _CellSheetHTTPAdapter(HTTPAdapter):

@@ -106,6 +106,7 @@ class CellRecoveryProfile(Enum):
 
     EPOCH4 = "epoch4"
     EPOCH5 = "epoch5"
+    EPOCH6 = "epoch6"
 
 
 @dataclass(frozen=True)
@@ -206,9 +207,48 @@ _EPOCH5_POLICY = _RecoveryPolicy(
     stopped_writers=frozenset(_APPROVED_STOPPED_WRITERS),
     running_local_containers=frozenset(_APPROVED_RUNNING_LOCAL_CONTAINERS),
 )
+_EPOCH6_POLICY = _RecoveryPolicy(
+    profile=CellRecoveryProfile.EPOCH6,
+    report_range=("2026-10-01", "2026-11-12"),
+    epoch=6,
+    expected_error="ReadTimeout",
+    cluster_id="412110",
+    database_target=_APPROVED_LOCAL_DATABASE_TARGET,
+    workbook_id_sha256=_APPROVED_WORKBOOK_ID_SHA256,
+    operation_pin_sha256="51576a9ca6a088fe294b863ff408d690c7e6f36f02b807b228616bcdec7306f1",
+    snapshot_fingerprint="7652fe276dd5b9e6bb7badbd5138641368884c61c61d2bb2e0ac83071ba00692",
+    owner_set_sha256=_APPROVED_OWNER_SET_SHA256,
+    finance_set_sha256=_APPROVED_FINANCE_SET_SHA256,
+    writer_set_sha256=_APPROVED_WRITER_SET_SHA256,
+    reader_set_sha256=_APPROVED_READER_SET_SHA256,
+    failed_execution_id_sha256="253e917a8fa39e157735d09947019bd9cd1cdffa3b3b692cf49eb5360a6e77af",
+    operator_reference="current-user-authorized-dev-readback-reconciliation-20261115",
+    failed_flow_revision=15,
+    finance_namespace=_APPROVED_FINANCE_NAMESPACE,
+    finance_flow_id=_APPROVED_FINANCE_FLOW_ID,
+    workbook_sheet_count=5,
+    audit_receipt_path=Path(
+        "/home/awsdx/.local/share/finpay-prod-recovery-20261114/reconcile-epoch6/reconciliation-audit.jsonl",
+    ),
+    database_toc_count=61,
+    database_listed_entry_count=56,
+    scope_inputs=(
+        ("start_date", "2026-10-01"),
+        ("end_date", "2026-11-12"),
+        ("cluster_id", "ALL"),
+        ("scrape_workers", 2),
+        ("dry_run", False),
+        ("write_gsheet", True),
+        ("send_telegram", False),
+        ("restore_missing_published_worksheets", True),
+    ),
+    stopped_writers=frozenset(_APPROVED_STOPPED_WRITERS),
+    running_local_containers=frozenset(_APPROVED_RUNNING_LOCAL_CONTAINERS),
+)
 _RECOVERY_POLICIES = MappingProxyType({
     CellRecoveryProfile.EPOCH4: _EPOCH4_POLICY,
     CellRecoveryProfile.EPOCH5: _EPOCH5_POLICY,
+    CellRecoveryProfile.EPOCH6: _EPOCH6_POLICY,
 })
 
 

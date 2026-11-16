@@ -40,6 +40,20 @@ _SAFE_API_REASONS = frozenset({
     "rateLimitExceeded", "resourceExhausted", "userRateLimitExceeded",
 })
 _SAFE_CELL_SHEET_PHASES = frozenset({"add_sheet", "add_sheet_readback"})
+_SAFE_CELL_SHEET_REASONS = frozenset({
+    "committed_worksheet_missing", "committed_worksheet_identity_conflict",
+    "committed_sheet_snapshot_mismatch", "unpublished_worksheet_not_empty",
+    "unpublished_worksheet_has_unmanaged_state", "unpublished_worksheet_grid_too_large",
+})
+
+
+def cell_sheet_validation_error(message, safe_reason):
+    """Attach an allowlisted diagnostic code without logging raw target details."""
+    if safe_reason not in _SAFE_CELL_SHEET_REASONS:
+        raise ValueError("unknown safe cell Sheet failure reason")
+    error = ValueError(message)
+    error.safe_reason = safe_reason
+    return error
 
 
 def _read_with_retry(read_call):
@@ -90,6 +104,11 @@ def safe_cell_sheet_error(exc):
             break
         seen.add(id(current))
         summary["error_types"].append(type(current).__name__)
+
+        safe_reason = getattr(current, "safe_reason", None)
+        if ("safe_reason" not in summary and isinstance(safe_reason, str)
+                and safe_reason in _SAFE_CELL_SHEET_REASONS):
+            summary["safe_reason"] = safe_reason
 
         if "http_status" not in summary:
             response = getattr(current, "response", None)

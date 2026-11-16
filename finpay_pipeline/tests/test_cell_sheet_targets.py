@@ -7,7 +7,7 @@ from unittest.mock import call, patch
 from finpay_pipeline.cell_format import bulk_pipeline, pipeline, settings
 from finpay_pipeline.cell_format.settings import selected_clusters
 from finpay_pipeline.cell_workflow import make_cell_sheet_client
-from finpay_pipeline.cell_publication import safe_cell_sheet_error
+from finpay_pipeline.cell_publication import cell_sheet_validation_error, safe_cell_sheet_error
 from finpay_pipeline.cell_publication_v2 import ROLES, cell_worksheet_title
 
 
@@ -240,8 +240,19 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(config.spreadsheet_id, "environment-id")
         self.assertEqual(config.finance_emails, ("one@example.test", "two@example.test"))
         self.assertTrue(config.create_spreadsheet_if_missing)
+        self.assertFalse(config.restore_missing_published_worksheets)
         self.assertIsNone(config.worksheet_ids)
         self.assertEqual(fallback.spreadsheet_id, "constant-id")
+
+    def test_published_worksheet_restore_requires_creation_to_be_enabled(self):
+        config = _configuration(CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS="true")
+        self.assertTrue(config.restore_missing_published_worksheets)
+        with self.assertRaisesRegex(ValueError, "worksheet creation to be enabled"):
+            _configuration(
+                CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING="false",
+                CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING="false",
+                CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS="true",
+            )
 
     def test_explicit_workbook_id_is_opened_by_key_and_title_must_match(self):
         workbook = FakeWorkbook("selected", "Renamed Workbook")
@@ -375,7 +386,8 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertIs(resolved, workbook)
         self.assertEqual(spreadsheet_id, "existing")
         self.assertEqual(set(targets), set(ROLES))
-        self.assertEqual(sleep.call_args_list, [call(2)] * 6)
+        self.assertEqual(sleep.call_args_list, [call(2)] * 5)
+        self.assertEqual(len(workbook.worksheet_lookup_failures), 1)
 
     def test_missing_named_workbook_is_created_and_shared_inside_journal(self):
         client, store = FakeClient(), MemoryOperationStore()
@@ -612,6 +624,81 @@ class CellSheetTargetTests(unittest.TestCase):
             pipeline._resolve_cell_targets(store, workbook, CLUSTER, config, publication)
         self.assertEqual(workbook.add_requests, [])
         self.assertEqual(store.operations, {})
+
+    def test_prior_publication_restores_missing_tabs_using_exact_saved_ids(self):
+        workbook = FakeWorkbook("existing", "Cell Reports", [FakeWorksheet(0, "Sheet1")])
+        role_snapshot = {}
+        for index, role in enumerate(ROLES):
+            role_snapshot[role] = {
+                "worksheet_id": 800 + index,
+                "title": cell_worksheet_title(ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME),
+            }
+        publication = {
+            "status": "COMPLETE",
+            "snapshot": {
+                "schema_version": 2, "spreadsheet_id": workbook.id,
+                "worksheets": role_snapshot,
+            },
+        }
+        config = _configuration(
+            CELL_FORMAT_SPREADSHEET_ID="existing",
+            CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS="true",
+        )
+        workbook.worksheet_lookup_failures = [ValueError("stale worksheet lookup")]
+        store = MemoryOperationStore()
+        restored_roles = set()
+
+        targets, _ = pipeline._resolve_cell_targets(
+            store, workbook, CLUSTER, config, publication, restored_roles=restored_roles,
+        )
+
+        self.assertEqual(restored_roles, set(ROLES))
+        self.assertEqual({role: target.worksheet_id for role, target in targets.items()},
+                         {role: item["worksheet_id"] for role, item in role_snapshot.items()})
+        self.assertEqual({request["sheetId"] for request in workbook.add_requests},
+                         {item["worksheet_id"] for item in role_snapshot.values()})
+        self.assertEqual(set(store.operations.values()), {"IDLE"})
+        self.assertEqual(len(workbook.worksheet_lookup_failures), 1)
+
+        retry_restored_roles = set()
+        pipeline._resolve_cell_targets(
+            store, workbook, CLUSTER, config, publication, restored_roles=retry_restored_roles,
+        )
+        self.assertEqual(retry_restored_roles, set(ROLES))
+        self.assertEqual(len(workbook.add_requests), len(ROLES))
+
+    def test_prior_publication_restore_never_adopts_same_title_with_new_id(self):
+        first_title = cell_worksheet_title(ACCOUNT, ROLES[0], settings.CELL_FORMAT_NAMING_SCHEME)
+        workbook = FakeWorkbook("existing", "Cell Reports", [FakeWorksheet(999, first_title)])
+        role_snapshot = {
+            role: {
+                "worksheet_id": 800 + index,
+                "title": cell_worksheet_title(ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME),
+            }
+            for index, role in enumerate(ROLES)
+        }
+        publication = {"status": "COMPLETE", "snapshot": {
+            "schema_version": 2, "spreadsheet_id": workbook.id,
+            "worksheets": role_snapshot,
+        }}
+        config = _configuration(
+            CELL_FORMAT_SPREADSHEET_ID="existing",
+            CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS="true",
+        )
+        with self.assertRaisesRegex(ValueError, "different worksheet ID"):
+            pipeline._resolve_cell_targets(MemoryOperationStore(), workbook, CLUSTER, config, publication)
+        self.assertEqual(workbook.add_requests, [])
+
+    def test_cell_sheet_validation_error_logs_only_allowlisted_reason(self):
+        private_detail = "private-workbook-id-123456789"
+        error = cell_sheet_validation_error(
+            f"committed worksheet {private_detail} is missing",
+            "committed_worksheet_missing",
+        )
+        summary = safe_cell_sheet_error(error)
+        self.assertEqual(summary["error_types"], ["ValueError"])
+        self.assertEqual(summary["safe_reason"], "committed_worksheet_missing")
+        self.assertNotIn(private_detail, json.dumps(summary))
 
     def test_ambiguous_add_sheet_reconciles_exact_readback_but_never_retries(self):
         workbook = FakeWorkbook("existing", "Cell Reports")

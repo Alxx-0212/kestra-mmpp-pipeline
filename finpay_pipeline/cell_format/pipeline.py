@@ -14,7 +14,9 @@ from ..cell_contracts import (
 )
 from ..cell_database import cell_publication_session, prepare_cell_day, validate_cluster_batch
 from ..cell_observability import cohort_counts, observed, report
-from ..cell_publication import ExistingSheetAdapter, _read_with_retry
+from ..cell_publication import (
+    ExistingSheetAdapter, _read_with_retry, cell_sheet_validation_error,
+)
 from ..cell_publication_v2 import (
     ROLES, build_cell_cluster_matrices_v2, cell_worksheet_title,
     preflight_unpublished_v2_sheet, publish_cell_cluster_v2, validate_output_targets,
@@ -277,7 +279,10 @@ def _journaled_add_worksheet(store, workbook, title, worksheet_id=None):
         raise error from exc
 
 
-def _resolve_cell_targets(store, workbook, cluster_id, configuration, publication):
+def _resolve_cell_targets(store, workbook, cluster_id, configuration, publication, *, restored_roles=None):
+    restored_roles = set() if restored_roles is None else restored_roles
+    if not isinstance(restored_roles, set):
+        raise TypeError("restored worksheet roles must be a mutable set")
     store.assert_cluster_target(workbook.id)
     if publication and publication["status"] != "COMPLETE":
         raise RuntimeError("cell-format target has unresolved publication state")
@@ -310,13 +315,56 @@ def _resolve_cell_targets(store, workbook, cluster_id, configuration, publicatio
             item = prior[role]
             worksheet_id, title = item.get("worksheet_id"), item.get("title")
             expected_title = cell_worksheet_title(account, role, CELL_FORMAT_NAMING_SCHEME)
-            worksheet = by_id.get(worksheet_id)
-            if (title != expected_title or worksheet is None or worksheet.title != title
+            if (type(worksheet_id) is not int or not isinstance(title, str)
+                    or title != expected_title
                     or (configured_ids and configured_ids.get(role) != worksheet_id)):
-                raise ValueError(
-                    "committed cell publication worksheet is missing or mismatched; operator reconciliation required"
+                raise cell_sheet_validation_error(
+                    "committed cell publication worksheet identity is incompatible with the configured alias",
+                    "committed_worksheet_identity_conflict",
                 )
+            worksheet = by_id.get(worksheet_id)
+            title_matches = by_title.get(title, [])
+            if len(title_matches) > 1:
+                raise cell_sheet_validation_error(
+                    "multiple worksheets have the committed cell publication title",
+                    "committed_worksheet_identity_conflict",
+                )
+            if worksheet is None:
+                if not (configuration.restore_missing_published_worksheets
+                        and configuration.create_worksheets_if_missing):
+                    raise cell_sheet_validation_error(
+                        "committed cell publication worksheet is missing; operator reconciliation required",
+                        "committed_worksheet_missing",
+                    )
+                if title_matches:
+                    raise cell_sheet_validation_error(
+                        "committed cell publication title exists with a different worksheet ID",
+                        "committed_worksheet_identity_conflict",
+                    )
+                worksheet = _journaled_add_worksheet(store, workbook, title, worksheet_id)
+                if worksheet.id != worksheet_id or worksheet.title != title:
+                    raise cell_sheet_validation_error(
+                        "restored worksheet did not retain its committed identity",
+                        "committed_worksheet_identity_conflict",
+                    )
+                by_id[worksheet_id] = worksheet
+                by_title.setdefault(title, []).append(worksheet)
+                restored_roles.add(role)
+            elif worksheet.title != title:
+                raise cell_sheet_validation_error(
+                    "committed cell publication worksheet is missing or mismatched; operator reconciliation required",
+                    "committed_worksheet_identity_conflict",
+                )
+            elif configuration.restore_missing_published_worksheets:
+                adapter = ExistingSheetAdapter(workbook, worksheet)
+                try:
+                    preflight_unpublished_v2_sheet(adapter, title, _read_with_retry(adapter.metadata))
+                except ValueError:
+                    pass
+                else:
+                    restored_roles.add(role)
             worksheet_ids[role] = worksheet_id
+            existing_worksheets[role] = worksheet
     else:
         missing = []
         for role in ROLES:
@@ -355,6 +403,7 @@ def _resolve_cell_targets(store, workbook, cluster_id, configuration, publicatio
         for role, title, requested_id in missing:
             worksheet = _journaled_add_worksheet(store, workbook, title, requested_id)
             worksheet_ids[role] = worksheet.id
+            existing_worksheets[role] = worksheet
 
     targets = sheet_targets(
         cluster_id, spreadsheet_id=spreadsheet_id,
@@ -367,7 +416,7 @@ def _resolve_cell_targets(store, workbook, cluster_id, configuration, publicatio
     )
     adapters = {}
     for role, target in targets.items():
-        worksheet = _read_with_retry(lambda: workbook.get_worksheet_by_id(target.worksheet_id))
+        worksheet = existing_worksheets.get(role)
         if worksheet is None or worksheet.id != target.worksheet_id or worksheet.title != target.title:
             raise ValueError("resolved cell worksheet workbook/ID/title identity changed")
         adapters[role] = ExistingSheetAdapter(workbook, worksheet)
@@ -711,6 +760,7 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
     ) as store:
         report("publication_lock_acquired")
         committed = _verify_handoff_history(store, handoff, config)
+        report("handoff_history_verified")
         publication = store.latest_publication(sheet_only=True)
         if publication and publication["status"] != "COMPLETE":
             raise RuntimeError("cell-format target has unresolved publication state")
@@ -721,21 +771,39 @@ def publish_cell_sheets(handoff_path: str, handoff_sha256: str, *, database_pass
             first_report_date=handoff["submitted_report_date"] if date_scoped else None,
             calculate_saldo=not date_scoped,
         )
+        report("committed_history_matrix_validated")
 
         if client is None:
             client = sheet_client_factory(credentials_info)
         workbook = _read_with_retry(lambda: client.open_by_key(workbook_id))
         _verify_workbook(workbook, workbook_id, configuration.spreadsheet_name)
         _verify_workbook_access(workbook, configuration)
+        report("workbook_access_verified")
+        configured_ids = (configuration.worksheet_ids or {}).get(actual_cluster + "_B")
+        report("worksheet_resolution_started", count=len(configured_ids or {}))
+        report("worksheet_restore_enabled" if configuration.restore_missing_published_worksheets
+               else "worksheet_restore_disabled")
+        report("worksheet_creation_enabled" if configuration.create_worksheets_if_missing
+               else "worksheet_creation_disabled")
+        report("worksheet_ids_configured" if configuration.worksheet_ids is not None
+               else "worksheet_ids_unconfigured")
+        report("worksheet_account_ids_present" if configured_ids is not None
+               else "worksheet_account_ids_missing")
+        restored_roles = set()
         targets, adapters = _resolve_cell_targets(
             store, workbook, actual_cluster, configuration, publication,
+            restored_roles=restored_roles,
         )
+        report("worksheet_resolution_complete", count=len(restored_roles))
+        if restored_roles:
+            report("committed_worksheets_restored", count=len(restored_roles))
         result = publish_cell_cluster_v2(
             store, workbook_id, targets, adapters, None, config,
             publication_only=True, preserve_manual_inputs=True,
             refresh_request_id=refresh_request_id, date_scoped=date_scoped,
             report_date=handoff["submitted_report_date"] if date_scoped else None,
-            write_from_date=publication_start_date,
+            write_from_date=publication_start_date, restored_roles=restored_roles,
+            restore_missing_published_worksheets=configuration.restore_missing_published_worksheets,
         )
         report("publication_verified", completed=4, total=4)
     return {"status": "COMPLETE", "cluster_id": actual_cluster,

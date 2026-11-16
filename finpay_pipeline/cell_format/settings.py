@@ -31,6 +31,7 @@ CELL_FORMAT_FINANCE_EMAILS: tuple[str, ...] = ()
 CELL_FORMAT_WORKSHEET_IDS: dict[str, dict[str, int]] = {}
 CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: bool | None = None
 CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: bool = True
+CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS: bool = False
 
 DATABASE_SCHEMA = "public"
 CELL_FORMAT_NAMING_SCHEME = "cluster_alias"
@@ -46,6 +47,7 @@ class CellSheetConfiguration:
     create_spreadsheet_if_missing: bool
     create_worksheets_if_missing: bool
     worksheet_ids: dict[str, dict[str, int]] | None
+    restore_missing_published_worksheets: bool = False
 
 
 def _unique_object(pairs):
@@ -167,12 +169,19 @@ def sheet_configuration(environment=None) -> CellSheetConfiguration:
     ), "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING")
     if create and not create_worksheets:
         raise ValueError("creating a workbook requires alias worksheet initialization to be enabled")
+    restore_missing_published_worksheets = _parse_boolean(_setting(
+        environment, "CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS",
+        CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS,
+    ), "CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS")
+    if restore_missing_published_worksheets and not create_worksheets:
+        raise ValueError("restoring published worksheets requires worksheet creation to be enabled")
     worksheet_ids = _parse_worksheet_ids(
         _setting(environment, "CELL_FORMAT_WORKSHEET_IDS", CELL_FORMAT_WORKSHEET_IDS),
     )
     return CellSheetConfiguration(
         spreadsheet_id or None, spreadsheet_name or None, legacy_id, writer_email,
         finance_emails, create, create_worksheets, worksheet_ids,
+        restore_missing_published_worksheets,
     )
 
 

@@ -93,8 +93,8 @@ class CellSheetReadRetriesTests(unittest.TestCase):
             for request in requests:
                 self.assertIs(adapter.send(request, timeout=(30, 300)), response)
 
-        self.assertEqual(starts, [0.0, 1.25, 2.5])
-        self.assertEqual(sleep.call_args_list, [call(1.25), call(1.25)])
+        self.assertEqual(starts, [0.0, 5.0, 10.0])
+        self.assertEqual(sleep.call_args_list, [call(5), call(5)])
         self.assertEqual(transport.call_args_list,
                          [call(request, timeout=(30, 300)) for request in requests])
         self.assertEqual(adapter.max_retries.total, 0)
@@ -131,7 +131,7 @@ class CellSheetReadRetriesTests(unittest.TestCase):
             transport.assert_called_once_with(write, timeout=(30, 300))
             adapter.send(read, timeout=(30, 300))
 
-        sleep.assert_called_once_with(1.25)
+        sleep.assert_called_once_with(5)
         self.assertEqual(transport.call_args_list,
                          [call(write, timeout=(30, 300)), call(read, timeout=(30, 300))])
         self.assertEqual(adapter.max_retries.total, 0)

@@ -16,8 +16,8 @@ from .cell_observability import report
 from .cell_publication import (
     GUARD_PREFIX, MANAGED_PREFIX, MAX_REQUEST_BYTES, _editors_match, _format_requests,
     _manual_values, _marker_entries, _marker_request, _padded, _protection_requests,
-    _status_requests, _verify_final_protections, _verify_marker, matrix_write_requests,
-    _validate_input_policy,
+    _status_requests, _verify_final_protections, _verify_marker, cell_sheet_validation_error,
+    matrix_write_requests, _validate_input_policy,
 )
 from .cell_sheets import cell_grid_capacity, mandiri_reset_dates, render_cell_matrix
 
@@ -957,8 +957,12 @@ def _source_calculation_history(rows):
     return {day: fingerprint(sorted(ids)) for day, ids in source_ids.items()}
 
 
-def _validate_deleted_row_tails(saved, adapters, metadata, call):
+def _validate_deleted_row_tails(saved, adapters, metadata, call, *, restored_roles=()):
+    restored_roles = set(restored_roles)
     for role in ROLES:
+        if role in restored_roles:
+            # Exact-ID restored tabs were already verified empty and unmanaged-free.
+            continue
         patch = saved[role].get("patch", {})
         data_count = patch.get("old_data_count", 0)
         shifts_rows = bool(patch.get("insert_count", 0) or patch.get("delete_count", 0))
@@ -1114,9 +1118,14 @@ def _write_full_snapshot(saved, prior, targets, adapters, guarded, store, epoch,
     report("formatting_applied")
 
 
-def _read_baseline(adapters, prior):
+def _read_baseline(adapters, prior, *, restored_roles=()):
     manual = {}
+    restored_roles = set(restored_roles)
     for role, saved in prior.items():
+        if role in restored_roles:
+            if role == "summary":
+                manual = _manual_values(saved["matrix"], saved["values"])
+            continue
         _verify_style(adapters[role], saved["matrix"], allow_unattested=True)
         expected = copy.deepcopy(saved["values"])
         actual = _padded(adapters[role].read(len(expected), len(expected[0])), len(expected), len(expected[0]))
@@ -1127,7 +1136,10 @@ def _read_baseline(adapters, prior):
                 if key in manual:
                     expected[entry["row"] - 1][entry["column"] - 1] = manual[key]
         if actual != expected:
-            raise ValueError(f"v2 {role} tab differs from its committed publication")
+            raise cell_sheet_validation_error(
+                f"v2 {role} tab differs from its committed publication",
+                "committed_sheet_snapshot_mismatch",
+            )
     return manual
 
 
@@ -1135,9 +1147,15 @@ def _require_empty(adapter, metadata):
     grid = metadata["properties"].get("gridProperties", {})
     rows, cols = grid.get("rowCount", 100), grid.get("columnCount", 100)
     if rows * cols > 5_000_000:
-        raise ValueError("initial empty worksheet preflight exceeds bounded grid")
+        raise cell_sheet_validation_error(
+            "initial empty worksheet preflight exceeds bounded grid",
+            "unpublished_worksheet_grid_too_large",
+        )
     if any(value not in ("", None) for row in adapter.read(rows, cols) for value in row):
-        raise ValueError("unpublished v2 target is not empty")
+        raise cell_sheet_validation_error(
+            "unpublished v2 target is not empty",
+            "unpublished_worksheet_not_empty",
+        )
 
 
 def preflight_unpublished_v2_sheet(adapter, expected_title, metadata=None):
@@ -1145,16 +1163,28 @@ def preflight_unpublished_v2_sheet(adapter, expected_title, metadata=None):
     metadata = adapter.metadata() if metadata is None else metadata
     properties = metadata["properties"]
     if properties["sheetId"] != adapter.worksheet_id:
-        raise ValueError("v2 worksheet identity mismatch")
+        raise cell_sheet_validation_error(
+            "v2 worksheet identity mismatch",
+            "committed_worksheet_identity_conflict",
+        )
     if properties.get("title") != expected_title:
-        raise ValueError("worksheet title does not match exact v2 cluster/role")
+        raise cell_sheet_validation_error(
+            "worksheet title does not match exact v2 cluster/role",
+            "committed_worksheet_identity_conflict",
+        )
     protections = metadata.get("protectedRanges", [])
     if any(item.get("description", "").startswith(GUARD_PREFIX) for item in protections):
         raise RuntimeError("unresolved v2 refresh guard")
     if any(not item.get("description", "").startswith(MANAGED_PREFIX) for item in protections):
-        raise ValueError("v2 target contains unmanaged protection")
+        raise cell_sheet_validation_error(
+            "v2 target contains unmanaged protection",
+            "unpublished_worksheet_has_unmanaged_state",
+        )
     if _marker_entries(metadata) or protections:
-        raise ValueError("unpublished v2 sheet has unmanaged generation/protection state")
+        raise cell_sheet_validation_error(
+            "unpublished v2 sheet has unmanaged generation/protection state",
+            "unpublished_worksheet_has_unmanaged_state",
+        )
     _require_empty(adapter, metadata)
 
 
@@ -1164,13 +1194,25 @@ def _verify_values(adapter, saved, previous=None):
     height, width = max(len(values), len(old)), max(len(values[0]), len(old[0]))
     expected = _padded(values, height, width)
     if _padded(adapter.read(height, width), height, width) != expected:
-        raise ValueError("v2 value/formula/tail readback mismatch")
+        raise cell_sheet_validation_error(
+            "v2 value/formula/tail readback mismatch",
+            "committed_sheet_snapshot_mismatch",
+        )
 
 
-def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_id, *, allow_legacy_migration=False):
+def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_id, *,
+                              allow_legacy_migration=False, restored_roles=(),
+                              restore_missing_published_worksheets=False):
     """Read-only identity, prior-epoch and content checks before tab mutation."""
     if set(targets) != set(ROLES) or set(adapters) != set(ROLES):
         raise ValueError("v2 preflight requires exactly four output roles")
+    restored_roles = set(restored_roles)
+    if not restored_roles.issubset(ROLES):
+        raise ValueError("restored worksheet roles must be known v2 outputs")
+    if type(restore_missing_published_worksheets) is not bool:
+        raise ValueError("published worksheet restoration must be an explicit boolean")
+    if restored_roles and not restore_missing_published_worksheets:
+        raise ValueError("restored worksheet roles require explicit restoration authorization")
     if type(allow_legacy_migration) is not bool:
         raise ValueError("explicit presentation-migration mode required")
     if store.cluster_id != cluster_id or store.target_id != spreadsheet_id:
@@ -1218,7 +1260,13 @@ def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_
                 and target.title == cell_worksheet_title(account, role, "cluster_alias")
             )
             if prior_identity != current_identity and not alias_only_rename:
-                raise ValueError("v2 target set changed from prior committed snapshot")
+                raise cell_sheet_validation_error(
+                    "v2 target set changed from prior committed snapshot",
+                    "committed_worksheet_identity_conflict",
+                )
+            if role in restored_roles:
+                preflight_unpublished_v2_sheet(adapter, target.title, meta)
+                continue
             _verify_marker(meta, {"status": "COMPLETE", "epoch": publication["epoch"],
                                   "fingerprint": publication["fingerprint"]})
             _verify_final_protections(target.sheet_target(), prior[role]["matrix"], meta)
@@ -1226,7 +1274,7 @@ def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_
         else:
             preflight_unpublished_v2_sheet(adapter, target.title, meta)
     if prior:
-        _read_baseline(adapters, prior)
+        _read_baseline(adapters, prior, restored_roles=restored_roles)
     return publication
 
 
@@ -1243,7 +1291,8 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                             changed_dates=None, additional_batches=None, configuration_only=False,
                             rows_per_request=200, publication_only=False,
                             preserve_manual_inputs=False, date_scoped=False, report_date=None,
-                            write_from_date: str | None = None,
+                            write_from_date: str | None = None, restored_roles=(),
+                            restore_missing_published_worksheets=False,
                             refresh_request_id: str | None = None):
     """Publish four tabs; an optional refresh ID makes same-execution retries write-free."""
     from psycopg import InterfaceError, OperationalError
@@ -1252,8 +1301,16 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
         raise ValueError("positive v2 write chunk size required")
     if any(type(value) is not bool for value in (
         configuration_only, publication_only, preserve_manual_inputs, date_scoped,
+        restore_missing_published_worksheets,
     )):
         raise ValueError("publication mode flags must be explicit booleans")
+    restored_roles = set(restored_roles)
+    if not restored_roles.issubset(ROLES):
+        raise ValueError("restored worksheet roles must be known v2 outputs")
+    if restored_roles and not restore_missing_published_worksheets:
+        raise ValueError("restored worksheet roles require explicit restoration authorization")
+    if restored_roles and date_scoped:
+        raise ValueError("missing published worksheets require a full-history publication")
     if date_scoped:
         if not publication_only or report_date is None or write_from_date is not None:
             raise ValueError("date-scoped publication requires a persisted date handoff")
@@ -1341,7 +1398,10 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             store.confirm_chunk(staged["epoch"], f"{prefix}-{index}")
 
     previous = preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, config.account[:-2],
-                                         allow_legacy_migration=configuration_only)
+                                         allow_legacy_migration=configuration_only,
+                                         restored_roles=restored_roles,
+                                         restore_missing_published_worksheets=restore_missing_published_worksheets)
+    report("cluster_sheet_preflight_complete", count=len(restored_roles))
     if refresh_request_id is not None:
         used = store.publications_for_refresh_request(refresh_request_id)
         if used:
@@ -1424,11 +1484,12 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                 [target.writer_email], meta.get("implicitOwnerEmails", []))
                 for item in meta.get("protectedRanges", []) if item.get("description") == MANAGED_PREFIX + "BANK INPUT"):
                 raise ValueError("v2 refresh did not lock all MANDIRI inputs")
+        report("temporary_guards_verified", count=len(guards))
         # Read manual inputs only after every tab's protection is confirmed.
         if prior is None:
             for role in ROLES:
                 call(_require_empty, adapters[role], guarded[role])
-        manual = _read_baseline(adapters, prior) if prior else {}
+        manual = _read_baseline(adapters, prior, restored_roles=restored_roles) if prior else {}
         audits = []
 
         def render_committed(session):
@@ -1522,14 +1583,17 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                     worksheets[role]["patch"] = patch
                 snapshot["write_from_date"] = write_from_date
             return {"start": config.first_report_date, "end": through, "snapshot": snapshot,
-                    "refresh_audit_required": bool(audits)}
+                    "refresh_audit_required": bool(audits) or bool(restored_roles)}
 
         if publication_only:
             rendered = render_committed(store)
+            report("committed_matrices_rendered", count=len(rendered["snapshot"]["worksheets"]))
             if date_scoped or (write_from_date is not None and prior is not None):
                 _validate_deleted_row_tails(
                     rendered["snapshot"]["worksheets"], adapters, guarded, call,
+                    restored_roles=restored_roles,
                 )
+                report("suffix_tail_check_complete", count=len(restored_roles))
             staged = store.stage_publication(
                 rendered["start"], rendered["end"], rendered["snapshot"],
                 write_gsheet=True,
@@ -1544,7 +1608,7 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                                       audit["previous_value"], audit["replacement_value"])
         marker = {"status": "PENDING", "epoch": staged["epoch"], "fingerprint": staged["fingerprint"]}
         report("publication_staged")
-        incremental_range = write_from_date is not None and prior is not None
+        incremental_range = write_from_date is not None and prior is not None and not restored_roles
         if staged["status"] != "COMPLETE":
             setup = []
             for role in ROLES:

@@ -9,6 +9,7 @@
 .env.*
 secrets/
 data/
+finpay_pipeline/data/
 tmp/
 docs/
 main.ipynb
