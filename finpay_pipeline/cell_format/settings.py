@@ -29,9 +29,6 @@ CELL_FORMAT_LEGACY_SPREADSHEET_ID = ""
 CELL_FORMAT_WRITER_EMAIL = ""
 CELL_FORMAT_FINANCE_EMAILS: tuple[str, ...] = ()
 CELL_FORMAT_WORKSHEET_IDS: dict[str, dict[str, int]] = {}
-CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: bool | None = None
-CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: bool = True
-CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS: bool = False
 
 DATABASE_SCHEMA = "public"
 CELL_FORMAT_NAMING_SCHEME = "cluster_alias"
@@ -44,10 +41,7 @@ class CellSheetConfiguration:
     legacy_spreadsheet_id: str
     writer_email: str
     finance_emails: tuple[str, ...]
-    create_spreadsheet_if_missing: bool
-    create_worksheets_if_missing: bool
     worksheet_ids: dict[str, dict[str, int]] | None
-    restore_missing_published_worksheets: bool = False
 
 
 def _unique_object(pairs):
@@ -88,16 +82,6 @@ def _parse_emails(value):
     return emails
 
 
-def _parse_boolean(value, name):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().casefold()
-        if normalized in ("true", "false"):
-            return normalized == "true"
-    raise ValueError(f"{name} must be the string true or false")
-
-
 def _parse_worksheet_ids(value):
     if value is None or value == "":
         return None
@@ -128,6 +112,13 @@ def _parse_worksheet_ids(value):
 def sheet_configuration(environment=None) -> CellSheetConfiguration:
     """Resolve and validate target settings without constructing Google clients."""
     environment = os.environ if environment is None else environment
+    obsolete_settings = (
+        "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING",
+        "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING",
+        "CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS",
+    )
+    if any(name in environment for name in obsolete_settings):
+        raise ValueError("cell-format destination creation and restoration settings are unsupported")
     spreadsheet_id = _setting(environment, "CELL_FORMAT_SPREADSHEET_ID", CELL_FORMAT_SPREADSHEET_ID)
     spreadsheet_name = _setting(environment, "CELL_FORMAT_SPREADSHEET_NAME", CELL_FORMAT_SPREADSHEET_NAME)
     if not isinstance(spreadsheet_id, str):
@@ -154,34 +145,12 @@ def sheet_configuration(environment=None) -> CellSheetConfiguration:
     finance_emails = _parse_emails(
         _setting(environment, "CELL_FORMAT_FINANCE_EMAILS", CELL_FORMAT_FINANCE_EMAILS),
     )
-    create_value = _setting(
-        environment, "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING",
-        CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING,
-    )
-    if create_value in (None, ""):
-        create = bool(spreadsheet_name)
-    else:
-        create = _parse_boolean(create_value, "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING")
-    if create and not spreadsheet_name:
-        raise ValueError("CELL_FORMAT_SPREADSHEET_NAME is required to create a workbook")
-    create_worksheets = _parse_boolean(_setting(
-        environment, "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING", CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING,
-    ), "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING")
-    if create and not create_worksheets:
-        raise ValueError("creating a workbook requires alias worksheet initialization to be enabled")
-    restore_missing_published_worksheets = _parse_boolean(_setting(
-        environment, "CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS",
-        CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS,
-    ), "CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS")
-    if restore_missing_published_worksheets and not create_worksheets:
-        raise ValueError("restoring published worksheets requires worksheet creation to be enabled")
     worksheet_ids = _parse_worksheet_ids(
         _setting(environment, "CELL_FORMAT_WORKSHEET_IDS", CELL_FORMAT_WORKSHEET_IDS),
     )
     return CellSheetConfiguration(
         spreadsheet_id or None, spreadsheet_name or None, legacy_id, writer_email,
-        finance_emails, create, create_worksheets, worksheet_ids,
-        restore_missing_published_worksheets,
+        finance_emails, worksheet_ids,
     )
 
 

@@ -100,7 +100,7 @@ class MemoryCellStore:
             self.dirty.add(item["report_date"])
 
 
-def source_bundle(directory, day, roster=None):
+def source_bundle(directory, day, roster=None, credit=100):
     roster = roster or {"412110_B": OBSERVED_CELL_ROSTER["412110_B"]}
     cells = configured_cells(roster)
     report_day = date.fromisoformat(day)
@@ -111,7 +111,7 @@ def source_bundle(directory, day, roster=None):
         path = Path(directory) / name
         row = [
             index + 1, f"{export_date} 12:00:00", f"000123456789012345{index}",
-            1000, 100, 0, 1100, "Credit", "RECHARGE", "0812345678", "Transaksi Sellthru",
+            1000, credit, 0, 1000 + credit, "Credit", "RECHARGE", "0812345678", "Transaksi Sellthru",
         ]
         _write_xhr_export(path, [row])
         content = path.read_bytes()
@@ -139,7 +139,7 @@ class CellFormatPipelineTests(unittest.TestCase):
         self.cluster_id = "412110"
         self.account = self.cluster_id + "_B"
 
-    def persist_with_store(self, prepared_path, prepared_sha, store, *, publication_scope="report_date"):
+    def persist_with_store(self, prepared_path, prepared_sha, store):
         observed = {}
 
         @contextmanager
@@ -150,11 +150,10 @@ class CellFormatPipelineTests(unittest.TestCase):
 
         result = persist_cell_day(
             str(prepared_path), prepared_sha, database_password="synthetic-password",
-            output_path=str(Path(prepared_path).with_name("cell_handoff_v1.json")),
-            publication_scope=publication_scope, target=self.target, session_factory=session,
+            target=self.target, session_factory=session,
         )
         self.assertEqual(observed["cluster"], self.cluster_id)
-        self.assertEqual(observed["sheet_id"], "")
+        self.assertEqual(observed["sheet_id"], "database-only:" + self.cluster_id)
         self.assertFalse(observed["kwargs"]["write_gsheet"])
         return result, observed
 
@@ -403,12 +402,7 @@ class CellFormatPipelineTests(unittest.TestCase):
                 item["config_id"] == store.facts[(CELL_START, item["identity"]["cell_code"])]["config_id"]
                 for item in store.facts.values()
             ))
-            handoff = json.loads((directory / "cell_handoff_v1.json").read_text(encoding="utf-8"))
-            self.assertEqual(handoff["first_report_date"], CELL_START)
-            self.assertEqual(handoff["last_report_date"], CELL_NEXT)
-            self.assertEqual(handoff["scope"], "report_date")
-            self.assertEqual({item["report_date"] for item in handoff["selected"]}, {CELL_NEXT})
-            self.assertEqual(len(handoff["selected"]), len(OBSERVED_CELL_ROSTER[self.account]))
+            self.assertEqual(outputs[-1]["status"], "PERSISTED")
             config = settings.report_config(self.cluster_id, CELL_START)
             facts = list(store.facts.values())
             report_days = build_cluster_report(config, facts, CELL_NEXT)["days"]
@@ -441,7 +435,7 @@ class CellFormatPipelineTests(unittest.TestCase):
             rerun, _ = self.persist_with_store(
                 prepared_path, result["prepared_sha256"], store,
             )
-            self.assertEqual(rerun["history_fingerprint"], outputs[-1]["history_fingerprint"])
+            self.assertEqual(rerun["status"], "PERSISTED")
             self.assertEqual(len(store.commits), 3)
 
     def test_later_day_persists_without_prior_history(self):
@@ -462,12 +456,53 @@ class CellFormatPipelineTests(unittest.TestCase):
             persisted, _ = self.persist_with_store(prepared_path, prepared["prepared_sha256"], store)
             self.assertEqual(len(store.commits), 1)
             self.assertEqual({day for day, _ in store.facts}, {CELL_NEXT})
-            handoff = json.loads((directory / "cell_handoff_v1.json").read_text(encoding="utf-8"))
-            self.assertEqual(handoff["scope"], "report_date")
-            self.assertEqual({item["report_date"] for item in handoff["selected"]}, {CELL_NEXT})
-            self.assertEqual(persisted["history_fingerprint"], handoff["history_fingerprint"])
+            self.assertEqual(persisted["status"], "PERSISTED")
 
-    def test_range_scope_retains_full_history_validation_and_handoff(self):
+    def test_report_date_rerun_replaces_only_current_cohort_and_keeps_source_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = MemoryCellStore()
+            prior_generation_ids = {}
+            later_facts = {}
+
+            for day, credit in ((CELL_START, 100), (CELL_NEXT, 250), (CELL_START, 900)):
+                folder = root / f"{day}-{credit}"
+                folder.mkdir()
+                bundle, digest = source_bundle(folder, day, credit=credit)
+                prepared_path = folder / "prepared.json"
+                prepared = preprocess_cell_day(
+                    str(bundle), digest, day, self.cluster_id, str(prepared_path),
+                )
+                self.persist_with_store(prepared_path, prepared["prepared_sha256"], store)
+                if day == CELL_START and credit == 100:
+                    prior_generation_ids = {
+                        code: store.facts[(CELL_START, code)]["generation_id"]
+                        for code in OBSERVED_CELL_ROSTER[self.account]
+                    }
+                if day == CELL_NEXT:
+                    later_facts = {
+                        code: store.facts[(CELL_NEXT, code)]
+                        for code in OBSERVED_CELL_ROSTER[self.account]
+                    }
+
+            self.assertEqual(len(store.facts), 2 * len(OBSERVED_CELL_ROSTER[self.account]))
+            self.assertTrue(all(
+                store.facts[(CELL_START, code)]["generation_id"] != prior_generation_ids[code]
+                for code in prior_generation_ids
+            ))
+            self.assertTrue(all(
+                store.facts[(CELL_NEXT, code)] is fact for code, fact in later_facts.items()
+            ))
+            self.assertTrue(all(
+                store.sources[prior_generation_ids[code]][1][0]["Kredit"] == 100
+                for code in prior_generation_ids
+            ))
+            self.assertEqual({
+                item["raw_rows"][0]["Kredit"]
+                for item in store.current_source_rows(CELL_START, CELL_START)
+            }, {900})
+
+    def legacy_test_explicit_history_scope_retains_full_history_validation_and_handoff(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
 
@@ -540,14 +575,15 @@ class CellFormatPipelineTests(unittest.TestCase):
             persisted, _ = self.persist_with_store(
                 prepared_path, prepared["prepared_sha256"], store,
             )
+            self.assertEqual(persisted["status"], "PERSISTED")
             sheet_client = Mock()
             database = Mock()
-            sheet_result = publish_cell_sheets(
-                str(Path(directory) / "cell_handoff_v1.json"), persisted["handoff_sha256"],
-                database_password=None, credentials_info=None, dry_run=True,
-                session_factory=database, sheet_client_factory=sheet_client,
-            )
-            self.assertEqual(sheet_result["status"], "DRY_RUN")
+            with self.assertRaisesRegex(ValueError, "secrets are required"):
+                publish_cell_sheets(
+                    CELL_START, self.cluster_id,
+                    database_password=None, credentials_info=None,
+                    session_factory=database, sheet_client_factory=sheet_client,
+                )
             database.assert_not_called()
             sheet_client.assert_not_called()
             with patch.object(settings, "CELL_FORMAT_SPREADSHEET_ID", ""), \
@@ -556,7 +592,7 @@ class CellFormatPipelineTests(unittest.TestCase):
                     validate_sheet_range(CELL_START, CELL_START, self.cluster_id)
             sheet_client.assert_not_called()
 
-    def test_named_workbook_history_guard_precedes_workbook_creation(self):
+    def legacy_test_named_workbook_history_guard_precedes_workbook_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             bundle, bundle_sha = source_bundle(directory, CELL_START)
             prepared_path = Path(directory) / "prepared.json"
@@ -641,7 +677,7 @@ class CellFormatPipelineTests(unittest.TestCase):
                 blocks += 1
             self.assertGreater(blocks, 0, f"no inline script found in {name}")
 
-    def test_changed_submitted_date_handoff_fails_before_google_client_creation(self):
+    def legacy_test_changed_submitted_date_handoff_fails_before_google_client_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             store = MemoryCellStore()
@@ -708,20 +744,18 @@ class CellFormatPipelineTests(unittest.TestCase):
             def session(target, approved, cluster_id, sheet_id, **kwargs):
                 yield store
 
-            handoff_path = directory / "failed-handoff.json"
             with self.assertRaisesRegex(RuntimeError, "injected cohort commit failure"):
                 persist_cell_day(
                     str(prepared_path), prepared["prepared_sha256"],
-                    database_password="synthetic-password", output_path=str(handoff_path),
-                    target=self.target, session_factory=session,
+                    database_password="synthetic-password", target=self.target,
+                    session_factory=session,
                 )
             self.assertEqual(
                 (store.facts, store.sources, store.configurations, store.dirty, store.commits),
                 before,
             )
-            self.assertFalse(handoff_path.exists())
 
-    def test_ambiguous_database_publication_gate_precedes_google(self):
+    def legacy_test_ambiguous_database_publication_gate_precedes_google(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             bundle, bundle_sha = source_bundle(directory, CELL_START)

@@ -10,7 +10,7 @@ from finpay_pipeline.cell_design import dummy_cluster_report
 from finpay_pipeline.cell_calculation import build_cluster_report
 from finpay_pipeline.tests import test_cell_calculation as fixtures
 from finpay_pipeline.cell_sheets import (
-    column_letter, mandiri_reset_dates, render_cell_matrix as current_matrix, write_cell_design_workbook,
+    column_letter, render_cell_matrix as current_matrix, write_cell_design_workbook,
 )
 
 
@@ -23,9 +23,8 @@ class CellSheetDesignTests(unittest.TestCase):
     def setUp(self):
         self.report = dummy_cluster_report("412110_B", ("412111", "412112"))
 
-    def input(self, matrix, day, code):
-        return next(item for item in matrix["editable_inputs"]
-                    if item["report_date"] == day and item["cell_code"] == code)
+    def block(self, matrix, code):
+        return next(item for item in matrix["blocks"] if item["cell_code"] == code)
 
     def row(self, matrix, day, key):
         start = next(item["start_row"] for item in matrix["date_ranges"] if item["report_date"] == day)
@@ -65,38 +64,34 @@ class CellSheetDesignTests(unittest.TestCase):
         self.assertEqual(matrix["values"][2][5], "=SUM(M3,T3)")
 
     def test_formulas_reference_correct_cell_columns_not_legacy_d(self):
-        matrix = render_cell_matrix(self.report, dummy=True)
-        for code, col in (("412111", "K"), ("412112", "R")):
-            bank = self.input(matrix, "2026-10-13", code)
-            formula = matrix["values"][bank["row"] - 1][bank["column"] - 1]
-            self.assertTrue(formula.startswith("=" + col))
-            self.assertNotIn("D", formula)
-            cell_saldo = 13 if code == "412111" else 20
-            detail = self.row(matrix, "2026-10-13", "DETAIL:SELLTHRU")
-            saldo_formula = matrix["values"][detail - 1][cell_saldo - 1]
-            self.assertIn(col + str(detail), saldo_formula)
-
-    def test_manual_reset_only_requested_and_preceding_dates(self):
-        reset = mandiri_reset_dates(self.report, ["2026-10-15"])
-        self.assertEqual(reset, {"2026-10-14", "2026-10-15"})
-        matrix = render_cell_matrix(
-            self.report, dummy=True, reset_dates=reset,
-            manual_values={("2026-10-13", "412111"): 45000,
-                           ("2026-10-14", "412111"): 33333},
-        )
-        old, refreshed = self.input(matrix, "2026-10-13", "412111"), self.input(matrix, "2026-10-14", "412111")
-        self.assertEqual(matrix["values"][old["row"] - 1][old["column"] - 1], 45000)
-        self.assertTrue(matrix["values"][refreshed["row"] - 1][refreshed["column"] - 1].startswith("=K"))
-        self.assertEqual(len(matrix["manual_reset_audit"]), 1)
-        self.assertEqual(matrix["manual_reset_audit"][0]["previous_value"], 33333)
+        matrix = current_matrix(self.report, dummy=True, presentation_version=5)
+        row = self.row(matrix, "2026-10-13", "CASH:cash:MANDIRI")
+        for code in ("412111", "412112"):
+            block = self.block(matrix, code)
+            formula = matrix["values"][row - 1][block["start_column"] - 1]
+            credit_col = column_letter(block["start_column"] + 1)
+            self.assertIn("SUMIFS", formula)
+            self.assertIn(f"{credit_col}:{credit_col}", formula)
+            self.assertIn('"2026-10-14"', formula)
+            self.assertIn('"CASHOUT APOLLO"', formula)
+        detail = next(index + 1 for index, key in enumerate(matrix["row_keys"])
+                      if key.startswith("DETAIL:") and matrix["values"][index][0] == "2026-10-13")
+        saldo_col = self.block(matrix, "412111")["start_column"] + 1
+        self.assertTrue(matrix["values"][detail - 1][saldo_col].startswith("=1000000+"))
+        next_detail = next(index + 1 for index, key in enumerate(matrix["row_keys"])
+                           if key.startswith("DETAIL:") and matrix["values"][index][0] == "2026-10-14")
+        self.assertIn("SUMIFS", matrix["values"][next_detail - 1][saldo_col])
+        self.assertEqual(matrix["editable_inputs"], [])
 
     def test_latest_day_bank_default_is_pending_not_zero(self):
-        matrix = render_cell_matrix(self.report, dummy=True)
-        bank = self.input(matrix, "2026-10-15", "412111")
-        row = matrix["values"][bank["row"] - 1]
-        self.assertEqual(row[bank["column"] - 1], "PENDING NEXT DAY")
-        self.assertIn("PENDING NEXT DAY", row[3])
-        self.assertEqual(matrix["numeric_preview"][bank["row"] - 1][3], "PENDING NEXT DAY")
+        matrix = current_matrix(self.report, dummy=True, presentation_version=5)
+        row = self.row(matrix, "2026-10-15", "CASH:cash:MANDIRI")
+        block = self.block(matrix, "412111")
+        formula = matrix["values"][row - 1][block["start_column"] - 1]
+        self.assertIn('"PENDING NEXT DAY"', formula)
+        self.assertEqual(matrix["numeric_preview"][row - 1][block["start_column"] - 1],
+                         "PENDING NEXT DAY")
+        self.assertEqual(matrix["editable_inputs"], [])
 
     def test_no_invoice_linkaja_or_legacy_panels(self):
         matrix = render_cell_matrix(self.report, dummy=True)
@@ -145,11 +140,19 @@ class CellSheetDesignTests(unittest.TestCase):
         self.assertEqual(matrix["numeric_preview"][st_row][10], 9_880)
 
     def test_numeric_preview_cash_difference_sign_matches_finance_layout(self):
-        matrix = render_cell_matrix(self.report, dummy=True,
-                                    manual_values={("2026-10-13", "412111"): 45000})
+        matrix = current_matrix(self.report, dummy=True, presentation_version=5)
         row = self.row(matrix, "2026-10-13", "CASH:cash:SELISIH")
-        self.assertEqual(matrix["numeric_preview"][row - 1][10], -55000)
-        self.assertEqual(matrix["numeric_preview"][row - 1][11], "KURANG BAYAR")
+        mandiri = self.row(matrix, "2026-10-13", "CASH:cash:MANDIRI")
+        running = self.row(matrix, "2026-10-13", "CASH:cash:RUNNING TOTAL")
+        block = self.block(matrix, "412111")
+        column = block["start_column"] - 1
+        mandiri_value = matrix["numeric_preview"][mandiri - 1][column]
+        if mandiri_value:
+            expected = mandiri_value - matrix["numeric_preview"][running - 1][column]
+            self.assertEqual(matrix["numeric_preview"][row - 1][column], expected)
+        else:
+            self.assertEqual(matrix["numeric_preview"][row - 1][column], "")
+        self.assertTrue(matrix["values"][row - 1][column].startswith("=IF"))
 
     def test_no_category_day_is_zero_movement_and_carries_prior_saldo(self):
         matrix = render_cell_matrix(self.report, dummy=True)
@@ -167,8 +170,9 @@ class CellSheetDesignTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             render_cell_matrix(self.report, reset_dates={"2026-10-12"})
 
-    def test_local_workbook_has_formulas_preview_and_only_cell_inputs_unlocked(self):
+    def test_local_workbook_has_formulas_preview_and_no_editable_inputs(self):
         matrix = render_cell_matrix(self.report, dummy=True)
+        self.assertEqual(matrix["editable_inputs"], [])
         with TemporaryDirectory() as directory:
             path = Path(directory) / "dummy.xlsx"
             write_cell_design_workbook(path, [matrix])
@@ -189,10 +193,7 @@ class CellSheetDesignTests(unittest.TestCase):
                     self.assertEqual(cell.fill.fgColor.rgb, "00FFFFFF")
                     self.assertIsNone(getattr(cell.border.bottom, "style", None))
             self.assertEqual(formulas["F3"].border.right.style, "medium")
-            for item in matrix["editable_inputs"]:
-                self.assertFalse(formulas.cell(item["row"], item["column"]).protection.locked)
-                self.assertTrue(formulas.cell(item["row"], 4).protection.locked)
-                self.assertTrue(preview.cell(item["row"], item["column"]).protection.locked)
+            self.assertTrue(formulas.protection.sheet)
             workbook.close()
         with self.assertRaises(ValueError):
             write_cell_design_workbook("ignored.xlsx", [render_cell_matrix(self.report)])
@@ -223,8 +224,7 @@ class CompactSheetDesignTests(unittest.TestCase):
             self.assertEqual(new.count(new[0]), 1)
             self.assertEqual(new[6], "")
             self.assertEqual(new[10], "")
-        self.assertTrue(all(item["column"] in (8, 12) for item in compact["editable_inputs"]))
-        self.assertTrue(all(not item["default"].startswith("=K") for item in compact["editable_inputs"]))
+        self.assertEqual(compact["editable_inputs"], [])
 
     def test_three_cell_layout_has_eighteen_columns_and_reference_palette(self):
         report = dummy_cluster_report("422040_B", ("422041", "422042", "422043"))
@@ -290,8 +290,7 @@ class CompactSheetDesignTests(unittest.TestCase):
                 self.assertEqual(before[:3], after[:3])
                 for index in range(len(codes)):
                     self.assertEqual(before[7 + index * 4:10 + index * 4], after[3 + index * 4:6 + index * 4])
-            for entry in new["editable_inputs"]:
-                self.assertEqual(entry["column"], 4 + 4 * codes.index(entry["cell_code"]))
+            self.assertEqual(new["editable_inputs"], [])
             with TemporaryDirectory() as directory:
                 path = Path(directory) / "cell-only.xlsx"
                 write_cell_design_workbook(path, [new])
@@ -324,21 +323,19 @@ class CompactSheetDesignTests(unittest.TestCase):
     def test_v5_bank_inputs_stay_debet_but_reference_next_day_credit(self):
         report = dummy_cluster_report("412110_B", ("412111", "412112"))
         matrix = current_matrix(report, dummy=True, presentation_version=5)
-        for entry in matrix["editable_inputs"]:
-            index = next(i for i, day in enumerate(report["days"]) if day["report_date"] == entry["report_date"])
-            self.assertIn(entry["column"], (4, 8))
-            if index == len(report["days"]) - 1:
-                self.assertEqual(entry["default"], "PENDING NEXT DAY")
-                continue
-            next_day = report["days"][index + 1]
-            cell = next(c for c in next_day["cells"] if c["cell_code"] == entry["cell_code"])
-            next_area = matrix["date_ranges"][index + 1]
-            target = next(row for row in range(next_area["start_row"], next_area["end_row"] + 1)
-                          if matrix["row_keys"][row - 1] == "DETAIL:CASHOUT APOLLO")
-            letter = "E" if entry["column"] == 4 else "I"
-            self.assertEqual(entry["default"], f"={letter}{target}")
-            self.assertEqual(matrix["numeric_preview"][entry["row"] - 1][entry["column"] - 1],
-                             cell["measures"].get("CASHOUT APOLLO", {}).get("kredit", 0))
+        for day in report["days"]:
+            row = next(index + 1 for index, key in enumerate(matrix["row_keys"])
+                       if key == "CASH:cash:MANDIRI"
+                       and matrix["values"][index][0] == day["report_date"])
+            for code in ("412111", "412112"):
+                block = next(item for item in matrix["blocks"] if item["cell_code"] == code)
+                formula = matrix["values"][row - 1][block["start_column"] - 1]
+                self.assertIn("SUMIFS", formula)
+                self.assertIn('"CASHOUT APOLLO"', formula)
+                if day["report_date"] != report["days"][-1]["report_date"]:
+                    self.assertIn('"' + (report["days"][report["days"].index(day) + 1]["report_date"]) + '"', formula)
+                else:
+                    self.assertIn('"PENDING NEXT DAY"', formula)
 
 
 if __name__ == "__main__":

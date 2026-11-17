@@ -12,8 +12,6 @@ variables:
   cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
   legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"
   cell_worksheet_ids_json: ""
-  create_spreadsheet_if_missing: true
-  create_worksheets_if_missing: true
 
 inputs:
   - id: start_date
@@ -40,11 +38,6 @@ inputs:
   - id: send_telegram
     type: BOOLEAN
     defaults: false
-  - id: restore_missing_published_worksheets
-    type: BOOLEAN
-    defaults: "{{ vars.create_worksheets_if_missing }}"
-    description: "Restore only missing published worksheet IDs from the committed snapshot when the target tabs are empty."
-
 tasks:
   - id: preflight_cell_bulk_targets
     type: io.kestra.plugin.scripts.python.Script
@@ -59,17 +52,18 @@ tasks:
       END_DATE: "{{ inputs.end_date }}"
       CLUSTER_ID: "{{ inputs.cluster_id }}"
       WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
       CELL_FORMAT_SPREADSHEET_ID: "{{ vars.cell_spreadsheet_id }}"
       CELL_FORMAT_SPREADSHEET_NAME: "{{ vars.cell_spreadsheet_name }}"
       CELL_FORMAT_LEGACY_SPREADSHEET_ID: "{{ vars.legacy_spreadsheet_id }}"
       CELL_FORMAT_WRITER_EMAIL: "{{ secret('FINPAY_CELL_WRITER_EMAIL') }}"
       CELL_FORMAT_FINANCE_EMAILS: "{{ secret('FINPAY_CELL_FINANCE_EMAILS') }}"
-      CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: "{{ vars.create_spreadsheet_if_missing }}"
       CELL_FORMAT_WORKSHEET_IDS: "{{ vars.cell_worksheet_ids_json }}"
-      CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ vars.create_worksheets_if_missing }}"
+      GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
     script: |
       import os
       from kestra import Kestra
+      from finpay_pipeline.cell_workflow import decode_cell_google_credentials
       from finpay_pipeline.cell_format import expand_cell_range
       from finpay_pipeline.cell_format.bulk_pipeline import validate_cell_bulk_sheet_range
       from finpay_pipeline.cell_observability import observed
@@ -79,9 +73,11 @@ tasks:
       runs = expand_cell_range(
           os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
       )
-      if os.environ["WRITE_GSHEET"].lower() == "true":
+      if (os.environ["DRY_RUN"].lower() == "false"
+              and os.environ["WRITE_GSHEET"].lower() == "true"):
           validate_cell_bulk_sheet_range(
               os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
+              credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
           )
       Kestra.outputs({"clusters": len({run["cluster_id"] for run in runs}), "runs": len(runs)})
 
@@ -203,8 +199,6 @@ tasks:
       FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
       FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
       FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
-    outputFiles:
-      - cell_bulk_handoffs_v1.zip
     script: |
       import os
       from kestra import Kestra
@@ -236,11 +230,10 @@ tasks:
       maxInterval: PT60S
       maxAttempts: 3
     runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
-    inputFiles:
-      cell_bulk_handoffs_v1.zip: "{{ outputs.persist_cell_bulk.outputFiles['cell_bulk_handoffs_v1.zip'] }}"
     env:
-      HANDOFF_BUNDLE_SHA256: "{{ outputs.persist_cell_bulk.vars.handoff_bundle_sha256 }}"
-      REFRESH_REQUEST_ID: "{{ execution.originalId ?? execution.id }}"
+      START_DATE: "{{ inputs.start_date }}"
+      END_DATE: "{{ inputs.end_date }}"
+      CLUSTER_ID: "{{ inputs.cluster_id }}"
       FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
       FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
       FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
@@ -252,10 +245,7 @@ tasks:
       CELL_FORMAT_LEGACY_SPREADSHEET_ID: "{{ vars.legacy_spreadsheet_id }}"
       CELL_FORMAT_WRITER_EMAIL: "{{ secret('FINPAY_CELL_WRITER_EMAIL') }}"
       CELL_FORMAT_FINANCE_EMAILS: "{{ secret('FINPAY_CELL_FINANCE_EMAILS') }}"
-      CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: "{{ vars.create_spreadsheet_if_missing }}"
       CELL_FORMAT_WORKSHEET_IDS: "{{ vars.cell_worksheet_ids_json }}"
-      CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ vars.create_worksheets_if_missing }}"
-      CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS: "{{ inputs.restore_missing_published_worksheets }}"
     script: |
       import json
       import os
@@ -266,10 +256,9 @@ tasks:
 
       try:
           result = publish_cell_range(
-              "cell_bulk_handoffs_v1.zip", os.environ["HANDOFF_BUNDLE_SHA256"],
+              os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
               database_password=os.environ["FINPAY_DB_PASSWORD"],
               credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
-              refresh_request_id=os.environ["REFRESH_REQUEST_ID"],
           )
       except Exception as exc:
           raise RuntimeError("Cell bulk Sheet publication failed: " + json.dumps(safe_cell_sheet_error(exc), sort_keys=True)) from None

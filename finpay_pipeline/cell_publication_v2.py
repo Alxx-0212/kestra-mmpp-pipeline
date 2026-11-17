@@ -384,11 +384,12 @@ def validate_output_targets(spreadsheet_id, legacy_spreadsheet_id, accounts, tar
 def build_cell_cluster_matrices_v2(config, cell_days, through_date, *, summary_manual_values=None,
                                    summary_reset_dates=None, dummy=False,
                                    first_report_date=None, calculate_saldo=True):
+    if summary_manual_values or summary_reset_dates:
+        raise ValueError("cell presentation is database-derived; manual Sheet inputs are unsupported")
     report = build_cluster_report(config, cell_days, through_date,
         first_report_date=first_report_date, calculate_saldo=calculate_saldo)
     matrices = {
-        "summary": render_cell_matrix(report, manual_values=summary_manual_values or {},
-            reset_dates=summary_reset_dates or set(), dummy=dummy, presentation_version=5),
+        "summary": render_cell_matrix(report, dummy=dummy, presentation_version=5),
         "invoice": build_cell_invoice_matrix(config, cell_days, dummy=dummy),
         "unusual": build_cell_detail_history(config, cell_days, "unusual"),
         "reversal": build_cell_detail_history(config, cell_days, "reversal"),
@@ -1016,8 +1017,9 @@ def _restore_prior_guards(prior, targets, adapters, guarded, guards, previous, s
         _verify_marker(meta, expected)
 
 
-def _write_date_snapshot(saved, targets, adapters, store, epoch, mutate, send_formatting,
+def _write_date_snapshot(saved, targets, store, epoch, send, send_formatting,
                          report, rows_per_request):
+    entries = []
     for role in ROLES:
         target, item = targets[role], saved[role]
         patch, values = item.get("patch"), item["values"]
@@ -1035,18 +1037,41 @@ def _write_date_snapshot(saved, targets, adapters, store, epoch, mutate, send_fo
                                                 "inheritFromBefore": start > 0}}
             else:
                 request = {"deleteDimension": {"range": dimension_range}}
-            mutate(adapters[role], [request])
-            store.confirm_chunk(epoch, f"{role}-rows-{kind}")
+            entries.append((request, f"{role}-rows-{kind}", None))
         start = patch["start_row"]
         rows = values[start:start + patch["row_count"]]
         requests = matrix_write_requests(rows, target.worksheet_id, start_row=start,
             rows_per_request=rows_per_request, allow_formulas=role == "summary")
         report("worksheet_write_started", role=role, completed=0, total=len(requests))
         for index, request in enumerate(requests):
-            mutate(adapters[role], [request])
-            store.confirm_chunk(epoch, f"{role}-date-rows-{index}")
-            report("worksheet_chunk_confirmed", role=role,
-                   completed=index + 1, total=len(requests))
+            entries.append((request, f"{role}-date-rows-{index}",
+                            (role, index + 1, len(requests))))
+
+    pending, pending_size = [], 16
+
+    def flush():
+        nonlocal pending, pending_size
+        if not pending:
+            return
+        send([entry[0] for entry in pending])
+        for _, confirmation, progress in pending:
+            store.confirm_chunk(epoch, confirmation)
+            if progress:
+                role, completed, total = progress
+                report("worksheet_chunk_confirmed", role=role,
+                       completed=completed, total=total)
+        pending, pending_size = [], 16
+
+    for entry in entries:
+        request_size = len(json.dumps(entry[0]).encode("utf-8")) + 2
+        if request_size + 16 > MAX_REQUEST_BYTES:
+            raise ValueError("one date-scoped request exceeds bounded request size")
+        if pending and pending_size + request_size > MAX_REQUEST_BYTES:
+            flush()
+        pending.append(entry)
+        pending_size += request_size
+    flush()
+
     formatting = []
     for role in ROLES:
         formatting.extend(_date_format_requests(
@@ -1203,7 +1228,8 @@ def _verify_values(adapter, saved, previous=None):
 def preflight_cell_cluster_v2(store, spreadsheet_id, targets, adapters, cluster_id, *,
                               allow_legacy_migration=False, restored_roles=(),
                               restore_missing_published_worksheets=False):
-    """Read-only identity, prior-epoch and content checks before tab mutation."""
+    """Reject the retired publication-snapshot preflight."""
+    raise RuntimeError("stateful cell publication preflight is retired")
     if set(targets) != set(ROLES) or set(adapters) != set(ROLES):
         raise ValueError("v2 preflight requires exactly four output roles")
     restored_roles = set(restored_roles)
@@ -1294,7 +1320,10 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
                             write_from_date: str | None = None, restored_roles=(),
                             restore_missing_published_worksheets=False,
                             refresh_request_id: str | None = None):
-    """Publish four tabs; an optional refresh ID makes same-execution retries write-free."""
+    """Reject the retired snapshot/status publisher."""
+    raise RuntimeError(
+        "stateful cell publication is retired; use finpay_pipeline.cell_format.publish_cell_sheets"
+    )
     from psycopg import InterfaceError, OperationalError
     validate_refresh_request_id(refresh_request_id)
     if type(rows_per_request) is not int or rows_per_request < 1:
@@ -1630,8 +1659,8 @@ def publish_cell_cluster_v2(store, spreadsheet_id, targets, adapters, batch, con
             for role in ROLES:
                 _verify_marker(call(adapters[role].metadata), marker)
             if date_scoped or incremental_range:
-                _write_date_snapshot(saved, targets, adapters, store, staged["epoch"],
-                                     mutate, send_formatting, report, rows_per_request)
+                _write_date_snapshot(saved, targets, store, staged["epoch"],
+                                     send, send_formatting, report, rows_per_request)
             else:
                 _write_full_snapshot(saved, prior, targets, adapters, guarded, store,
                                      staged["epoch"], mutate, send_formatting, report,

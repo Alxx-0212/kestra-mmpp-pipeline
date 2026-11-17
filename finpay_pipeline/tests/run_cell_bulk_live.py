@@ -1,7 +1,6 @@
 """Opt-in, fixed-scope October bulk run; credentials and evidence stay private."""
 from __future__ import annotations
 
-import argparse
 import collections
 import hashlib
 import importlib.util
@@ -351,8 +350,6 @@ def render_flow():
         f"  cell_spreadsheet_name: {json.dumps(TITLE)}\n"
         f"  legacy_spreadsheet_id: {json.dumps(ops.LEGACY_WORKBOOK_ID)}\n"
         f"  cell_worksheet_ids_json: {json.dumps(json.dumps(profile['targets'], separators=(',', ':')))}\n"
-        "  create_spreadsheet_if_missing: false\n"
-        "  create_worksheets_if_missing: false\n"
     )
     text, variable_count = re.subn(r"(?m)^variables:\n(?:^  [^\n]*\n)+", variables, text, count=1)
     if variable_count != 1:
@@ -370,7 +367,7 @@ def render_flow():
     prefix = ["from finpay_pipeline.cell_format import settings as _settings",
               "_settings.CELL_FORMAT_NAMING_SCHEME = 'cluster_alias'",
               f"_settings.CELL_FORMAT_SPREADSHEET_ID = {WORKBOOK!r}",
-              f"_settings.LEGACY_SPREADSHEET_ID = {ops.LEGACY_WORKBOOK_ID!r}",
+              f"_settings.CELL_FORMAT_LEGACY_SPREADSHEET_ID = {ops.LEGACY_WORKBOOK_ID!r}",
               f"_settings.CELL_FORMAT_WRITER_EMAIL = {profile['writer_email']!r}",
               f"_settings.CELL_FORMAT_FINANCE_EMAILS = {profile['finance_emails']!r}",
               f"_settings.CELL_FORMAT_WORKSHEET_IDS = {profile['targets']!r}"]
@@ -1707,36 +1704,9 @@ def verify():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("prepare", "tabs", "backup-unrelated", "bootstrap", "configure-server", "fix-auth", "render-flow", "register-flow", "execute", "status", "inspect-pending", "finalize-pending", "rename-tabs", "restore-unrelated-sheet", "download-handoff", "split-handoffs", "filter-unpublished", "render-remaining-flow", "register-remaining-flow", "execute-remaining-flow", "status-remaining-flow", "record-partial-result", "verify-final", "verify"))
-    arguments = parser.parse_args()
-    actions = {"prepare": prepare, "tabs": provision_tabs, "backup-unrelated": backup_unrelated,
-               "bootstrap": ops.create_database,
-               "configure-server": configure_server,
-               "fix-auth": fix_auth,
-               "render-flow": render_flow, "register-flow": register_flow, "execute": execute,
-               "status": status, "inspect-pending": inspect_pending_publication,
-               "finalize-pending": finalize_pending_publication,
-               "rename-tabs": rename_tabs_to_cluster_aliases,
-               "restore-unrelated-sheet": restore_original_unrelated_sheet,
-               "download-handoff": download_persisted_handoff,
-               "split-handoffs": split_remaining_handoffs,
-               "filter-unpublished": filter_unpublished_alias_handoffs,
-               "render-remaining-flow": render_remaining_flow,
-               "register-remaining-flow": register_remaining_flow,
-               "execute-remaining-flow": execute_remaining_flow,
-               "status-remaining-flow": status_remaining_flow,
-               "record-partial-result": record_partial_bulk_result,
-               "verify-final": verify_final_bulk, "verify": verify}
-    try:
-        actions[arguments.phase]()
-    except Exception as error:
-        import traceback
-        origin = traceback.extract_tb(error.__traceback__)[-1]
-        ops.emit("bulk_stopped", phase=arguments.phase,
-                 reason=error.reason if isinstance(error, ops.Blocked) else type(error).__name__,
-                 origin=f"{Path(origin.filename).name}:{origin.lineno}:{origin.name}")
-        raise SystemExit(2) from None
+    raise ops.Blocked(
+        "legacy stateful live bulk harness is retired; do not execute it against current destinations"
+    )
 
 
 if __name__ == "__main__":

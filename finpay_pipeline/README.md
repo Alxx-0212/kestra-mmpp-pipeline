@@ -14,8 +14,8 @@ Build, CI/CD, commissioning, and recovery steps are in
 | Previous-format acquisition and daily reporting | Implemented; separate acquisition, compute, database, and Sheet tasks. |
 | Cell acquisition and four-tab reporting | Implemented through the compatibility flows below. |
 | Independent subpackages, date-range acquisition, and staged cell tasks | Implemented; range inputs and task boundaries below. |
-| Cell running SALDO | Daily reports leave cumulative SALDO unverified; range/bulk balance calculations retain the October 1, 2026 boundary. No opening transaction or separate balance table is created. |
-| Cell publication targets | Package defaults fail closed. Configure a destination name (optionally pin its ID), legacy ID, writer and Finance editors through Kestra environment secrets or per-flow variables. Missing spreadsheet files/tabs can be created on a non-dry publish when enabled. |
+| Cell running SALDO | The database stores no cumulative balance; Sheet formulas calculate SALDO from persisted history and leave it explicitly unverified when required history is missing. The reporting boundary is October 1, 2026. |
+| Cell publication targets | Package defaults fail closed. Configure the existing destination name/ID, legacy ID, writer, and Finance editor identities through Kestra secrets or per-flow variables. All four exact role tabs must already exist; workflows never create or share targets. |
 | Monthly settlement | Preview and gated publication implemented; Finance release requirements remain separate. |
 | Production commissioning and schedules | Not authorized by a local test or this refactor; acquisition schedules remain disabled. |
 
@@ -31,8 +31,8 @@ validation/calculation utilities without routing cell sources into legacy tables
 | Pipeline | Range entry point | Per-day processing |
 |---|---|---|
 | Previous format | `finpay_legacy_range_v1` | `finpay_legacy_day_v1`, then retained daily v5 tasks. |
-| Cell format | `finpay_cell_range_v1` | `finpay_cell_day_v1` in full-history scope, with four explicit stages. Standalone day runs are date-scoped. |
-| Bulk cell | `finpay_cell_bulk_v1` | Range acquisition/preprocessing, one DB commit and Sheet publication per cluster. |
+| Cell format | `finpay_cell_range_v1` | `finpay_cell_day_v1` in date-scoped mode, with four explicit stages. |
+| Bulk cell | `finpay_cell_bulk_v1` | Range acquisition/preprocessing, persist every selected cluster/date, then publish date blocks. |
 
 `finpay_cell_range_v1` defines a disabled daily schedule for 05:00
 `Asia/Makassar`. If separately commissioned and enabled, it processes the previous
@@ -42,9 +42,9 @@ with exponential delays of 30s, 60s, then a 120s cap. The range expander and coh
 progress logs use the same retry policy. A recovered task resets its future retry
 sequence to the 30s minimum. The range parent does not replay a day subflow after
 the child exhausts its retries, and terminal Telegram notifications remain
-single-attempt. `PENDING`, `IN_FLIGHT`, or `UNKNOWN` publication states still
-require operator reconciliation; retries do not issue blind Sheet writes or
-automatically clear those states. After each successful live date/cluster cohort,
+single-attempt. The cell publisher keeps no publication snapshots or write-state
+rows. Rewriting the same date block is idempotent, while mutation retries remain
+disabled in the Google HTTP transport. After each successful live date/cluster cohort,
 the range waits 30s before starting the next cohort; this also preserves spacing
 when a new per-cohort Sheets client is created. Dry runs and database-only runs
 skip this wait.
@@ -80,37 +80,25 @@ Each prefix has `Summary`, `Invoice`, `Unusual`, and `Reversal` tabs (for exampl
 `finpay_cell_bulk_v1` flow's `cell_spreadsheet_name` and `cell_cluster_group`;
 the group accepts one code, comma-separated codes, or `ALL`. The workbook ID is
 optional if the exact name resolves to one file; duplicate names fail closed. A
-pinned ID must already exist; name-only targets can create a missing workbook.
-On non-dry publication, `create_spreadsheet_if_missing=true` creates a missing
-workbook and `create_worksheets_if_missing=true` creates missing alias tabs. Only
-a newly created workbook is shared with configured Finance editors; sharing on
-existing files is unchanged. Keep
-tab IDs stable across title-only migrations; arbitrary retargeting to another
-workbook or role is rejected. Assign each cluster to only one destination flow;
-cross-workbook routing for a cluster with publication history is blocked. Give
-each copied flow a unique ID.
-
-The bulk flow's `restore_missing_published_worksheets` input defaults to
-`create_worksheets_if_missing`. When enabled for a previously published workbook,
-it restores only the exact worksheet IDs and titles in the latest `COMPLETE`
-snapshot, and only when each missing/recreated tab is empty and has no unmanaged
-metadata or protections. It preserves prior epochs and manual Summary inputs, then
-publishes a full snapshot as a new epoch. A title that exists with a different ID,
-nonempty content, an unresolved publication, or an active target operation blocks
-restoration; the workflow never adopts a new worksheet ID. Production restoration
-requires a verified backup and explicit owner approval.
+pinned ID and exact-name targets must already exist with all four exact alias
+worksheet titles and IDs. Missing or mismatched targets fail the read-only
+preflight before persistence. Workflows never create or share workbooks, or create,
+rename, restore, or adopt worksheets. Keep tab IDs stable; arbitrary retargeting
+to another workbook or role is rejected. Assign each cluster to only one
+destination flow and give each copied flow a unique ID.
 
 Flow defaults read `FINPAY_CELL_SPREADSHEET_NAME` and
 `FINPAY_LEGACY_SPREADSHEET_ID` from Kestra secrets; optional
 `FINPAY_CELL_SPREADSHEET_ID` pins the destination. `FINPAY_CELL_WRITER_EMAIL`
-and `FINPAY_CELL_FINANCE_EMAILS` configure the writer/protection identity.
+and `FINPAY_CELL_FINANCE_EMAILS` configure the writer and expected existing
+Finance access identities.
 A private deployment flow may set these values directly in its `variables` block.
 
 `finpay_cell_bulk_v1` accepts inclusive dates, a cluster selector, and 1-4 scrape
 workers (default 2). It preflights every indexed export, retries only failed
-acquisition chunks, then commits each cluster in one database transaction and
-publishes once. A bounded checksummed cohort spool feeds persistence; PostgreSQL
-COPY inserts only new source generations. Scraping is parallel by account, but
+acquisition chunks, then commits each cluster in one database transaction before
+publishing each requested date block. A bounded checksummed cohort spool feeds
+persistence; PostgreSQL COPY inserts only new source generations. Scraping is parallel by account, but
 dates per account and database/Sheet writes stay serial. Use validated daily
 exports; day and range remain separate entry points, and portal login remains
 per cell/day.
@@ -163,15 +151,19 @@ The cell day task graph is:
 ```text
 preflight_cell_database (non-dry runs only, before acquisition)
   -> read-only target/schema/table-privilege check
+validate_cell_sheet_targets (when Sheets output is enabled)
+  -> read-only existing-workbook and exact worksheet-ID/title check
 acquire_cell_cluster_day -> cell_sources_v2.zip
 preprocess_cell_cluster_day -> cell_prepared_v1.json
-persist_cell_sources_and_calculations -> cell_handoff_v1.json
-publish_cell_four_tabs -> guarded Summary/Invoice/Unusual/Reversal publication
+persist_cell_sources_and_calculations -> database current rows
+publish_cell_four_tabs -> requested Summary date block
 ```
 
-Both day and bulk workflows run the read-only database preflight before DigiPOS
-acquisition when `dry_run=false`, using the existing `FINPAY_DB_*` secrets. Dry
-runs skip the task and do not connect to PostgreSQL. The preflight checks the
+Day and bulk workflows run the read-only database preflight before DigiPOS
+acquisition when `dry_run=false`, using the existing `FINPAY_DB_*` secrets. When
+Sheets output is enabled, a separate read-only target preflight runs before
+acquisition. Dry runs skip both preflights and do not connect to PostgreSQL or
+Google. The database preflight checks the
 configured target and runtime role's schema/table privileges; it creates no
 schema or tables and applies no DDL or migration. Cell schema setup remains an
 explicit operation.
@@ -186,47 +178,40 @@ retains its separate host network. The selected reporting network must resolve
 the database host and allow Google HTTPS access.
 
 Cell artifacts are size-bounded, with SHA-256 checks performed by application
-code at specific task boundaries. Persistence does not create a Google client;
-publication reacquires locks and rejects changed selected history before writing,
-without re-importing sources. Spreadsheet name/optional ID, distinct
-legacy ID, writer, and Finance editors must be configured; missing configuration
-fails preflight before acquisition or DB writes. `write_gsheet=false` keeps the
-bulk acquisition/preprocessing/DB path independent from Google writes.
+code at specific task boundaries. Persistence does not create a Google client.
+When Sheets output is enabled, a read-only preflight verifies the existing
+workbook and exact account/role worksheet IDs and titles before acquisition or DB
+writes; no workbook, worksheet, sharing, or protection changes are made.
+Spreadsheet name/optional ID, distinct legacy ID, writer, and Finance editor
+identities must be configured. `write_gsheet=false` keeps the bulk
+acquisition/preprocessing/DB path independent from Google writes.
 Daily persistence validates and atomically replaces only the requested complete
 cell/date cohort. It does not require other dates or clear the current cohort if
 acquisition or validation fails; immutable source generations and row hashes are
-retained. A standalone daily Sheet publication patches only that date's block
-in each tab, resizing variable-height blocks as needed while preserving MANDIRI
-inputs and all other dates. Bulk range publication still calculates full history,
-but writes only the suffix starting at the requested date in Summary, Invoice,
-Unusual, and Reversal; rows before it remain untouched. It fails closed if saved
-prefix source fingerprints or row layout differ; widen the range start to repair
-that prefix. The range flow passes
-full-history scope to each sequential day child and retains its full-report
-publication. Before deleting rows or rewriting a suffix, the writer refuses if
-affected rows contain off-matrix values/formulas or rows below the saved matrix
-contain data that a row shift would move; resolve that extra content before
-retrying the persisted handoff. Daily database results
-never store cumulative SALDO. If the corrected Sheet date already has an SALDO
-formula chain, preserve it so later dependent SALDO formulas may recalculate.
-Without an existing chain, the date's Summary block marks
-`CUMULATIVE SALDO UNVERIFIED` and leaves SALDO values blank; earlier dates are
-not required. The configured boundary remains
-`2026-10-01`; source balance evidence remains in the ledger.
-Full-range/range/bulk balance calculations retain their historical-coverage
-checks; the date-scoped behavior applies to standalone day runs only.
+retained. A standalone day or range publication reads persisted database facts,
+then replaces or appends only each requested date block in Summary, Invoice,
+Unusual, and Reversal. Other dates remain in place. A range persists every
+selected cluster/date before its publication pass begins; bulk likewise finishes
+all selected persistence before publishing its requested date blocks. No Sheet
+snapshot, publication epoch, or write-state row is used. Daily database results
+never store cumulative SALDO; the Summary uses formulas so later balances
+recalculate. Combined MANDIRI is formula-derived from the next day's
+`CASHOUT APOLLO` KREDIT and displays `PENDING NEXT DAY` when that date is absent.
+Manual MANDIRI inputs and reset tracking are unsupported. Full-history coverage
+checks remain for bulk calculations; the requested Sheet range itself is never
+widened implicitly. The configured balance boundary remains `2026-10-01`, and
+source balance evidence remains in the ledger.
 
-Bulk persistence and Sheet publication retry the whole task up to three times.
-Persistence reuses the same prepared bundle without duplicating evidence. A daily
-execution changes only its requested date block; a bulk range changes rows from
-its requested start date onward while preserving earlier rows. The separate
-range flow retains its full-report behavior. Finance MANDIRI inputs and unrelated
-date blocks remain intact. The Kestra execution ID identifies the request:
-retries verify already-completed clusters without rewriting them. An uncertain
-write remains blocked for reconciliation; it is never blindly retried.
+Bulk persistence and Sheet publication retain their configured Kestra task
+retries. Persistence reuses the same prepared bundle without duplicating evidence.
+A standalone day, range child, or bulk run changes only its requested date block(s);
+dates outside the selection remain intact. Rewriting a date block from current DB
+rows is idempotent. The HTTP adapter does not retry mutation requests; read-only
+review is required before rerunning after an ambiguous live outcome.
 
-Existing IDs remain compatibility interfaces, including their original inputs
-and artifact contracts:
+Existing flow IDs remain stable. Cell publication reads persisted database
+history directly and does not emit or require a publication handoff artifact;
+previous-format inputs and artifacts are unchanged:
 
 | Path | Acquisition | Reporting |
 |---|---|---|
@@ -302,18 +287,14 @@ New cell tabs use cluster aliases, not numeric cluster codes:
 | `422040_B` | `BOLMONG` |
 
 Each prefix has `Summary`, `Invoice`, `Unusual`, and `Reversal` worksheets.
-Tab-title migration is allowed only for the same worksheet IDs and the exact
-code-to-alias mapping; it creates a new publication epoch and retains prior
-history. Arbitrary workbook, worksheet ID, role, or account changes remain blocked.
+Exact alias titles and worksheet IDs are required contracts. A rename or ID change
+requires a separately approved workbook/configuration change; the workflow fails
+preflight on any mismatch. Arbitrary workbook, worksheet ID, role, or account
+changes remain blocked.
 Workflows may be copied per destination: set the copied flow's `cell_spreadsheet_name`
 and `cell_cluster_group` (a single code, comma-separated group, or `ALL`).
-If a file name resolves to no spreadsheet and creation is enabled, publication
-creates it and shares the new file with configured Finance editors. Existing
-file sharing is unchanged. Missing role tabs on an unpublished workbook are added
-by alias. For prior publication history, the bulk-only restore input can recreate
-missing tabs using the saved IDs/titles and last committed snapshot, but it blocks
-conflicting IDs/titles, nonempty tabs, and unmanaged protections. Other flows
-remain fail-closed.
+The destination workbook and all role tabs must already exist. Cell flows never
+create files or tabs, change sharing, or restore missing worksheets.
 
 The existing v3/v2 compatibility pair requires a schema-v2 configuration FILE,
 its checksum, and the independent `FINPAY_CELL_CONFIG_SHA256` deployment pin.
@@ -327,32 +308,30 @@ C3 panels with CASH IN - NGRS, SELLTHRU, and ACCOUNTING sections. QRISDUWIT
 disbursement dates appear inside Cash In, not in another cell detail worksheet.
 LinkAja calculations and fee rows are not included.
 
-Current Summary presentation uses shared A:C and cell blocks D:F, H:J, L:N,
-with editable bank inputs D/H/L and next-day cashout references E/I/M. Invoice
+Current Summary presentation uses shared A:C and cell blocks D:F, H:J, L:N.
+Bank rows are formula-derived from report data; no Sheet cells are editable inputs. Invoice
 titles merge each panel as `C1 | CELL 412111`, report-date columns are 140px,
 and panels have three blank separator columns. Invoice days retain two blank
 rows and continuous panel side rails. Unusual/Reversal display validated relative
 CELL numbers 1-3, preserve semantic widths and muted stripes, and separate each
 visible date with a top border. Source full cell codes remain in evidence.
 
-Four-tab publication uses one epoch, target/cluster locks, temporary guards, and
-value/formula/style/protection readback before completion. Standalone daily
-publication merges one date's blocks and writes only those rows. Bulk range
-publication calculates full history but writes the suffix beginning at the first
-column-A date at or after the requested start date, preserving earlier dated
-rows. When appending to an existing Invoice tab, that suffix also includes its
-standard two blank separator rows before the first dated row. The separate range
-flow remains a full-report write. Missing initial tabs are created only
-when `create_worksheets_if_missing` is enabled. A missing worksheet ID with
-previous publication history fails closed by default; the bulk-only
-`restore_missing_published_worksheets` input may recreate the exact saved IDs/titles
-from a `COMPLETE` snapshot after an empty/unmanaged-free check. It preserves saved
-manual inputs and prior epochs, forces a full-snapshot write and a new publication
-epoch, and never rebinds a different ID. Production use requires a verified
-database/Sheet backup and explicit approval. A green
-tab/A1 note confirms Sheet verification only; success also requires the database
-completion record. A failed or ambiguous DB confirmation requires operator
-reconciliation even when the tabs look complete.
+All four existing role worksheets are preflighted by exact workbook, title, and
+worksheet ID before persistence when Sheets output is enabled. Missing workbooks
+or tabs fail before data is committed; workflows never create, rename, share, or
+restore destinations. After selected data is persisted, the publisher locates
+each requested date from column A and inserts, replaces, or resizes only that
+date's block. Range and bulk flows finish persistence for their full selection
+before beginning the date-block publication pass. Other dates remain untouched.
+SALDO formulas recalculate over the persisted history; combined MANDIRI references
+the following date's `CASHOUT APOLLO` KREDIT and displays `PENDING NEXT DAY` if
+that source date is unavailable. The database stores no publication snapshots or
+`PENDING`/`IN_FLIGHT`/`UNKNOWN` write state. Date-block row mutations, values,
+and managed display-only protection updates across the four role tabs share one
+`spreadsheets.batchUpdate` when the payload fits the configured byte limit;
+larger payloads split into bounded batches. The writer removes legacy MANDIRI
+input holes and temporary publisher guards, but leaves unmanaged protections and
+workbook sharing unchanged. Readback is a separate batched phase.
 The current source configures the dedicated cell Google client with a 30-second
 connection timeout and a 300-second response-read timeout (the prior source values
 were 10/120 seconds). This source change does not update a deployed image
@@ -361,10 +340,10 @@ Kestra. Google can spend up to 180 seconds processing one Sheets request, so the
 client must not give up earlier. The timeout is a socket inactivity limit, not a
 total job deadline, and cannot fix a broken VPN or network route.
 
-Clusters and writes remain sequential. A bulk publication lazily shares one
-client across its clusters so pacing does not reset between them. HTTPS request
+Date blocks and writes remain sequential. A bulk publication lazily shares one
+client across its clusters and dates so pacing does not reset between them. HTTPS request
 attempts within each cell client are spaced at least 5 seconds apart, including
-metadata, paged style readback, and writes. Fast calls sleep for the remaining interval; slow calls
+metadata, date-column/value readback, and writes. Fast calls sleep for the remaining interval; slow calls
 already satisfy it. This limits one serial client to approximately 12 requests
 per minute, below Sheets' 60-per-user-per-project read and write quotas. It does
 not coordinate quota across other client instances, even in the same process,
@@ -372,35 +351,27 @@ or across separate processes/stacks using the same service account. Do not run
 independent publishers concurrently against the same workbook without shared
 quota coordination. A `ReadTimeout` is not proof of a quota rejection; HTTP 429 is the
 explicit rate-limit response. The cell HTTP transport sets `max_retries=0`,
-including for mutations; Kestra task retries are separate and cannot clear
-unresolved `PENDING` or `UNKNOWN` publication states.
+including for mutations; existing Kestra task retry policies remain unchanged.
 
-Read-only metadata, value, and style fetches retry HTTP 408/429/500/502/503/504,
+Read-only metadata and value fetches retry HTTP 408/429/500/502/503/504,
 Drive 403 rate/quota errors explicitly identified by `usageLimits`, and
 request timeout/connection errors for at most six attempts with 2/4/8/16/32-second
 backoff. Numeric `Retry-After` is honored only when finite and at most 60 seconds;
 invalid or longer values fail closed. Authentication, permission, daily-limit,
 disabled-API, and validation errors propagate immediately,
 and `batch_update` or any other mutation is never retried.
-Worksheet creation is one-shot: bounded exact-title readback confirms only a
-single matching tab with the exact returned ID when present and configured ID
-when pinned. A failed or ambiguous readback leaves the target-operation journal
-`UNKNOWN` for operator reconciliation.
 A checksum proves integrity, not source authority: deployment must
-restrict non-dry source imports to approved callers. Existing managed or design
-preview tabs are not fresh targets and cannot be adopted by inventing a baseline.
-Date, stale-handoff, and publication-state guards remain in force for corrections.
-Stored-coverage checks apply to full-range cumulative calculations; a date-scoped
-daily run validates its complete cell/date cohort without requiring earlier dates
-or persisting a cumulative balance. Existing Sheet formula chains are preserved
-for dependent recalculation. Ambiguous `IN_FLIGHT`/`UNKNOWN` state is never
-bypassed.
+restrict non-dry source imports to approved callers. Stored-coverage checks apply
+to full-history bulk calculations; a date-scoped daily run validates its complete
+cell/date cohort without requiring earlier dates or persisting a cumulative
+balance. Formula-derived SALDO and MANDIRI recalculate from the Sheet's persisted
+date blocks; manual MANDIRI values and publication-state gates are unsupported.
 
 A byte-different XLSX creates a new source generation because generation identity
 includes the source-file SHA-256. If its normalized-row fingerprint and row count
-are unchanged, that generation change alone does not require a manual bank-input
-reset. Date-scoped daily updates preserve MANDIRI inputs on the corrected date and
-all other dates. Full-range correction retains its existing audited reset policy.
+are unchanged, the persisted business rows remain equivalent. Combined MANDIRI is
+derived from the following date's `CASHOUT APOLLO` KREDIT and is never manually
+edited or reset in Google Sheets.
 
 ## Data Contracts
 
@@ -417,8 +388,10 @@ The loader detects headers in the first ten rows. CSV accepts semicolon, comma,
 pipe, or tab delimiters; XLSX preserves exact IDs, phone numbers, and literal
 remarks. Required monetary values are integers, not manufactured zeroes.
 `Transaction Date` uses `DD-MM-YYYY HH:MM:SS`. Integrity rejects rows with both
-Kredit and Debet nonzero; both zero is allowed. Keep raw DigiPOS balances even
-though the date-scoped daily Sheet leaves cumulative SALDO unverified.
+Kredit and Debet nonzero; both zero is allowed. Keep raw DigiPOS balances in the
+ledger; cumulative SALDO is never persisted in the database and is calculated by
+Sheet formulas from available report history. Missing history remains explicitly
+unverified rather than being treated as zero activity.
 
 - Preserve `raw_transaction_label`, source IDs, amounts, and `Remarks`; diagnostics belong in `unusual_reason`.
 - Evaluate a transaction family consistently for unusual output and summary eligibility. Unknown labels/remarks quarantine the complete family. DISBURSEMENT is label-authoritative in v5 and cell summaries; its Remarks do not gate inclusion.
@@ -473,22 +446,22 @@ is legacy behavior, not permission to add implicit migrations.
 Daily initialization applies only `001_finpay_daily_source_evidence.sql`;
 monthly initialization additionally applies `002_finpay_monthly_model.sql`.
 Retain `001_finpay_transaction_model_legacy_compat.sql` for compatibility/rollback.
-Cell migration `003_finpay_cell_reporting_v1.sql` is explicit and never applies
-as an ordinary write side effect. Empty verified cell-days may supersede current
-data; incomplete or failed downloads must not clear it.
+Cell migration `003_finpay_cell_reporting_v1.sql` remains explicit and never applies
+as an ordinary write side effect. Follow it with
+`004_finpay_cell_remove_publication_state.sql` only after separate approval and a
+verified backup of the exact `finpay` database; migration 004 drops obsolete
+publication, target-operation, manual-reset, and dirty-date tables. This change
+does not execute either migration against a database. Empty verified cell-days
+may supersede current data; incomplete or failed downloads must not clear it.
 
 Cell database state is split by purpose:
 
 - Evidence: `finpay_cell_configs_v1`, `finpay_cell_sources_v1`,
   `finpay_cell_ledger_v1`, and `finpay_cell_calculations_v1` retain configuration,
   source generations/rows, and calculated results without replacing prior evidence.
-- Current/recalculation state: `finpay_cell_current_v1` selects each cell/date's
-  generation and calculation; `finpay_cell_current_results_v1` is its result view;
-  `finpay_cell_dirty_dates_v1` tracks changed calculations and reset requirements.
-- Publication/recovery state: `finpay_cell_publications_v1`,
-  `finpay_cell_publication_dates_v1`, and `finpay_cell_target_operations_v1` track
-  publication snapshots/statuses and ambiguous target operations;
-  `finpay_cell_manual_resets_v1` records manual bank-input resets.
+- Current business state: `finpay_cell_current_v1` selects each cell/date's
+  generation and calculation; `finpay_cell_current_results_v1` is its result view.
+  Google Sheets is derived presentation output and owns no publication or reset state.
 
 Exact reruns reuse evidence rows rather than duplicating them, but still update
 `finpay_cell_current_v1.selected_at`. Fingerprints use canonical JSON: dictionary
@@ -496,12 +469,11 @@ keys are sorted, while list order is preserved.
 
 ## Publication Safety
 
-- Keep all Sheet writes sequential. Flow concurrency limits apply only to the same flow ID; database locks protect cell writers across entry points.
-- Queue or reject overlapping legacy writes to the same spreadsheet, worksheet, and report date across entry points; per-flow limits are not a shared lock.
-- Reacquire locks and validate persisted state before publishing across a task boundary. Reject stale handoffs before any Google mutation.
-- Never retry or clear `IN_FLIGHT`/`UNKNOWN` publications blindly. Lost ownership or an ambiguous mutation requires approved operator reconciliation; acknowledged writes with failed readback remain pending.
-- Daily date-block writes preserve manual MANDIRI inputs and unrelated dates. Daily cohorts do not require earlier dates; full-range cumulative calculations still require configured coverage and never treat missing history as zero-activity days.
-- Existing cell snapshots/layouts remain recovery inputs, not automatic rollback commands. Protection checks include read-only owner metadata; no sharing mutation is implied.
+- Keep date-block writes sequential and preserve the existing Kestra retry/backoff and 30-second cohort pause.
+- Require the exact existing workbook and all four exact worksheet IDs/titles before persistence when Sheets output is enabled; workflows never create, rename, share, or restore a destination.
+- Persist all selected range data before starting its Sheet publication pass. Locate date blocks by `REPORT DATE` in column A and replace only requested dates; repeated writes of the same persisted date block are idempotent.
+- Batch each date's row mutations, four-role values, and managed protection updates into `spreadsheets.batchUpdate` requests, splitting only when the byte bound requires it. Remove only legacy MANDIRI input holes and publisher guards; preserve unmanaged protections and sharing. Readback remains separate; mutation requests are not retried by the HTTP adapter.
+- Do not store publication snapshots, write statuses, manual MANDIRI overrides, or reset records. SALDO and combined MANDIRI are formula-derived from persisted date data.
 - Previous-format writers replace the requested date, grow row capacity, and repair the stable `LinkAja` reference worksheet before invoice formulas use it. LinkAja source population remains outside this package.
 - Previous-format sheets retain A:F cash flow and H:K invoice panels, DETAIL/MANDIRI/Cash order, uppercase literal text, date separators, and editable protected MANDIRI inputs. The expected pembelian fee is count times Rp200, distinct from the Rp20 transaction-fee cap.
 
@@ -541,10 +513,9 @@ docker run --rm --pull never --network none \
 git diff --check
 ```
 
-The opt-in scale runner is `tests/run_cell_scale_benchmark.py --workload month`
-or `--workload year`. It requires `FINPAY_SCALE_TEST_DSN` for a guarded loopback
-PostgreSQL 18.4 database named `finpay_cell_scale_test`; it uses synthetic data
-and does not contact DigiPOS or Sheets.
+The former scale runner depended on publication snapshots and is retired. It does
+not measure the stateless date-block writer; the 1–2 minute per date/cluster
+runtime target remains unverified by a full-range performance benchmark.
 
 Validate workflow properties with the pinned native validator, not YAML alone:
 

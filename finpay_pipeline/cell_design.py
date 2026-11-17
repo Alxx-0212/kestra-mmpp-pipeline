@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .cell_calculation import CellReportConfig, build_cluster_report, calculate_cell_day
 from .cell_contracts import OBSERVED_CELL_ROSTER, fingerprint
-from .cell_sheets import mandiri_reset_dates, render_cell_matrix, write_cell_design_workbook
+from .cell_sheets import render_cell_matrix, write_cell_design_workbook
 
 
 def dummy_cluster_report(account: str, codes: tuple[str, ...], cluster_index: int = 0) -> dict:
@@ -62,10 +62,8 @@ def generate_dummy_cell_design(output_dir: str | Path, *, presentation_version=3
     matrices = []
     for index, (account, codes) in enumerate(sorted(OBSERVED_CELL_ROSTER.items())):
         report = dummy_cluster_report(account, codes, index)
-        manual = {("2026-10-13", codes[0]): 45_000, ("2026-10-14", codes[0]): 33_333}
         matrices.append(render_cell_matrix(
-            report, manual_values=manual,
-            reset_dates=mandiri_reset_dates(report, ["2026-10-15"]), dummy=True,
+            report, dummy=True,
             presentation_version=presentation_version,
         ))
     directory = Path(output_dir)

@@ -15,9 +15,14 @@ the current user for the exact target, scope, operation, and backup plan; any
 no-backup exception requires fresh, explicit authorization from the current user
 for that consequence. Section 6.1 records historical approval only, not current or
 future authorization. Never point test resets or cleanup at production resources.
-The configured auto-create option may share a newly created workbook only with
-its explicit Finance editor list. Obtain current approval for production targets
-and operations.
+Cell workflows require an existing workbook and exact existing worksheet IDs/titles;
+they do not create destinations or change sharing. Obtain current approval for
+production targets and operations.
+
+Before a live Sheet mutation, verify the exact workbook and role tabs and perform
+a read-only audit of the selected date blocks against persisted rows. Obtain
+current authorization for the exact write scope; historical execution receipts
+and reset approvals do not authorize additional writes.
 No hosted CI workflow is installed here; the gates below define what CI/CD must
 execute.
 
@@ -27,49 +32,40 @@ execute.
    SHA does not identify uncommitted code. Do not commit without authorization.
 2. Inventory the active writers, schedules, DB identities, workbook ID, worksheet
    IDs, and backups. A workbook title alone is not a unique identity.
-3. For multi-destination routing, configure each copy of
-   `finpay_cell_bulk_v1` with one destination and cluster group. Set
-   `cell_spreadsheet_name` from Kestra secret `FINPAY_CELL_SPREADSHEET_NAME` or
-   directly in a private flow copy. Leave `cell_spreadsheet_id` empty for
-   exact-name lookup/creation; an optional pinned ID must refer to an existing
-   workbook (reference `FINPAY_CELL_SPREADSHEET_ID` from that copied flow if desired).
-    Set the distinct `legacy_spreadsheet_id`, `cell_cluster_group`,
-    `create_spreadsheet_if_missing`, and `create_worksheets_if_missing` variables.
-    The group accepts one numeric
-   cluster, a comma-separated list, or `ALL`; it may be literal in the cloned
-    flow or read from `secret('FINPAY_CELL_CLUSTER_GROUP')`. Give each cloned flow
-    a unique ID and keep groups disjoint: a cluster with publication history
-    cannot silently be routed to another workbook. The daily/range wrappers use the deployment's
-   shared target secrets. Do not commit production workbook IDs, Finance emails,
-   or credentials.
-4. Configure the writer service-account email and Finance editor emails as Kestra
-   secrets. The package title scheme is `cluster_alias`; worksheet IDs are
-   discovered by exact alias title unless an explicit ID map is provided.
+3. Configure one existing destination and cluster group for each bulk flow.
+   Set `cell_spreadsheet_name` from Kestra secret `FINPAY_CELL_SPREADSHEET_NAME`
+   or a private flow copy, and pin `cell_spreadsheet_id` when known. Set the
+   distinct `legacy_spreadsheet_id` and `cell_cluster_group`. The group accepts
+   one numeric cluster, a comma-separated list, or `ALL`; it may be read from
+   `secret('FINPAY_CELL_CLUSTER_GROUP')`. Give each cloned flow a unique ID and
+   keep groups disjoint. The daily/range wrappers use the deployment's shared
+   target secrets. Do not commit workbook IDs, Finance emails, or credentials.
+4. Configure the writer service-account email and Finance editor identities as
+   Kestra secrets. The package title scheme is `cluster_alias`; worksheet IDs are
+   verified against exact alias titles, with an explicit ID map when pinned.
 5. Resolve aliases from `CLUSTER_ALIASES` and verify exact titles `<alias>`,
    `<alias> Invoice`, `<alias> Unusual`, and `<alias> Reversal`. Current aliases
    are `412110_B=PKY`, `422090_B=MRT`, `422100_B=TDR`, `422010_B=BGI`,
    `422180_B=MRW`, `422220_B=TNT`, `422140_B=KOTAMOB`, and `422040_B=BOLMONG`.
-   Keep worksheet IDs stable during a code-to-alias rename; changing IDs, workbook,
-   account ownership, or editors is not a title migration. Before provisioning,
-   read workbook metadata and take the approved backup. When a configured exact
-    spreadsheet name is absent and creation is enabled, the service account creates
-    the Drive file and grants access only to configured Finance editors. Existing
-    workbook sharing is never changed. New files are created in the service
-    account's My Drive root; pre-create the file if a specific Drive folder/shared
-    drive is required. Missing alias tabs are created on publish;
-   existing tabs are reused by exact title/ID. If a published tab is missing or an
-   existing tab is unmanaged/nonempty without matching DB history, fail closed.
-   Never delete or clear data to initialize a destination.
+    Keep workbook and worksheet IDs stable during a code-to-alias rename; changing
+    IDs, workbook, account ownership, or editors is not a title migration. Before
+    execution, read workbook metadata and take the approved backup. The read-only
+    preflight requires all four existing role tabs with exact IDs and titles before
+    persistence. Missing or mismatched targets fail closed. Existing workbook
+    sharing is never changed, and no tab is created, renamed, restored, deleted,
+    or cleared by the workflow.
 6. Agree whether this release includes cell, legacy, or monthly reporting.
    A cell canary does not verify legacy/monthly live behavior or other domains.
 
 ### October 1 And SALDO
 
 The new cell history starts on **2026-10-01**, in `Asia/Makassar`. The first
-displayed running SALDO starts at **0**, then carries forward through rows/days;
-it is not reset per execution. Do not insert an opening transaction, adjustment,
-or separate balance table. Existing configuration provenance records zero/date
-for hashing; raw DigiPOS balances remain immutable source evidence.
+displayed running SALDO starts at **0**, then formulas carry it through rows/days;
+it is not reset per execution or stored as a cumulative database value. Do not
+insert an opening transaction, adjustment, or separate balance table. Existing
+configuration provenance records zero/date for hashing; raw DigiPOS balances
+remain immutable source evidence. Combined MANDIRI is formula-derived from the
+following date's `CASHOUT APOLLO` KREDIT and shows `PENDING NEXT DAY` when absent.
 
 Persist October 1 before later dates. Earlier history and missing days fail
 safely rather than becoming zero activity. Individual later-day preprocessing
@@ -276,7 +272,8 @@ ranges. It uses the same inputs plus bounded `scrape_workers`; the parallel
 acquisition stage still retains per-cell/day browser/login overhead. Use an
 execution-specific private cache mount for validated downloads, never a shared
 cross-run cache that could silently reuse old source data. Bulk persistence and
-publication remain serial, with one four-tab publication per selected cluster.
+publication remain serial, with one date-block publication per selected
+cluster/date.
 
 For two destination workbooks, clone `finpay_cell_bulk_v1` twice, assign unique
 flow IDs, and change the clone variables (or their `secret()` names). Example:
@@ -286,14 +283,13 @@ variables:
   cell_spreadsheet_name: "{{ secret('FINPAY_CELL_GROUP_A_SPREADSHEET_NAME') }}"
   cell_spreadsheet_id: "" # Optional; pin when the exact file ID is known.
   cell_cluster_group: "412110,422010"
-  create_spreadsheet_if_missing: true
-  create_worksheets_if_missing: true
 ```
 
 The second clone uses its own destination name and cluster list. The execution
 input `cluster_id` defaults to the group but can still be overridden per run.
-Each destination file reuses/creates the constant alias role tabs; a missing file
-is created on publish when enabled, and an existing file's sharing is not changed.
+Each destination workbook and all constant alias role tabs must already exist;
+missing or mismatched targets fail the read-only preflight before persistence.
+Existing workbook sharing is not changed.
 Read back definitions/image references. If releasing legacy too, register daily
 v5 before legacy day, then legacy range. Keep compatibility IDs for their callers.
 Keep `finpay_cell_range_v1`'s `daily_cell_range_0500_wita` trigger disabled when
@@ -304,9 +300,9 @@ publication or schedules as an incidental deployment step.
 ### Execute A Per-Day Range
 
 `finpay_cell_range_v1` is the sequential range wrapper; it starts one
-`finpay_cell_day_v1` child for each cluster/date cohort and passes
-`publication_scope=history`. Keep its scheduled trigger disabled and execute it
-manually from the Kestra UI:
+`finpay_cell_day_v1` child for each cluster/date cohort. It persists every selected
+cohort before the separate publication pass writes only those date blocks. Keep
+its scheduled trigger disabled and execute it manually from the Kestra UI:
 
 Before running, set the flow variable `cell_reporting_network` to the exact
 shared Docker network that can resolve the configured database host. This is a
@@ -338,17 +334,20 @@ send_telegram: false
    notifications are intentionally enabled. Start with one date/cluster, then
    expand `cluster_id` to a comma-separated group or `ALL` and widen the date
    range after verifying the first cohort.
-5. Confirm the parent and every child reach terminal `SUCCESS`, then verify DB
-   publication status and the four role tabs. A green tab alone is not proof of
-   DB completion. Any `PENDING`, `IN_FLIGHT`, or `UNKNOWN` publication stops
-   automatic recovery and requires reconciliation.
+5. Confirm the parent and every child reach terminal `SUCCESS`, then verify the
+   selected DB current rows and four requested date blocks. A green tab alone is
+   not proof of DB persistence; compare it with the committed current-result view.
 
 For live Sheet writes, the range pauses 30 seconds after each successful
 cluster/date cohort. Each cell Sheets client spaces HTTPS requests by five seconds.
 Failed operational tasks retry up to five times after the initial attempt, with
 exponential waits of 30 seconds, 60 seconds, then a 120-second cap. After the
 child exhausts its retries, the parent stops rather than restarting the entire
-day. Retries do not clear or blindly repeat an ambiguous Sheet write.
+day. Mutation requests themselves are not retried by the Google HTTP adapter.
+Rerunning a cohort is idempotent: it reads current persisted data and replaces or
+appends only the matching column-A report-date block in the same four worksheets.
+Earlier source generations and other dates remain intact; row-count changes resize
+only the requested block.
 
 For a full alias-named range use `finpay_cell_bulk_v1`, not the per-day range
 wrapper:
@@ -367,7 +366,7 @@ cohorts, 342 cell-days). Acquisition took 2,309.4 seconds with two account
 workers, about 3.95 cluster-days/minute or 8.88 cell-days/minute. This is one
 observed run, not a single-worker comparison or a universal portal throughput
 guarantee. Dates within each account remain sequential; DB persistence and Sheet
-publication are serial, one publication per cluster. Retain the sanitized run
+publication are serial, one publication per requested date/cluster. Retain the sanitized run
 receipt with CI/evidence, not transaction rows or credentials.
 The same native flow's preprocessing stage took 7m53s and its atomic database
 stage took 2m30s. The first Sheet attempt stopped at a readback API error after
@@ -522,18 +521,18 @@ confirmed non-production stack and workbook; it does not authorize any later res
   restore test covered all seven databases; the Kestra store restore test matched
   all 143 archived entries. Keep these backups through final acceptance.
 - Runtime: Kestra is stopped during reset. Re-provision the project databases,
-  apply only `003_finpay_cell_reporting_v1.sql` to `finpay`, and deploy only the
-  range/day flows with verified current images. Set and forward
+  apply base migration `003_finpay_cell_reporting_v1.sql` to `finpay`; apply
+  `004_finpay_cell_remove_publication_state.sql` only after separate approval and
+  a verified backup. Deploy only the range/day flows with verified current images. Set and forward
   `cell_reporting_network` to `mmpp-finpay-replication-20261021_mmpp-finance-network`
   on Docker reporting task runners; DigiPOS acquisition retains its host network.
   Keep the range schedule disabled; do not run the broad flow-deployer that also
   publishes LinkAja flows.
 - Failure handling: an execution that fails before acquisition and has verified
-  no DB or Sheet writes may be resubmitted in this same approved scope after fixing
-  configuration; do not reset again. Any `UNKNOWN` publication or ambiguous Sheet
-  write requires a stop and fresh authorization before reconciliation or retry.
-  Unpinned worksheet identities, failed preflight, changed sharing, or extra
-  resources remain hard stops.
+  no DB or Sheet writes may be resubmitted after fixing configuration; do not reset
+  again. For any ambiguous historical Sheet outcome, perform a read-only comparison
+  first and obtain fresh authorization before another live write. Unpinned worksheet
+  identities, failed preflight, changed sharing, or extra resources remain hard stops.
 
 For the production canary, obtain approval for the account/date, exact four tabs,
 DB target, migration, and planned writes. Limit it to the approved DB/Sheet
@@ -550,26 +549,23 @@ Require all of the following:
 - `cell_prepared_v1.json` passes identity/rules/calculation checks. Persistence
   commits that checked calculation rather than silently recomputing the input.
 - DB source counts, selected generation/calculation/configuration hashes, and
-  full-history handoff agree. No synthetic opening transaction exists; raw source
-  balances remain intact.
-- Four-tab values, evaluated formulas, formatting, protections, and markers read
-  back correctly, and the DB publication epoch is `COMPLETE`. A green tab or A1
-  note alone does not prove database completion.
+  requested date/cell coverage agree. No synthetic opening transaction exists;
+  raw source balances remain intact.
+- Four-tab requested date blocks and formulas match persisted current data after
+  batched readback. A green tab alone does not prove database persistence.
 - Summary starts at zero. Offline multi-day tests prove carry-forward; a one-day
   live canary must not be presented as live multi-day coverage.
 - Unrelated tab fingerprints and workbook sharing remain unchanged.
 
 ### Protection Policy
 
-Summary is strictly protected except each date's `CASH:cash:MANDIRI` DEBET inputs
-in D/H/L for up to three cells. Those inputs are restricted to configured Finance
-editors and the writer. Invoice, Unusual, and Reversal have no Finance holes.
-Temporary whole-tab guards lock inputs while publication is in progress.
-
-The Finance list is global across clusters. The writer and spreadsheet owners
-remain privileged exceptions; protection cannot remove owner authority. Range
-permissions do not grant workbook sharing. Legacy Summary differs: without
-`FINPAY_MANDIRI_EDITOR_EMAILS`, its D-column holes allow workbook editors.
+Cell Summary, Invoice, Unusual, and Reversal are formula/value presentation
+outputs. The writer maintains a managed display-only protection per tab and
+removes legacy MANDIRI input holes and temporary publisher guards. It leaves
+unmanaged protections and workbook sharing unchanged. The configured service
+account must already have the required workbook access; workbook owners retain
+their Google privileges.
+Previous-format Summary/MANDIRI protection behavior remains separate.
 
 ## 7. Promote And Recover
 
@@ -578,41 +574,29 @@ between canary and production. Process remaining dates chronologically in small,
 consecutive ranges, stopping on failure. Sequential iteration limits active work,
 not total Kestra task-run count.
 
-The per-cluster/day flow retries only database persistence and guarded Sheet
-publication, up to three total attempts with exponential backoff, reusing the
-verified cohort artifacts. Publication recovery gates still reject `PENDING`,
-`IN_FLIGHT`, and `UNKNOWN`; those states require reconciliation, not another
-automatic or manual blind write.
+The per-cluster/day flow retains its configured Kestra retry/backoff policy; the
+Google HTTP adapter does not retry mutation requests. A retry rereads current DB
+facts and idempotently replaces the requested date block. The range's 30-second
+cohort pause and sequential order remain in force.
 
 Before cutover, stop old writers/schedules. Per-flow queueing does not serialize
 different flow IDs or Kestra installations. Retain old images/flow artifacts and
 verified DB/Sheet backups through the rollback window. Enable schedules only
 with separate approval.
 
-For `IN_FLIGHT`, `UNKNOWN`, lost locks, ambiguous Google writes, failed final DB
-confirmation, or stale handoffs: stop and retain evidence. Never clear status
-rows, erase immutable history, reset protections, or blindly retry. Require an
-approved attributable reconciliation. Image rollback does not undo DB/Sheet data.
+For an ambiguous prior live Sheet outcome, stop and retain evidence. Compare the
+affected date blocks with persisted DB data using read-only access, then obtain
+fresh approval before any corrective write. Do not create or restore a missing
+worksheet as a recovery shortcut. Image rollback does not undo DB/Sheet data.
 
-### Owner-Cleared Published Worksheets
+### Existing Destination Blockers
 
-The bulk flow's `restore_missing_published_worksheets` input is opt-in and
-defaults from `create_worksheets_if_missing`. It may recreate a missing worksheet
-only from the exact ID/title in the latest `COMPLETE` publication snapshot, after
-confirming that the target is blank and has no unmanaged metadata/protections.
-Same-title/different-ID sheets, nonempty targets, and unresolved database guards
-remain blocked. Restored tabs use their original IDs; the prior publication epoch
-is retained, manual Summary inputs come from its committed snapshot, and the full
-current snapshot is staged as a new epoch. The flow does not delete or rebind
-history.
-
-For production, take and checksum-verify an external `finpay` database backup and
-a read-only workbook snapshot before enabling this recovery. Record the failed
-execution, target/cluster/date scope, saved worksheet identity counts, backup
-receipt, and owner approval. If the original worksheet IDs cannot be recreated,
-stop and restore the original workbook structure from an approved backup/version;
-never silently adopt new IDs. A restoration does not itself authorize a subsequent
-bulk execution or Sheet publication.
+Missing or mismatched workbooks/tabs block before persistence when Sheets output
+is enabled. Resolve destination structure through a separately approved workbook
+administration procedure, then rerun the read-only preflight. The cell workflow
+never creates, renames, shares, restores, or adopts a destination. Migration 004
+removes the retired database write-state tables only after separate approval and
+a verified backup; it is not an automatic workflow action.
 
 Clean up temporary E2E resources after evidence capture. A dev-only volume reset
 requires exact user approval, stopped consumers, and a verified backup/restore
@@ -621,6 +605,10 @@ requires explicit approval. Never use `docker volume prune` or apply this rule t
 production/shared volumes. Remove temporary credentials.
 
 ## Local Bulk Canary Result
+
+Historical evidence only: this run exercised the prior publication-state writer,
+not the current stateless date-block writer. It does not resolve the outstanding
+read-only audit or authorize a new live Sheet mutation.
 
 The authorized local run used the copied workbook `Salinan dari Monitoring
 Finpay & LinkAja`, a fresh isolated PostgreSQL 18.4 database/application role,

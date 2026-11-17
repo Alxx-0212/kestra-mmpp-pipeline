@@ -56,16 +56,17 @@ class LiveDesignRunScopeTests(unittest.TestCase):
         client.http_client.request.assert_called_with("get", "https://www.googleapis.com/drive/v3/files/" + run.BOOK,
             params={"fields": "id,name,permissions(id,type,role),capabilities(canEdit)"})
 
-    def test_rejected_attempt_cannot_overwrite_sealed_success_evidence(self):
+    def test_retired_live_runner_stops_before_touching_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result = root / "result.json"
             result.write_text(json.dumps({"status": "PASS", "checks": {"e2e": "PASS"}}))
             before = result.read_bytes()
             with patch("sys.argv", ["run", "prepare", "--root", str(root), "--credential-file", str(root / "absent-key")]), \
-                    patch.object(run.os, "umask"):
-                with self.assertRaisesRegex(RuntimeError, "prepare stopped"):
+                    patch.object(run.os, "umask") as umask:
+                with self.assertRaisesRegex(RuntimeError, "legacy stateful live E2E runner is retired"):
                     run.main()
+                umask.assert_not_called()
             self.assertEqual(result.read_bytes(), before)
 
     def test_private_root_rejects_permissions_and_symlink_in_test_fixture(self):

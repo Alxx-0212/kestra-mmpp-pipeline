@@ -268,11 +268,21 @@ class FinPayWorkflowContractTest(unittest.TestCase):
             "Asia/Makassar",
             "2026-09-01",
             "SELLTHRUSALESFEE",
+            "replaces or appends only each requested date block",
+            "spreadsheets.batchUpdate",
             "finpay_monthly_materialization_v1",
             EXPECTED_SPREADSHEET_NAME,
         ):
             with self.subTest(contract=required_contract):
                 self.assertIn(required_contract, normalized_readme)
+
+        for stale_contract in (
+            "finpay_cell_day_v1` in full-history scope",
+            "full-history scope to each sequential day child",
+            "The separate range flow retains its full-report behavior",
+        ):
+            with self.subTest(stale_contract=stale_contract):
+                self.assertNotIn(stale_contract, normalized_readme)
 
         for cluster_id, worksheet in EXPECTED_CLUSTER_WORKSHEETS.items():
             with self.subTest(cluster_id=cluster_id):
@@ -295,32 +305,22 @@ class FinPayWorkflowContractTest(unittest.TestCase):
 
         self.assertIn("Legacy `.xls` is explicitly rejected", normalized_readme)
 
-    def test_bulk_cell_flow_exposes_copyable_destination_and_cluster_group(self):
+    def test_bulk_cell_flow_exposes_existing_destination_and_cluster_group(self):
         flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_bulk_v1.yml").read_text()
         for setting in (
             "cell_cluster_group", "cell_spreadsheet_id", "cell_spreadsheet_name",
             "legacy_spreadsheet_id", "cell_worksheet_ids_json",
-            "create_spreadsheet_if_missing", "create_worksheets_if_missing",
         ):
             self.assertIn(f"{setting}:", flow)
         self.assertIn("cell_spreadsheet_name: \"{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}\"", flow)
         self.assertIn("legacy_spreadsheet_id: \"{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}\"", flow)
-        self.assertIn("create_spreadsheet_if_missing: true", flow)
-        self.assertIn("create_worksheets_if_missing: true", flow)
-        self.assertIn(
-            '- id: restore_missing_published_worksheets\n    type: BOOLEAN\n'
-            '    defaults: "{{ vars.create_worksheets_if_missing }}"',
-            flow,
-        )
+        self.assertNotIn("create_spreadsheet_if_missing", flow)
+        self.assertNotIn("create_worksheets_if_missing", flow)
+        self.assertNotIn("restore_missing_published_worksheets", flow)
+        self.assertNotIn("cell_bulk_handoffs_v1.zip", flow)
         self.assertIn('defaults: "{{ vars.cell_cluster_group }}"', flow)
         self.assertIn("comma-separated cluster group", flow)
         self.assertIn("CELL_FORMAT_SPREADSHEET_NAME: \"{{ vars.cell_spreadsheet_name }}\"", flow)
-        self.assertIn("CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING", flow)
-        self.assertIn("CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING", flow)
-        self.assertIn(
-            'CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS: "{{ inputs.restore_missing_published_worksheets }}"',
-            _task_block(flow, "publish_cell_bulk"),
-        )
         for task_id in ("preflight_cell_bulk_targets", "publish_cell_bulk"):
             task = flow.split(f"  - id: {task_id}\n", 1)[1].split("\n  - id:", 1)[0]
             for env_name in (
@@ -375,11 +375,14 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         self.assertNotIn("retry:", _task_block(flow, "process_cell_day"))
         pause = _task_block(flow, "pause_after_cell_cohort")
         self.assertIn("type: io.kestra.plugin.core.flow.Sleep", pause)
-        self.assertIn('runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"', pause)
+        self.assertIn(
+            'runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"',
+            _task_block(flow, "publish_cell_range_sequentially"),
+        )
         self.assertIn("duration: PT30S", pause)
         self.assertNotIn("retry:", flow.split("\nafterExecution:\n", 1)[1])
 
-    def test_cell_sheet_writers_use_stable_execution_refresh_ids(self):
+    def test_cell_sheet_writers_publish_without_epochs_or_snapshot_artifacts(self):
         for workflow, task_id in (
             ("finpay_cell_day_v1.yml", "publish_cell_four_tabs"),
             ("finpay_cell_bulk_v1.yml", "publish_cell_bulk"),
@@ -387,8 +390,9 @@ class FinPayWorkflowContractTest(unittest.TestCase):
             with self.subTest(workflow=workflow):
                 flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows" / workflow).read_text()
                 task = _task_block(flow, task_id)
-                self.assertIn('REFRESH_REQUEST_ID: "{{ execution.originalId ?? execution.id }}"', task)
-                self.assertIn('refresh_request_id=os.environ["REFRESH_REQUEST_ID"]', task)
+                self.assertNotIn("REFRESH_REQUEST_ID", task)
+                self.assertNotIn("refresh_request_id=", task)
+                self.assertNotIn("HANDOFF", task)
 
     def test_cell_day_bind_mounts_and_copies_validated_source_exports(self):
         flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
@@ -434,20 +438,17 @@ class FinPayWorkflowContractTest(unittest.TestCase):
             for block in flow.split("type: io.kestra.plugin.scripts.python.Script")[1:]:
                 self.assertTrue(block.startswith("\n    logLevel: INFO\n"), filename)
 
-    def test_cell_range_forwards_destination_settings_to_day_subflow(self):
+    def test_cell_range_forwards_destination_settings_to_date_block_subflows(self):
         range_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
         day_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
         subflow = range_flow.split("flowId: finpay_cell_day_v1", 1)[1]
-        self.assertIn('publication_scope: "history"', subflow)
-        self.assertIn('- id: publication_scope\n    type: STRING\n    defaults: "report_date"', day_flow)
-        self.assertIn('PUBLICATION_SCOPE: "{{ inputs.publication_scope }}"', day_flow)
+        self.assertNotIn("publication_scope", range_flow)
+        self.assertNotIn("publication_scope", day_flow)
         settings = {
             "cell_spreadsheet_id": ("STRING", "CELL_FORMAT_SPREADSHEET_ID"),
             "cell_spreadsheet_name": ("STRING", "CELL_FORMAT_SPREADSHEET_NAME"),
             "legacy_spreadsheet_id": ("STRING", "CELL_FORMAT_LEGACY_SPREADSHEET_ID"),
             "cell_worksheet_ids_json": ("STRING", "CELL_FORMAT_WORKSHEET_IDS"),
-            "create_spreadsheet_if_missing": ("BOOLEAN", "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING"),
-            "create_worksheets_if_missing": ("BOOLEAN", "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING"),
         }
         for name, (input_type, environment_name) in settings.items():
             with self.subTest(setting=name):

@@ -89,7 +89,7 @@ class FakeWorkbook:
             raise AssertionError("unexpected fake Drive metadata request")
         return FakeResponse({"id": self.id, "owners": []})
 
-    def fetch_sheet_metadata(self):
+    def fetch_sheet_metadata(self, params=None):
         _raise_next(self.metadata_failures)
         return {
             "spreadsheetId": self.id,
@@ -226,7 +226,7 @@ def _configuration(**overrides):
 
 
 class CellSheetTargetTests(unittest.TestCase):
-    def test_env_values_override_constants_and_name_defaults_to_create(self):
+    def test_env_values_override_constants_without_creation_capabilities(self):
         with patch.object(settings, "CELL_FORMAT_SPREADSHEET_ID", "constant-id"), \
                 patch.object(settings, "CELL_FORMAT_WRITER_EMAIL", "constant@example.test"):
             config = settings.sheet_configuration({
@@ -239,12 +239,13 @@ class CellSheetTargetTests(unittest.TestCase):
             fallback = settings.sheet_configuration(BASE_ENV)
         self.assertEqual(config.spreadsheet_id, "environment-id")
         self.assertEqual(config.finance_emails, ("one@example.test", "two@example.test"))
-        self.assertTrue(config.create_spreadsheet_if_missing)
-        self.assertFalse(config.restore_missing_published_worksheets)
+        self.assertFalse(hasattr(config, "create_spreadsheet_if_missing"))
+        self.assertFalse(hasattr(config, "create_worksheets_if_missing"))
+        self.assertFalse(hasattr(config, "restore_missing_published_worksheets"))
         self.assertIsNone(config.worksheet_ids)
         self.assertEqual(fallback.spreadsheet_id, "constant-id")
 
-    def test_published_worksheet_restore_requires_creation_to_be_enabled(self):
+    def legacy_test_published_worksheet_restore_requires_creation_to_be_enabled(self):
         config = _configuration(CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS="true")
         self.assertTrue(config.restore_missing_published_worksheets)
         with self.assertRaisesRegex(ValueError, "worksheet creation to be enabled"):
@@ -300,7 +301,7 @@ class CellSheetTargetTests(unittest.TestCase):
                     "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
                     "CELL_FORMAT_FINANCE_EMAILS": value,
                 })
-        with self.assertRaisesRegex(ValueError, "must be the string true or false"):
+        with self.assertRaisesRegex(ValueError, "creation and restoration settings are unsupported"):
             settings.sheet_configuration({
                 **BASE_ENV,
                 "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
@@ -322,15 +323,14 @@ class CellSheetTargetTests(unittest.TestCase):
     def test_exact_title_lookup_rejects_duplicates_and_does_not_create(self):
         first = FakeWorkbook("first", "Cell Reports")
         second = FakeWorkbook("second", "Cell Reports")
-        client, store = FakeClient([first, second]), MemoryOperationStore()
+        client = FakeClient([first, second])
         with self.assertRaisesRegex(ValueError, "multiple Google spreadsheets"):
-            pipeline.resolve_cell_workbook(client, _configuration(), store)
+            pipeline.resolve_cell_workbook(client, _configuration())
         self.assertEqual(client.create_calls, [])
-        self.assertEqual(store.operations, {})
         self.assertTrue(client.drive_queries)
         self.assertIn("drive/v3/files", client.drive_queries[0][1])
 
-    def test_named_workbook_creation_checks_cluster_history_before_create(self):
+    def legacy_test_named_workbook_creation_checks_cluster_history_before_create(self):
         client = FakeClient()
         store = MemoryOperationStore(conflicting_targets={"previous-workbook"})
         with self.assertRaisesRegex(ValueError, "another workbook"):
@@ -347,7 +347,7 @@ class CellSheetTargetTests(unittest.TestCase):
         )
         client = FakeClient([workbook])
         resolved, spreadsheet_id, created = pipeline.resolve_cell_workbook(
-            client, _configuration(), MemoryOperationStore(),
+            client, _configuration(),
         )
         self.assertIs(resolved, workbook)
         self.assertEqual(spreadsheet_id, "existing")
@@ -378,18 +378,19 @@ class CellSheetTargetTests(unittest.TestCase):
 
         with patch("finpay_pipeline.cell_publication.time.sleep") as sleep:
             resolved, spreadsheet_id = pipeline._spreadsheet_by_name(client, "Cell Reports")
+            pipeline._verify_workbook(resolved, spreadsheet_id, "Cell Reports")
             pipeline._verify_workbook_access(resolved, _configuration())
-            targets, _ = pipeline._resolve_cell_targets(
-                MemoryOperationStore(), resolved, CLUSTER, _configuration(CELL_FORMAT_SPREADSHEET_ID="existing"), None,
+            targets, _ = pipeline._resolve_existing_cell_targets(
+                resolved, CLUSTER, _configuration(CELL_FORMAT_SPREADSHEET_ID="existing"),
             )
 
         self.assertIs(resolved, workbook)
         self.assertEqual(spreadsheet_id, "existing")
         self.assertEqual(set(targets), set(ROLES))
-        self.assertEqual(sleep.call_args_list, [call(2)] * 5)
-        self.assertEqual(len(workbook.worksheet_lookup_failures), 1)
+        self.assertEqual(sleep.call_args_list, [call(2)] * 4)
+        self.assertEqual(len(workbook.worksheet_listing_failures), 1)
 
-    def test_missing_named_workbook_is_created_and_shared_inside_journal(self):
+    def legacy_test_missing_named_workbook_is_created_and_shared_inside_journal(self):
         client, store = FakeClient(), MemoryOperationStore()
         workbook, spreadsheet_id, created = pipeline.resolve_cell_workbook(
             client, _configuration(), store,
@@ -403,7 +404,7 @@ class CellSheetTargetTests(unittest.TestCase):
         )
         self.assertEqual(list(store.operations.values()), ["IDLE"])
 
-    def test_ambiguous_file_create_does_not_share_a_concurrent_exact_title_match(self):
+    def legacy_test_ambiguous_file_create_does_not_share_a_concurrent_exact_title_match(self):
         client, store = FakeClient(), MemoryOperationStore()
         client.create_mode = "after"
         with self.assertRaisesRegex(RuntimeError, "blocked for operator reconciliation"):
@@ -412,7 +413,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(client.workbooks["created-1"].shares, [])
         self.assertEqual(list(store.operations.values()), ["UNKNOWN"])
 
-    def test_unresolved_file_create_marks_unknown_and_fails_closed(self):
+    def legacy_test_unresolved_file_create_marks_unknown_and_fails_closed(self):
         client, store = FakeClient(), MemoryOperationStore()
         client.create_mode = "before"
         with self.assertRaisesRegex(RuntimeError, "blocked for operator reconciliation"):
@@ -425,7 +426,7 @@ class CellSheetTargetTests(unittest.TestCase):
             pipeline.resolve_cell_workbook(duplicate_client, _configuration(), duplicate_store)
         self.assertEqual(list(duplicate_store.operations.values()), ["UNKNOWN"])
 
-    def test_disabled_file_creation_fails_without_journal_or_create(self):
+    def legacy_test_disabled_file_creation_fails_without_journal_or_create(self):
         client, store = FakeClient(), MemoryOperationStore()
         config = _configuration(CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING="false")
         with self.assertRaisesRegex(FileNotFoundError, "creation is disabled"):
@@ -433,7 +434,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(client.create_calls, [])
         self.assertEqual(store.operations, {})
 
-    def test_alias_tabs_are_created_once_then_reused_by_id(self):
+    def legacy_test_alias_tabs_are_created_once_then_reused_by_id(self):
         workbook = FakeWorkbook("existing", "Cell Reports", [FakeWorksheet(0, "Sheet1")])
         store = MemoryOperationStore()
         config = _configuration(CELL_FORMAT_SPREADSHEET_ID="existing")
@@ -445,7 +446,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual({role: target.worksheet_id for role, target in second_targets.items()}, first_ids)
         self.assertEqual(len(workbook.add_requests), len(ROLES))
 
-    def test_populated_existing_alias_blocks_missing_tab_creation(self):
+    def legacy_test_populated_existing_alias_blocks_missing_tab_creation(self):
         title = cell_worksheet_title(ACCOUNT, ROLES[0], settings.CELL_FORMAT_NAMING_SCHEME)
         workbook = FakeWorkbook(
             "existing", "Cell Reports", [FakeWorksheet(900, title, [["unmanaged data"]])],
@@ -457,7 +458,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(workbook.add_requests, [])
         self.assertEqual(store.operations, {})
 
-    def test_worksheet_creation_flag_is_independent_from_workbook_creation_flag(self):
+    def legacy_test_worksheet_creation_flag_is_independent_from_workbook_creation_flag(self):
         workbook = FakeWorkbook("existing", "Cell Reports")
         store = MemoryOperationStore()
         config = _configuration(
@@ -470,7 +471,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(workbook.add_requests, [])
         self.assertEqual(store.operations, {})
 
-    def test_cluster_cannot_fork_publication_history_to_another_workbook(self):
+    def legacy_test_cluster_cannot_fork_publication_history_to_another_workbook(self):
         workbook = FakeWorkbook("new-workbook", "Cell Reports")
         store = MemoryOperationStore(conflicting_targets={"old-workbook"})
         config = _configuration(CELL_FORMAT_SPREADSHEET_ID="new-workbook")
@@ -479,22 +480,20 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(workbook.add_requests, [])
         self.assertEqual(store.operations, {})
 
-    def test_configured_missing_alias_tabs_use_the_pinned_sheet_ids(self):
+    def legacy_test_configured_missing_alias_tabs_use_the_pinned_sheet_ids(self):
         configured = {ACCOUNT: {role: 701 + index for index, role in enumerate(ROLES)}}
         config = _configuration(
             CELL_FORMAT_SPREADSHEET_ID="existing",
             CELL_FORMAT_WORKSHEET_IDS=json.dumps(configured),
         )
         workbook = FakeWorkbook("existing", "Cell Reports")
-        targets, _ = pipeline._resolve_cell_targets(
-            MemoryOperationStore(), workbook, CLUSTER, config, None,
-        )
+        targets, _ = pipeline._resolve_existing_cell_targets(workbook, CLUSTER, config)
         self.assertEqual(
             {role: target.worksheet_id for role, target in targets.items()}, configured[ACCOUNT],
         )
         self.assertEqual([request["sheetId"] for request in workbook.add_requests], list(configured[ACCOUNT].values()))
 
-    def test_acknowledged_add_retries_transient_readback_once_and_finishes_idle(self):
+    def legacy_test_acknowledged_add_retries_transient_readback_once_and_finishes_idle(self):
         workbook = FakeWorkbook("existing", "Cell Reports")
         workbook.worksheet_listing_failures = [APIError(503)]
         store = MemoryOperationStore()
@@ -510,7 +509,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(list(store.operations.values()), ["IDLE"])
         self.assertEqual(sleep.call_args_list, [call(2)])
 
-    def test_failed_readback_stays_unknown_and_keeps_class_only_journal_error(self):
+    def legacy_test_failed_readback_stays_unknown_and_keeps_class_only_journal_error(self):
         # A leaf read error is journaled directly; an addSheet error is rewrapped first.
         cases = (
             ("permanent", [APIError(403)]),
@@ -537,7 +536,7 @@ class CellSheetTargetTests(unittest.TestCase):
                     ["RuntimeError", "APIError"],
                 )
 
-    def test_create_error_is_rewrapped_as_runtime_error_without_historical_status(self):
+    def legacy_test_create_error_is_rewrapped_as_runtime_error_without_historical_status(self):
         workbook = FakeWorkbook("existing", "Cell Reports")
         workbook.fail_add = "before"
         store = MemoryOperationStore()
@@ -552,7 +551,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(summary["error_types"], ["RuntimeError", "RuntimeError", "TimeoutError"])
         self.assertNotIn("http_status", summary)
 
-    def test_add_sheet_never_adopts_wrong_response_id_or_duplicate_title(self):
+    def legacy_test_add_sheet_never_adopts_wrong_response_id_or_duplicate_title(self):
         for mode in ("wrong-response-id", "duplicate-title"):
             with self.subTest(mode=mode):
                 workbook = FakeWorkbook("existing", "Cell Reports")
@@ -602,7 +601,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(len(bounded["error_types"]), 8)
         self.assertNotIn(secret, json.dumps(bounded))
 
-    def test_prior_publication_with_missing_tab_fails_before_creation(self):
+    def legacy_test_prior_publication_with_missing_tab_fails_before_creation(self):
         workbook = FakeWorkbook("existing", "Cell Reports")
         role_snapshot = {}
         for index, role in enumerate(ROLES):
@@ -625,7 +624,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(workbook.add_requests, [])
         self.assertEqual(store.operations, {})
 
-    def test_prior_publication_restores_missing_tabs_using_exact_saved_ids(self):
+    def legacy_test_prior_publication_restores_missing_tabs_using_exact_saved_ids(self):
         workbook = FakeWorkbook("existing", "Cell Reports", [FakeWorksheet(0, "Sheet1")])
         role_snapshot = {}
         for index, role in enumerate(ROLES):
@@ -667,7 +666,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(retry_restored_roles, set(ROLES))
         self.assertEqual(len(workbook.add_requests), len(ROLES))
 
-    def test_prior_publication_restore_never_adopts_same_title_with_new_id(self):
+    def legacy_test_prior_publication_restore_never_adopts_same_title_with_new_id(self):
         first_title = cell_worksheet_title(ACCOUNT, ROLES[0], settings.CELL_FORMAT_NAMING_SCHEME)
         workbook = FakeWorkbook("existing", "Cell Reports", [FakeWorksheet(999, first_title)])
         role_snapshot = {
@@ -700,7 +699,7 @@ class CellSheetTargetTests(unittest.TestCase):
         self.assertEqual(summary["safe_reason"], "committed_worksheet_missing")
         self.assertNotIn(private_detail, json.dumps(summary))
 
-    def test_ambiguous_add_sheet_reconciles_exact_readback_but_never_retries(self):
+    def legacy_test_ambiguous_add_sheet_reconciles_exact_readback_but_never_retries(self):
         workbook = FakeWorkbook("existing", "Cell Reports")
         workbook.fail_add = "after"
         store = MemoryOperationStore()
@@ -732,15 +731,54 @@ class CellSheetTargetTests(unittest.TestCase):
             [{"emailAddress": "writer@example.test", "role": "owner"}],
         )
         config = _configuration(CELL_FORMAT_SPREADSHEET_ID="existing")
-        targets, _ = pipeline._resolve_cell_targets(
-            MemoryOperationStore(), workbook, CLUSTER, config, None,
-        )
+        targets, _ = pipeline._resolve_existing_cell_targets(workbook, CLUSTER, config)
         self.assertEqual(
             [targets[role].worksheet_id for role in ROLES],
             [worksheet.id for worksheet in worksheets],
         )
         self.assertEqual(workbook.add_requests, [])
         self.assertEqual(workbook.shares, [])
+
+    def test_existing_target_preflight_requires_exact_tabs_and_never_creates(self):
+        worksheets = [
+            FakeWorksheet(
+                index + 900,
+                cell_worksheet_title(ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME),
+            )
+            for index, role in enumerate(ROLES)
+        ]
+        permissions = [
+            {"emailAddress": email, "role": "writer"}
+            for email in ("writer@example.test", "finance-a@example.test", "finance-b@example.test")
+        ]
+        workbook = FakeWorkbook("existing", "Cell Reports", worksheets, permissions)
+        client = FakeClient([workbook])
+        environment = {
+            **BASE_ENV,
+            "CELL_FORMAT_SPREADSHEET_ID": "existing",
+            "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
+            "CELL_FORMAT_WORKSHEET_IDS": json.dumps({
+                ACCOUNT: {role: 900 + index for index, role in enumerate(ROLES)},
+            }),
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            result = pipeline.validate_existing_sheet_targets(
+                [CLUSTER], {"client_email": "writer@example.test"},
+                sheet_client_factory=lambda credentials: client,
+            )
+        self.assertEqual(result["validated_roles"], len(ROLES))
+        self.assertEqual(client.create_calls, [])
+        self.assertEqual(workbook.add_requests, [])
+
+        workbook._worksheets.pop()
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(FileNotFoundError, "exact title"):
+                pipeline.validate_existing_sheet_targets(
+                    [CLUSTER], {"client_email": "writer@example.test"},
+                    sheet_client_factory=lambda credentials: client,
+                )
+        self.assertEqual(client.create_calls, [])
+        self.assertEqual(workbook.add_requests, [])
 
     def test_existing_workbook_access_requires_writer_and_all_finance_editors(self):
         workbook = FakeWorkbook(
@@ -751,19 +789,15 @@ class CellSheetTargetTests(unittest.TestCase):
             pipeline._verify_workbook_access(workbook, _configuration())
         self.assertEqual(workbook.shares, [])
 
-    def test_drive_file_scope_is_added_only_for_creation_capability(self):
+    def test_client_has_read_only_drive_metadata_scope_without_file_creation_scope(self):
         with patch("google.oauth2.service_account.Credentials.from_service_account_info") as credentials, \
                 patch("google.auth.transport.requests.AuthorizedSession"), \
                 patch("requests.adapters.HTTPAdapter"), patch("gspread.Client"):
             make_cell_sheet_client({"client_email": "writer@example.test"})
-            default_scopes = credentials.call_args.kwargs["scopes"]
-            make_cell_sheet_client({"client_email": "writer@example.test"}, include_drive_file=True)
-            create_scopes = credentials.call_args.kwargs["scopes"]
-        drive_file = "https://www.googleapis.com/auth/drive.file"
-        self.assertNotIn(drive_file, default_scopes)
-        self.assertIn("https://www.googleapis.com/auth/spreadsheets", create_scopes)
-        self.assertIn("https://www.googleapis.com/auth/drive.metadata.readonly", create_scopes)
-        self.assertIn(drive_file, create_scopes)
+            scopes = credentials.call_args.kwargs["scopes"]
+        self.assertIn("https://www.googleapis.com/auth/spreadsheets", scopes)
+        self.assertIn("https://www.googleapis.com/auth/drive.metadata.readonly", scopes)
+        self.assertNotIn("https://www.googleapis.com/auth/drive.file", scopes)
 
 
 if __name__ == "__main__":

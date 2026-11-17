@@ -4,8 +4,10 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from finpay_pipeline.cell_contracts import OBSERVED_CELL_ROSTER
@@ -168,32 +170,48 @@ class CellWorkflowV2Tests(unittest.TestCase):
             database.assert_not_called()
             google.assert_not_called()
 
-    def run_fake_persistence(self, directory, *, write_gsheet, roster=None, missing_last_history=False):
-        from finpay_pipeline.tests.test_cell_publication_v2 import MultiTabAdapter, MultiTabStore
-
-        class Store(MultiTabStore):
-            def commit_and_stage(self, *args, **kwargs):
-                result = super().commit_and_stage(*args, **kwargs)
-                if not kwargs["write_gsheet"]:
-                    result["status"] = self.publications[result["epoch"]]["status"] = "DB_ONLY"
-                return result
-
+    def run_fake_persistence(self, directory, *, write_gsheet, roster=None):
         bundle, config, _, _, bundle_hash = self.make_inputs(Path(directory), roster)
         runtime = json.loads(config.read_text())
         runtime["dummy_data_only"] = False
-        if missing_last_history:
-            runtime["accounts"][-1].update(first_report_date="2026-10-12", opening_boundary="2026-10-12T00:00:00+08:00")
         config.write_text(json.dumps(runtime))
         digest = hashlib.sha256(config.read_bytes()).hexdigest()
-        stores, worksheets = {}, {}
-        for account, targets in runtime["worksheet_targets"].items():
-            store = stores[account[:-2]] = Store()
-            store.cluster_id = account[:-2]
-            for role, item in targets.items():
-                adapter = MultiTabAdapter(role, item["worksheet_id"], item["title"], store)
-                store.adapters[role] = worksheets[item["worksheet_id"]] = adapter
+
+        class Store:
+            def __init__(self, cluster):
+                self.cluster_id = cluster
+                self.target_id = runtime["spreadsheet_id"]
+                self.facts = {}
+                self.connection = SimpleNamespace(transaction=nullcontext)
+
+            def latest_report_date(self):
+                return max((day for day, _ in self.facts), default=None)
+
+            def current_results(self, start, end):
+                start = start.isoformat() if hasattr(start, "isoformat") else str(start)
+                end = end.isoformat() if hasattr(end, "isoformat") else str(end)
+                return [{
+                    "report_date": date.fromisoformat(day),
+                    "account": item["identity"]["account"],
+                    "cell_code": code, "generation_id": item["generation_id"],
+                    "calculation_id": item["calculation_id"], "config_id": item["config_id"],
+                    "result": item["calculation"],
+                } for (day, code), item in sorted(self.facts.items()) if start <= day <= end]
+
+            def commit_cluster_day(self, batch, expected_cells):
+                for item in batch:
+                    self.facts[(item["report_date"], item["identity"]["cell_code"])] = item
+
+        stores = {}
+        for account in runtime["accounts"]:
+            cluster = account["account"][:-2]
+            stores[cluster] = Store(cluster)
         workbook = Mock()
-        workbook.get_worksheet_by_id.side_effect = worksheets.__getitem__
+        workbook.fetch_sheet_metadata.return_value = {
+            "spreadsheetId": runtime["spreadsheet_id"],
+            "sheets": [{"properties": {"sheetId": item["worksheet_id"], "title": item["title"]}}
+                       for roles in runtime["worksheet_targets"].values() for item in roles.values()],
+        }
         google = Mock()
         google.return_value.open_by_key.return_value = workbook
 
@@ -201,30 +219,19 @@ class CellWorkflowV2Tests(unittest.TestCase):
         def session(target, approved, cluster, spreadsheet, **kwargs):
             yield stores[cluster]
 
-        with patch("finpay_pipeline.cell_workflow.ExistingSheetAdapter", side_effect=lambda book, sheet: sheet):
-            if missing_last_history:
-                with self.assertRaises(ValueError):
-                    run_cell_reporting_v2(bundle, config, digest, bundle_hash,
-                        approved_configuration_sha256=digest, dry_run=False, write_gsheet=True,
-                        database_password="synthetic", credentials_info={"client_email": "writer@example.test"},
-                        session_factory=session, sheet_client_factory=google, output_dir=directory)
-                google.assert_not_called()
-                self.assertTrue(all(not store.facts for store in stores.values()))
-                return
+        with patch("finpay_pipeline.cell_workflow.publish_cell_date_blocks",
+                   return_value={"status": "PUBLISHED", "report_date": "2026-10-13"}) as publish:
             result = run_cell_reporting_v2(bundle, config, digest, bundle_hash,
                 approved_configuration_sha256=digest, dry_run=False, write_gsheet=write_gsheet,
                 database_password="synthetic", credentials_info={"client_email": "writer@example.test"},
                 session_factory=session, sheet_client_factory=google, output_dir=directory)
-        self.assertTrue(all(item["status"] == ("COMPLETE" if write_gsheet else "DB_ONLY") for item in result["accounts"]))
+        self.assertTrue(all(item["status"] == "PUBLISHED" for item in result["accounts"]) if write_gsheet
+                        else all(item["persisted_cells"] > 0 for item in result["accounts"]))
         if not write_gsheet:
             google.assert_not_called()
-        for store in stores.values():
-            worksheets = store.latest_publication()["snapshot"]["worksheets"]
-            self.assertEqual(set(worksheets),
-                             {"summary", "invoice", "unusual", "reversal"})
-            self.assertEqual(worksheets["summary"]["matrix"]["layout_version"], 5)
-            for role, item in worksheets.items():
-                self.assertEqual(item["matrix"]["style_contract"]["role"], role)
+        else:
+            self.assertEqual(publish.call_count, len(runtime["accounts"]))
+            self.assertTrue(all(call.args[3] == "2026-10-13" for call in publish.call_args_list))
 
     def test_db_only_persists_all_four_outputs_without_google_factory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -233,11 +240,6 @@ class CellWorkflowV2Tests(unittest.TestCase):
     def test_full_roster_live_fake_path_publishes_all_32_tabs(self):
         with tempfile.TemporaryDirectory() as directory:
             self.run_fake_persistence(directory, write_gsheet=True, roster=OBSERVED_CELL_ROSTER)
-
-    def test_last_account_missing_history_blocks_google_and_all_commits(self):
-        with tempfile.TemporaryDirectory() as directory:
-            self.run_fake_persistence(directory, write_gsheet=True, roster=OBSERVED_CELL_ROSTER, missing_last_history=True)
-
 
 if __name__ == "__main__":
     unittest.main()

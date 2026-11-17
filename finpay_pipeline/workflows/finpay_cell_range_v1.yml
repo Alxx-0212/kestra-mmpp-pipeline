@@ -12,8 +12,6 @@ variables:
   cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
   legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"
   cell_worksheet_ids_json: ""
-  create_spreadsheet_if_missing: true
-  create_worksheets_if_missing: true
 
 triggers:
   - id: daily_cell_range_0500_wita
@@ -68,17 +66,18 @@ tasks:
       END_DATE: "{{ inputs.end_date }}"
       CLUSTER_ID: "{{ inputs.cluster_id }}"
       WRITE_GSHEET: "{{ inputs.write_gsheet }}"
+      DRY_RUN: "{{ inputs.dry_run }}"
       CELL_FORMAT_SPREADSHEET_ID: "{{ vars.cell_spreadsheet_id }}"
       CELL_FORMAT_SPREADSHEET_NAME: "{{ vars.cell_spreadsheet_name }}"
       CELL_FORMAT_LEGACY_SPREADSHEET_ID: "{{ vars.legacy_spreadsheet_id }}"
       CELL_FORMAT_WRITER_EMAIL: "{{ secret('FINPAY_CELL_WRITER_EMAIL') }}"
       CELL_FORMAT_FINANCE_EMAILS: "{{ secret('FINPAY_CELL_FINANCE_EMAILS') }}"
-      CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING: "{{ vars.create_spreadsheet_if_missing }}"
       CELL_FORMAT_WORKSHEET_IDS: "{{ vars.cell_worksheet_ids_json }}"
-      CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING: "{{ vars.create_worksheets_if_missing }}"
+      GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
     script: |
       import os
       from kestra import Kestra
+      from finpay_pipeline.cell_workflow import decode_cell_google_credentials
       from finpay_pipeline.cell_format import expand_cell_range, validate_sheet_range
       from finpay_pipeline.cell_observability import observed
 
@@ -86,9 +85,11 @@ tasks:
       runs = expand_cell_range(
           os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
       )
-      if os.environ["WRITE_GSHEET"].lower() == "true":
+      if (os.environ["DRY_RUN"].lower() == "false"
+              and os.environ["WRITE_GSHEET"].lower() == "true"):
           validate_sheet_range(
               os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
+              credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
           )
       Kestra.logger().info("Range ready: " + str(len(runs)) + " sequential cluster/date cohorts")
       Kestra.outputs({"runs": [dict(run, ordinal=index + 1) for index, run in enumerate(runs)], "count": len(runs)})
@@ -105,7 +106,7 @@ tasks:
           interval: PT30S
           maxInterval: PT120S
           maxAttempts: 6
-        message: "Starting cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}; open the child execution for live cell progress and estimated remaining time."
+        message: "Persisting cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}"
       - id: process_cell_day
         type: io.kestra.plugin.core.flow.Subflow
         namespace: finance.finpay
@@ -116,16 +117,14 @@ tasks:
           report_date: "{{ fromJson(taskrun.value).report_date }}"
           cluster_id: "{{ fromJson(taskrun.value).cluster_id }}"
           dry_run: "{{ inputs.dry_run }}"
-          write_gsheet: "{{ inputs.write_gsheet }}"
-          publication_scope: "history"
-          send_telegram: "{{ inputs.send_telegram }}"
+          write_gsheet: false
+          publish_only: false
+          send_telegram: false
           cell_spreadsheet_id: "{{ vars.cell_spreadsheet_id }}"
           cell_spreadsheet_name: "{{ vars.cell_spreadsheet_name }}"
           legacy_spreadsheet_id: "{{ vars.legacy_spreadsheet_id }}"
           cell_worksheet_ids_json: "{{ vars.cell_worksheet_ids_json }}"
           cell_reporting_network: "{{ vars.cell_reporting_network }}"
-          create_spreadsheet_if_missing: "{{ vars.create_spreadsheet_if_missing }}"
-          create_worksheets_if_missing: "{{ vars.create_worksheets_if_missing }}"
       - id: log_cell_cohort_completed
         type: io.kestra.plugin.core.log.Log
         retry:
@@ -133,11 +132,50 @@ tasks:
           interval: PT30S
           maxInterval: PT120S
           maxAttempts: 6
-        message: "Completed cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}"
+        message: "Persisted cohort {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}"
 
+  - id: publish_cell_range_sequentially
+    type: io.kestra.plugin.core.flow.ForEach
+    runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
+    values: "{{ outputs.expand_cell_range.vars.runs }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: log_cell_publish_started
+        type: io.kestra.plugin.core.log.Log
+        retry:
+          type: exponential
+          interval: PT30S
+          maxInterval: PT120S
+          maxAttempts: 6
+        message: "Publishing date block {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}"
+      - id: publish_cell_day_block
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: finance.finpay
+        flowId: finpay_cell_day_v1
+        wait: true
+        transmitFailed: true
+        inputs:
+          report_date: "{{ fromJson(taskrun.value).report_date }}"
+          cluster_id: "{{ fromJson(taskrun.value).cluster_id }}"
+          dry_run: false
+          write_gsheet: true
+          publish_only: true
+          send_telegram: "{{ inputs.send_telegram }}"
+          cell_spreadsheet_id: "{{ vars.cell_spreadsheet_id }}"
+          cell_spreadsheet_name: "{{ vars.cell_spreadsheet_name }}"
+          legacy_spreadsheet_id: "{{ vars.legacy_spreadsheet_id }}"
+          cell_worksheet_ids_json: "{{ vars.cell_worksheet_ids_json }}"
+          cell_reporting_network: "{{ vars.cell_reporting_network }}"
+      - id: log_cell_publish_completed
+        type: io.kestra.plugin.core.log.Log
+        retry:
+          type: exponential
+          interval: PT30S
+          maxInterval: PT120S
+          maxAttempts: 6
+        message: "Published date block {{ fromJson(taskrun.value).ordinal }}/{{ outputs.expand_cell_range.vars.count }}: cluster={{ fromJson(taskrun.value).cluster_id }}, date={{ fromJson(taskrun.value).report_date }}"
       - id: pause_after_cell_cohort
         type: io.kestra.plugin.core.flow.Sleep
-        runIf: "{{ inputs.dry_run == false and inputs.write_gsheet }}"
         duration: PT30S
         retry:
           type: exponential

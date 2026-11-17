@@ -78,6 +78,11 @@ class BulkLiveBoundaryTests(unittest.TestCase):
         self.assertTrue(audit["scope_enforced"])
         self.assertNotIn("123", json.dumps(audit))
 
+    def test_legacy_live_runner_is_retired_before_any_remote_action(self):
+        with self.assertRaisesRegex(live.ops.Blocked, "legacy stateful live bulk harness is retired"):
+            live.main()
+        self.assertEqual(self.http.writes, [])
+
     def test_global_foreign_and_unrelated_mutations_fail_before_http(self):
         client = live.scoped_sheet_client({})
         attempts = [
@@ -117,7 +122,8 @@ class BulkLiveBoundaryTests(unittest.TestCase):
         self.assertNotIn(f'{self.root}:/evidence"', text)
         self.assertNotIn("/opt/finpay-ops", text)
         self.assertIn("_settings.CELL_FORMAT_WORKSHEET_IDS =", text)
-        self.assertIn("create_worksheets_if_missing: false", text)
+        self.assertNotIn("create_worksheets_if_missing", text)
+        self.assertNotIn("cell_bulk_handoffs_v1.zip", text)
         self.assertIn("defaults: false", text)
         self.assertNotIn("afterExecution:", text)
         self.assertNotIn("TELEGRAM_BOT_TOKEN", text)

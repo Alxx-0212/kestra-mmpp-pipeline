@@ -175,45 +175,6 @@ def _session_for(store, calls=None):
     return session
 
 
-def _make_handoff_bundle(root: Path, cluster_ids=None) -> tuple[Path, str]:
-    clusters = list(selected_clusters("ALL")) if cluster_ids is None else sorted(cluster_ids, key=int)
-    entries = []
-    with zipfile.ZipFile(root / "cell_bulk_handoffs_v1.zip", "w") as archive:
-        for cluster in clusters:
-            config = report_config(cluster, REPORTING_START_DATE)
-            selected = []
-            for report_date in bulk_pipeline._dates(START, END):
-                for cell in config.cells:
-                    selected.append({
-                        "account": config.account, "cluster_id": cluster,
-                        "cell_code": cell.cell_code, "report_date": report_date,
-                        "generation_id": f"generation-{cluster}-{report_date}-{cell.cell_code}",
-                        "calculation_id": f"calculation-{cluster}-{report_date}-{cell.cell_code}",
-                        "config_id": f"config-{cluster}",
-                    })
-            handoff = {
-                "schema_version": 1, "cluster_id": cluster, "account": config.account,
-                "submitted_report_date": END, "first_report_date": REPORTING_START_DATE,
-                "last_report_date": END, "roster_fingerprint": roster_fingerprint(config.cells),
-                "selected": selected, "history_fingerprint": fingerprint(selected),
-            }
-            content = json.dumps(handoff, sort_keys=True, separators=(",", ":")).encode()
-            path = bulk_pipeline._handoff_path(cluster)
-            archive.writestr(path, content)
-            entries.append({
-                "cluster_id": cluster, "path": path,
-                "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content),
-            })
-        index = {
-            "schema_version": 1, "start_date": START, "end_date": END,
-            "cluster_id": "ALL" if len(clusters) > 1 else clusters[0],
-            "clusters": clusters, "roster_version": ROSTER_VERSION, "entries": entries,
-        }
-        archive.writestr("index.json", json.dumps(index, sort_keys=True))
-    path = root / "cell_bulk_handoffs_v1.zip"
-    return path, hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 class CellBulkPipelineTests(unittest.TestCase):
     def _preprocess(self, directory):
         source, source_sha = _write_source_bulk(directory)
@@ -223,13 +184,12 @@ class CellBulkPipelineTests(unittest.TestCase):
         )
         return source, source_sha, output, result
 
-    def _persist(self, prepared_path, result, store, output_path=None, calls=None):
+    def _persist(self, prepared_path, result, store, calls=None):
         session_factory = _session_for(store, calls)
-        output_path = output_path or prepared_path.with_name("cell_bulk_handoffs_v1.zip")
         return persist_cell_range(
             str(prepared_path), result["prepared_bundle_sha256"],
-            database_password="synthetic-password", output_path=str(output_path),
-            target=TARGET, session_factory=session_factory,
+            database_password="synthetic-password", target=TARGET,
+            session_factory=session_factory,
         )
 
     def test_preprocess_emits_exact_two_day_two_cell_prepared_archive(self):
@@ -400,39 +360,25 @@ class CellBulkPipelineTests(unittest.TestCase):
                     self.assertEqual((start, end, clusters), (START, END, [CLUSTER]))
             self.assertEqual(source.read_bytes(), b"replacement after verification")
 
-    def test_prepared_and_handoff_members_are_checked_before_clients_open(self):
+    def test_bulk_publication_rejects_invalid_ranges_before_clients_open(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, _, prepared_path, _ = self._preprocess(root)
-            handoff_path, _ = _make_handoff_bundle(root, [CLUSTER])
-
-            def corrupt_member_checksum(path):
-                with zipfile.ZipFile(path) as source:
-                    files = {name: source.read(name) for name in source.namelist()}
-                index = json.loads(files["index.json"])
-                index["entries"][0]["sha256"] = "0" * 64
-                files["index.json"] = json.dumps(index, sort_keys=True).encode()
-                with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as destination:
-                    for name, content in files.items():
-                        destination.writestr(name, content)
-                return hashlib.sha256(path.read_bytes()).hexdigest()
-
             database_factory, sheet_factory = Mock(), Mock()
-            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
-                persist_cell_range(
-                    str(prepared_path), corrupt_member_checksum(prepared_path),
-                    database_password="synthetic", target=TARGET, session_factory=database_factory,
-                )
-            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            with self.assertRaisesRegex(ValueError, "start_date must be on or before end_date"):
                 publish_cell_range(
-                    str(handoff_path), corrupt_member_checksum(handoff_path),
-                    database_password="synthetic", credentials_info={"client_email": "writer@example.test"},
-                    target=TARGET, session_factory=database_factory, sheet_client_factory=sheet_factory,
+                    END, START, CLUSTER, database_password="synthetic",
+                    credentials_info={"client_email": "writer@example.test"},
+                    target=TARGET, session_factory=database_factory,
+                    sheet_client_factory=sheet_factory,
                 )
+            with self.assertRaisesRegex(ValueError, "unsupported cell bulk artifact kind"):
+                with bulk_pipeline._open_bulk_zip(prepared_path, "0" * 64, "handoff"):
+                    pass
             database_factory.assert_not_called()
             sheet_factory.assert_not_called()
 
-    def test_range_commit_rebinds_config_and_emits_full_history_handoff(self):
+    def test_range_commit_rebinds_config_and_validates_full_database_history(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, _, prepared_path, prepared = self._preprocess(root)
@@ -452,39 +398,29 @@ class CellBulkPipelineTests(unittest.TestCase):
             self.assertTrue(all(
                 item["raw_rows"][0]["Saldo Awal"] == 1000 for item in store.facts.values()
             ))
-            handoff_path = root / "cell_bulk_handoffs_v1.zip"
-            with zipfile.ZipFile(handoff_path) as archive:
-                index = json.loads(archive.read("index.json"))
-                self.assertEqual(index["end_date"], END)
-                handoff = json.loads(archive.read(index["entries"][0]["path"]))
-            self.assertEqual(handoff["submitted_report_date"], END)
-            self.assertEqual(handoff["first_report_date"], REPORTING_START_DATE)
-            self.assertEqual(handoff["last_report_date"], END)
-            self.assertEqual(len(handoff["selected"]), 4)
+            self.assertEqual(result["persisted_dates"], 2)
             self.assertEqual(result["committed_clusters"], 1)
+            self.assertFalse(list(root.glob("*handoff*")))
 
     def test_replaying_same_prepared_bundle_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, _, prepared_path, prepared = self._preprocess(root)
             store = MemoryCellStore()
-            first_handoff = root / "first-handoff.zip"
-            second_handoff = root / "second-handoff.zip"
-
-            self._persist(prepared_path, prepared, store, output_path=first_handoff)
+            self._persist(prepared_path, prepared, store)
             original_facts = deepcopy(store.facts)
             original_sources = deepcopy(store.sources)
             original_configurations = deepcopy(store.configurations)
             original_dirty = set(store.dirty)
 
-            result = self._persist(prepared_path, prepared, store, output_path=second_handoff)
+            result = self._persist(prepared_path, prepared, store)
 
             self.assertEqual(store.facts, original_facts)
             self.assertEqual(store.sources, original_sources)
             self.assertEqual(store.configurations, original_configurations)
             self.assertEqual(store.dirty, original_dirty)
             self.assertEqual(result["status"], "PERSISTED")
-            self.assertTrue(second_handoff.exists())
+            self.assertEqual(result["persisted_dates"], 2)
 
     def test_all_date_cohorts_rollback_together_when_one_commit_fails(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -492,14 +428,12 @@ class CellBulkPipelineTests(unittest.TestCase):
             _, _, prepared_path, prepared = self._preprocess(root)
             store = MemoryCellStore()
             store.fail_on_commit = 2
-            output = root / "must-not-exist.zip"
             with self.assertRaisesRegex(RuntimeError, "injected date-cohort"):
-                self._persist(prepared_path, prepared, store, output_path=output)
+                self._persist(prepared_path, prepared, store)
             self.assertEqual(store.facts, {})
             self.assertEqual(store.sources, {})
             self.assertEqual(store.configurations, {})
             self.assertEqual(store.commits, [])
-            self.assertFalse(output.exists())
 
     def test_overlapping_extension_and_single_date_correction_use_stored_history(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -510,17 +444,14 @@ class CellBulkPipelineTests(unittest.TestCase):
                 source, digest = _write_source_bulk(root, start, end, credit=credit)
                 prepared_path = root / "cell_bulk_prepared_v1.zip"
                 prepared = preprocess_cell_range(str(source), digest, start, end, CLUSTER, str(prepared_path))
-                self._persist(prepared_path, prepared, store)
-                with zipfile.ZipFile(root / "cell_bulk_handoffs_v1.zip") as archive:
-                    index = json.loads(archive.read("index.json"))
-                    return json.loads(archive.read(index["entries"][0]["path"]))
+                return self._persist(prepared_path, prepared, store)
 
             process(START, "2026-10-10")
             earlier = {key: item["calculation_id"] for key, item in store.facts.items() if key[0] < "2026-10-10"}
-            handoff = process("2026-10-10", "2026-10-15", credit=200)
+            persisted = process("2026-10-10", "2026-10-15", credit=200)
             self.assertEqual(len(store.facts), 15 * len(account_settings(CLUSTER)[1]))
-            self.assertEqual(handoff["first_report_date"], START)
-            self.assertEqual(handoff["last_report_date"], "2026-10-15")
+            self.assertEqual(persisted["start_date"], "2026-10-10")
+            self.assertEqual(persisted["end_date"], "2026-10-15")
             for key, digest in earlier.items():
                 self.assertEqual(store.facts[key]["calculation_id"], digest)
             self.assertEqual(store.facts[("2026-10-10", "412111")]["raw_rows"][0]["Kredit"], 200)
@@ -529,9 +460,9 @@ class CellBulkPipelineTests(unittest.TestCase):
             before = deepcopy(store.facts)
             config = report_config(CLUSTER, START)
             report_before = build_cluster_report(config, list(before.values()), "2026-10-20")
-            handoff = process("2026-10-19", "2026-10-19", credit=350)
-            self.assertEqual(handoff["submitted_report_date"], "2026-10-19")
-            self.assertEqual(handoff["last_report_date"], "2026-10-20")
+            persisted = process("2026-10-19", "2026-10-19", credit=350)
+            self.assertEqual(persisted["end_date"], "2026-10-19")
+            self.assertEqual(persisted["persisted_dates"], 1)
             self.assertEqual(len(store.facts), 20 * len(config.cells))
             for key, item in before.items():
                 if key[0] != "2026-10-19":
@@ -540,9 +471,9 @@ class CellBulkPipelineTests(unittest.TestCase):
             self.assertEqual(report_after["days"][-1]["combined"]["opening_saldo"] -
                              report_before["days"][-1]["combined"]["opening_saldo"], 500)
             before_range = deepcopy(store.facts)
-            handoff = process("2026-10-10", "2026-10-15", credit=250)
-            self.assertEqual(handoff["submitted_report_date"], "2026-10-15")
-            self.assertEqual(handoff["last_report_date"], "2026-10-20")
+            persisted = process("2026-10-10", "2026-10-15", credit=250)
+            self.assertEqual(persisted["end_date"], "2026-10-15")
+            self.assertEqual(persisted["persisted_dates"], 6)
             self.assertEqual(len(store.facts), 20 * len(config.cells))
             for key, item in before_range.items():
                 if not "2026-10-10" <= key[0] <= "2026-10-15":
@@ -589,87 +520,75 @@ class CellBulkPipelineTests(unittest.TestCase):
             self.assertEqual(result["status"], "DRY_RUN")
             session_factory.assert_not_called()
 
-            store = MemoryCellStore()
-            persisted = self._persist(prepared_path, prepared, store)
-            handoffs = root / "cell_bulk_handoffs_v1.zip"
             database_factory = Mock()
             published = publish_cell_range(
-                str(handoffs), persisted["handoff_bundle_sha256"],
+                START, END, CLUSTER,
                 database_password=None, credentials_info=None, dry_run=True,
                 session_factory=database_factory, sheet_client_factory=sheet_factory,
             )
             self.assertEqual(published["status"], "DRY_RUN")
+            self.assertEqual(published["publications"], 2)
             database_factory.assert_not_called()
             sheet_factory.assert_not_called()
 
-    def test_publisher_runs_once_per_cluster_and_shares_the_paced_sheet_client(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            handoffs, digest = _make_handoff_bundle(root)
-            sheet_factory = Mock()
-            database_factory = Mock()
-            clients = []
+    def test_publisher_writes_each_date_block_sequentially_with_one_shared_client(self):
+        sheet_factory = Mock()
+        database_factory = Mock()
+        clients = []
 
-            def fake_publish(path, sha256, **kwargs):
-                clients.append(kwargs["sheet_client_factory"](
-                    kwargs["credentials_info"], include_drive_file=True,
-                ))
-                return {"status": "COMPLETE", "cluster_id": kwargs["cluster_id"]}
+        def fake_publish(day, cluster, **kwargs):
+            clients.append(kwargs["sheet_client_factory"](kwargs["credentials_info"]))
+            return {"status": "COMPLETE", "cluster_id": cluster,
+                    "report_date": day, "http_write_batches": 1}
 
-            with patch.object(bulk_pipeline, "validate_cell_bulk_sheet_range"), \
-                    patch.object(
-                        bulk_pipeline, "sheet_configuration",
-                        return_value=SimpleNamespace(writer_email="writer@example.test"),
-                    ), \
-                    patch.object(bulk_pipeline.daily, "publish_cell_sheets", side_effect=fake_publish) as publish:
-                result = publish_cell_range(
-                    str(handoffs), digest, database_password="synthetic",
-                    credentials_info={"client_email": "writer@example.test"}, target=TARGET,
-                    session_factory=database_factory, sheet_client_factory=sheet_factory,
-                    refresh_request_id="execution-123",
-                )
-            clusters = list(selected_clusters("ALL"))
-            self.assertEqual([call.kwargs["cluster_id"] for call in publish.call_args_list], clusters)
-            self.assertTrue(all(call.kwargs["refresh_request_id"] == "execution-123"
-                                for call in publish.call_args_list))
-            self.assertTrue(all(call.kwargs["publication_start_date"] == START
-                                for call in publish.call_args_list))
-            self.assertTrue(all(
-                call.kwargs["sheet_client_factory"] is publish.call_args_list[0].kwargs["sheet_client_factory"]
-                for call in publish.call_args_list
-            ))
-            sheet_factory.assert_called_once_with(
-                {"client_email": "writer@example.test"}, include_drive_file=True,
+        with patch.object(bulk_pipeline, "validate_cell_bulk_sheet_range"), \
+                patch.object(
+                    bulk_pipeline, "sheet_configuration",
+                    return_value=SimpleNamespace(writer_email="writer@example.test"),
+                ), \
+                patch.object(bulk_pipeline.daily, "publish_cell_sheets", side_effect=fake_publish) as publish:
+            result = publish_cell_range(
+                START, END, "ALL", database_password="synthetic",
+                credentials_info={"client_email": "writer@example.test"}, target=TARGET,
+                session_factory=database_factory, sheet_client_factory=sheet_factory,
             )
-            self.assertEqual(len(clients), len(clusters))
-            self.assertTrue(all(client is sheet_factory.return_value for client in clients))
-            self.assertEqual(result["status"], "COMPLETE")
-            self.assertEqual(len(result["publications"]), len(clusters))
+        clusters = list(selected_clusters("ALL"))
+        expected = [(cluster, day) for cluster in clusters for day in (START, END)]
+        actual = [(call.args[1], call.args[0]) for call in publish.call_args_list]
+        self.assertEqual(actual, expected)
+        self.assertTrue(all(
+            call.kwargs["sheet_client_factory"] is publish.call_args_list[0].kwargs["sheet_client_factory"]
+            for call in publish.call_args_list
+        ))
+        sheet_factory.assert_called_once_with(
+            {"client_email": "writer@example.test"},
+        )
+        self.assertEqual(len(clients), len(expected))
+        self.assertTrue(all(client is sheet_factory.return_value for client in clients))
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertEqual(result["publications"], len(expected))
 
-    def test_stale_or_unknown_cluster_publication_is_not_retried(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            handoffs, digest = _make_handoff_bundle(root)
-            calls = []
+    def test_bulk_publisher_stops_at_first_failed_date_block(self):
+        calls = []
 
-            def fake_publish(path, sha256, **kwargs):
-                calls.append(kwargs["cluster_id"])
-                if kwargs["cluster_id"] == "422140":
-                    raise RuntimeError("stale cell Sheet handoff: target has an ambiguous publication")
-                return {"status": "COMPLETE", "cluster_id": kwargs["cluster_id"]}
+        def fake_publish(day, cluster, **kwargs):
+            calls.append((cluster, day))
+            if cluster == "412110" and day == END:
+                raise RuntimeError("date block write failed")
+            return {"status": "COMPLETE"}
 
-            with patch.object(bulk_pipeline, "validate_cell_bulk_sheet_range"), \
-                    patch.object(
-                        bulk_pipeline, "sheet_configuration",
-                        return_value=SimpleNamespace(writer_email="writer@example.test"),
-                    ), \
-                    patch.object(bulk_pipeline.daily, "publish_cell_sheets", side_effect=fake_publish):
-                with self.assertRaisesRegex(RuntimeError, "stale cell Sheet handoff"):
-                    publish_cell_range(
-                        str(handoffs), digest, database_password="synthetic",
-                        credentials_info={"client_email": "writer@example.test"}, target=TARGET,
-                    )
-            self.assertEqual(calls, list(selected_clusters("ALL"))[:6])
+        with patch.object(bulk_pipeline, "validate_cell_bulk_sheet_range"), \
+                patch.object(
+                    bulk_pipeline, "sheet_configuration",
+                    return_value=SimpleNamespace(writer_email="writer@example.test"),
+                ), \
+                patch.object(bulk_pipeline.daily, "publish_cell_sheets", side_effect=fake_publish):
+            with self.assertRaisesRegex(RuntimeError, "date block write failed"):
+                publish_cell_range(
+                    START, END, "ALL", database_password="synthetic",
+                    credentials_info={"client_email": "writer@example.test"}, target=TARGET,
+                )
+        self.assertEqual(calls, [("412110", START), ("412110", END)])
 
     def test_bulk_target_preflight_rejects_cross_cluster_worksheet_id_collisions(self):
         accounts = sorted(OBSERVED_CELL_ROSTER)

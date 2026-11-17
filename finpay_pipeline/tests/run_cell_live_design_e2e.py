@@ -1,7 +1,6 @@
 """Explicitly invoked, fixed-scope real-source design test; never a scheduled job."""
 from __future__ import annotations
 
-import argparse
 import base64
 import contextlib
 import hashlib
@@ -82,8 +81,7 @@ def event(stage, **values):
 
 def code_hashes():
     root = Path(__file__).resolve().parents[1]
-    paths = [*root.glob("*.py"), root / "migrations/003_finpay_cell_reporting_v1.sql", Path(__file__),
-             root / "tests/cell_summary_oracle.py"]
+    paths = [*root.glob("*.py"), root / "migrations/003_finpay_cell_reporting_v1.sql", Path(__file__)]
     return {str(path.relative_to(root)): sha(path) for path in paths}
 
 
@@ -701,41 +699,9 @@ def refresh_existing(root, expected, credential, receipt_sha256, failed_sha256, 
 
 
 def main():
-    os.umask(0o077)
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("prepare", "acquire", "publish", "resume", "refresh"))
-    parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--configuration-sha256")
-    parser.add_argument("--source-receipt-sha256")
-    parser.add_argument("--failed-attempt-sha256")
-    parser.add_argument("--recovery-outcome-sha256")
-    parser.add_argument("--credential-file", type=Path)
-    parser.add_argument("--portal-secret-file", type=Path)
-    args = parser.parse_args()
-    try:
-        if args.phase == "prepare":
-            prepare(args.root, args.credential_file)
-        elif args.phase == "acquire":
-            acquire(args.root, args.configuration_sha256, args.portal_secret_file)
-        elif args.phase == "publish":
-            publish(args.root, args.configuration_sha256, args.credential_file, args.source_receipt_sha256)
-        elif args.phase == "resume":
-            resume(args.root, args.configuration_sha256, args.credential_file, args.source_receipt_sha256, args.failed_attempt_sha256)
-        else:
-            refresh_existing(args.root, args.configuration_sha256, args.credential_file,
-                args.source_receipt_sha256, args.failed_attempt_sha256, args.recovery_outcome_sha256)
-    except Exception as exc:
-        path = args.root / "result.json"
-        if path.exists():
-            result = json.loads(path.read_text())
-            if result["status"] in ({"REFRESHING"} if args.phase in ("resume", "refresh") else
-                                    {{"acquire": "ACQUIRING", "publish": "PUBLISHING"}.get(args.phase)}):
-                result.update(status="FAILED", failed_phase=args.phase, error_class=type(exc).__name__)
-                response = getattr(exc, "response", None)
-                if response is not None:
-                    result["http_status"] = response.status_code
-                dump(path, result)
-        raise RuntimeError(f"{args.phase} stopped ({type(exc).__name__}); preserve state, no blind publish retry") from None
+    raise RuntimeError(
+        "legacy stateful live E2E runner is retired; no current live-write authorization is implied"
+    )
 
 
 if __name__ == "__main__":

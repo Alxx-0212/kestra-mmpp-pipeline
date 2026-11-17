@@ -10,24 +10,25 @@ import os
 import re
 import time
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 
 from requests.adapters import HTTPAdapter
 
-from .cell_calculation import CellReportConfig, build_cluster_report, calculate_cell_day, recalculate_stale_history
+from .cell_calculation import CellReportConfig, build_cluster_report, calculate_cell_day
 from .cell_contracts import (
-    MAX_CELL_ARTIFACT_BYTES, OBSERVED_CELL_ROSTER, configured_cells,
+    MAX_CELL_ARTIFACT_BYTES, OBSERVED_CELL_ROSTER, business_date, configured_cells,
     fingerprint, read_bounded_bytes as _bounded_bytes, sha256_file_bounded, validate_complete_manifest,
 )
 from .cell_database import CellDatabaseTarget, cell_publication_session
 from .cell_detail_sheets import build_cell_detail_history
 from .cell_invoice_sheets import build_cell_invoice_matrix
 from .cell_publication import (
-    CellSheetTarget, CellWorksheetTarget, ExistingSheetAdapter, publish_cell_cluster,
+    CellSheetTarget, CellWorksheetTarget, publish_cell_date_blocks,
 )
 from .cell_publication_v2 import (
-    bind_cell_style_contract, build_cell_cluster_matrices_v2, preflight_cell_cluster_v2, cell_worksheet_title,
-    publish_cell_cluster_v2, validate_output_targets,
+    bind_cell_style_contract, build_cell_cluster_matrices_v2, cell_worksheet_title,
+    validate_output_targets,
 )
 from .cell_sheets import render_cell_matrix
 from .digipos_cells import scrape_cell_roster
@@ -307,7 +308,7 @@ def prepare_cell_bundle_v2(bundle_path, configuration_path, expected_configurati
     return _prepare_cell_bundle_with_configs(bundle_path, expected_bundle_sha256, runtime, configs)
 
 
-def make_cell_sheet_client(credentials_info, *, include_drive_file=False):
+def make_cell_sheet_client(credentials_info):
     """A paced no-write-retry client; legacy retry policy is not reused."""
     import gspread
     from google.auth.transport.requests import AuthorizedSession
@@ -317,8 +318,6 @@ def make_cell_sheet_client(credentials_info, *, include_drive_file=False):
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.metadata.readonly",
     ]
-    if include_drive_file:
-        scopes.append("https://www.googleapis.com/auth/drive.file")
     credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
     session = AuthorizedSession(
         credentials,
@@ -343,20 +342,16 @@ def _account_preflight(store, config, batch, report_date, configuration_only):
         expected = {(item["identity"]["cell_code"], item["generation_id"]) for item in batch}
         if actual != expected:
             raise ValueError("configuration-only operation requires existing identical source generations")
-    history = recalculate_stale_history(store, config, through, submitted_dates={report_date})
     identities = {cell.cell_code: cell.to_dict() for cell in config.cells}
     facts = {(str(row["report_date"]), row["cell_code"]): {
         "identity": identities[row["cell_code"]], "report_date": str(row["report_date"]),
         "generation_id": row["generation_id"], "calculation_id": row["calculation_id"],
         "config_id": row["config_id"], "calculation": row["result"],
     } for row in current}
-    for cohort in [*history, batch]:
-        for item in cohort:
-            facts[(item["report_date"], item["identity"]["cell_code"])] = item
-    # Full coverage and numeric/formula inputs are pure-validated for every
-    # account before the request's first mutation; manual inputs are read later.
+    for item in batch:
+        facts[(item["report_date"], item["identity"]["cell_code"])] = item
     render_cell_matrix(build_cluster_report(config, list(facts.values()), through), dummy=True)
-    return baseline, history
+    return baseline
 
 
 def run_cell_reporting(bundle_path, configuration_path, expected_configuration_sha256,
@@ -412,7 +407,7 @@ def run_cell_reporting(bundle_path, configuration_path, expected_configuration_s
             raise ValueError("Google credential identity differs from worksheet writer")
         if any(item.writer_email != credentials_info.get("client_email") for item in targets.values()):
             raise ValueError("every worksheet writer must match the supplied Google identity")
-    client = None
+    client = sheet_client_factory(credentials_info) if write_gsheet else None
     preflight = {}
     for account, config in sorted(configs.items()):
         sheet = targets.get(account)
@@ -421,8 +416,26 @@ def run_cell_reporting(bundle_path, configuration_path, expected_configuration_s
             password=database_password, approved_sheet_ids={sheet.spreadsheet_id} if sheet else set(),
             write_gsheet=write_gsheet,
         ) as store:
-            preflight[account], _ = _account_preflight(
+            preflight[account] = _account_preflight(
                 store, config, batches[account], manifest["report_date"], configuration_only,
+            )
+    worksheet_context = {}
+    if write_gsheet:
+        for account, sheet in targets.items():
+            spreadsheet = client.open_by_key(sheet.spreadsheet_id)
+            metadata = _read_with_retry(lambda: spreadsheet.fetch_sheet_metadata(params={
+                "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                           "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
+                           "developerMetadata(metadataId,metadataKey,location(sheetId))"),
+            }))
+            properties = next((item.get("properties", {}) for item in metadata.get("sheets", [])
+                               if item.get("properties", {}).get("sheetId") == sheet.worksheet_id), None)
+            if metadata.get("spreadsheetId") != sheet.spreadsheet_id or properties is None:
+                raise FileNotFoundError("configured cell worksheet does not exist in the target workbook")
+            worksheet_context[account] = (
+                spreadsheet, metadata,
+                CellWorksheetTarget("summary", sheet.spreadsheet_id, sheet.worksheet_id,
+                                    properties["title"], sheet.writer_email, sheet.finance_emails),
             )
     for account, config in sorted(configs.items()):
         sheet = targets.get(account)
@@ -431,35 +444,28 @@ def run_cell_reporting(bundle_path, configuration_path, expected_configuration_s
             password=database_password, approved_sheet_ids={sheet.spreadsheet_id} if sheet else set(),
             write_gsheet=write_gsheet,
         ) as store:
-            current_token, history = _account_preflight(
+            current_token = _account_preflight(
                 store, config, batches[account], manifest["report_date"], configuration_only,
             )
             if current_token != preflight[account]:
                 raise ValueError("account history changed after global preflight; retry with current facts")
+            if not configuration_only:
+                with store.connection.transaction():
+                    store.commit_cluster_day(batches[account], config.cells)
             if write_gsheet:
-                if client is None:
-                    client = sheet_client_factory(credentials_info)
-                spreadsheet = client.open_by_key(sheet.spreadsheet_id)
-                worksheet = spreadsheet.get_worksheet_by_id(sheet.worksheet_id)
-                result = publish_cell_cluster(
-                    store, sheet, allowed, ExistingSheetAdapter(spreadsheet, worksheet),
-                    batches[account], config, changed_dates=[manifest["report_date"]],
-                    additional_batches=history,
-                    configuration_only=configuration_only,
+                spreadsheet, metadata, target_sheet = worksheet_context[account]
+                facts, through = _current_cell_facts(store, config, manifest["report_date"])
+                report_matrix = render_cell_matrix(
+                    build_cluster_report(config, facts, through, first_report_date=config.first_report_date),
+                    dummy=False, presentation_version=3,
+                )
+                result = publish_cell_date_blocks(
+                    spreadsheet, {"summary": target_sheet}, {"summary": report_matrix},
+                    manifest["report_date"], metadata=metadata,
                 )
             else:
-                def render_database(session):
-                    through = max(manifest["report_date"], session.latest_report_date() or manifest["report_date"])
-                    current = session.current_results(config.first_report_date, through)
-                    identities = {cell.cell_code: cell.to_dict() for cell in config.cells}
-                    facts = [{"identity": identities[row["cell_code"]],
-                              "report_date": str(row["report_date"]), "generation_id": row["generation_id"],
-                              "calculation_id": row["calculation_id"], "config_id": row["config_id"],
-                              "calculation": row["result"]} for row in current]
-                    report = build_cluster_report(config, facts, through)
-                    return {"start": config.first_report_date, "end": through, "snapshot": {"report": report}}
-                result = store.commit_and_stage(batches[account], config.cells, render_database,
-                                                write_gsheet=False, additional_batches=history)
+                result = {"status": "PERSISTED", "report_date": manifest["report_date"],
+                          "selected_cells": len(batches[account])}
             summary["accounts"].append({"account": account, "cells": len(batches[account]), **result})
     return summary
 
@@ -470,6 +476,21 @@ def _v2_fact_rows(config, rows):
              "generation_id": row["generation_id"], "calculation_id": row["calculation_id"],
              "config_id": row["config_id"], "rules_version": config.rules_version,
              "calculation": row["result"]} for row in rows]
+
+
+def _current_cell_facts(store, config, report_date):
+    latest = store.latest_report_date()
+    if latest is None:
+        raise ValueError("no persisted cell data is available for the report date")
+    latest = str(latest)
+    next_date = (business_date(report_date) + timedelta(days=1)).isoformat()
+    through = next_date if latest >= next_date else report_date
+    facts = _v2_fact_rows(config, store.current_results(config.first_report_date, through))
+    actual = {item["identity"]["cell_code"] for item in facts
+              if item["report_date"] == report_date}
+    if actual != {cell.cell_code for cell in config.cells}:
+        raise ValueError("persisted report date does not contain the complete cell roster")
+    return facts, through
 
 
 def run_cell_reporting_v2(bundle_path, configuration_path, expected_configuration_sha256,
@@ -536,90 +557,71 @@ def run_cell_reporting_v2(bundle_path, configuration_path, expected_configuratio
                for account in targets.values() for item in account.values()):
             raise ValueError("v2 worksheet writer differs from pinned config")
 
-    # Load and validate every cluster's complete history before opening a write
-    # session or issuing any Google mutation for the run.
+    # Validate every account's date cohort before the first DB or Sheet write.
     preflight = {}
     for account, config in sorted(configs.items()):
         with session_factory(target, {target}, config.account[:-2], spreadsheet_id,
                              password=database_password,
                              approved_sheet_ids={spreadsheet_id} if write_gsheet else set(),
                              write_gsheet=write_gsheet) as store:
-            baseline, history = _account_preflight(
+            baseline = _account_preflight(
                 store, config, batches[account], manifest["report_date"], configuration_only,
             )
-            through = max(manifest["report_date"], store.latest_report_date() or manifest["report_date"])
+            latest = str(store.latest_report_date() or manifest["report_date"])
+            next_date = (business_date(manifest["report_date"]) + timedelta(days=1)).isoformat()
+            through = next_date if latest >= next_date else manifest["report_date"]
             facts = _v2_fact_rows(config, store.current_results(config.first_report_date, through))
             keyed = {(item["report_date"], item["identity"]["cell_code"]): item for item in facts}
-            for cohort in [*history, batches[account]]:
-                for item in cohort:
-                    keyed[(item["report_date"], item["identity"]["cell_code"])] = item
+            for item in batches[account]:
+                keyed[(item["report_date"], item["identity"]["cell_code"])] = item
             complete_facts = list(keyed.values())
-            # Validate every output projection at the global barrier. The summary
-            # uses current manual inputs later under the publication guard.
             build_cell_cluster_matrices_v2(
-                config, complete_facts, max(item["report_date"] for item in complete_facts),
-                dummy=True,
+                config, complete_facts, through, dummy=True,
+                first_report_date=config.first_report_date,
             )
             preflight[account] = baseline
 
     workbook = None
+    workbook_metadata = None
     if write_gsheet:
         workbook = sheet_client_factory(credentials_info).open_by_key(spreadsheet_id)
-        for account, config in sorted(configs.items()):
-            with session_factory(target, approved_db, account[:-2], spreadsheet_id,
-                                 password=database_password, approved_sheet_ids={spreadsheet_id},
-                                 write_gsheet=True) as store:
-                adapters = {role: ExistingSheetAdapter(workbook,
-                    workbook.get_worksheet_by_id(item.worksheet_id)) for role, item in targets[account].items()}
-                preflight_cell_cluster_v2(store, spreadsheet_id, targets[account], adapters, account[:-2],
-                                         allow_legacy_migration=configuration_only)
+        workbook_metadata = workbook.fetch_sheet_metadata(params={
+            "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                       "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
+                       "developerMetadata(metadataId,metadataKey,location(sheetId))"),
+        })
+        sheet_metadata = {item.get("properties", {}).get("sheetId"): item.get("properties", {})
+                          for item in workbook_metadata.get("sheets", [])}
+        for role_targets in targets.values():
+            for target_sheet in role_targets.values():
+                if sheet_metadata.get(target_sheet.worksheet_id, {}).get("title") != target_sheet.title:
+                    raise FileNotFoundError("configured v2 worksheet ID/title is not present")
 
     for account, config in sorted(configs.items()):
         with session_factory(target, {target}, config.account[:-2], spreadsheet_id,
                              password=database_password,
                              approved_sheet_ids={spreadsheet_id} if write_gsheet else set(),
                              write_gsheet=write_gsheet) as store:
-            baseline, history = _account_preflight(
+            baseline = _account_preflight(
                 store, config, batches[account], manifest["report_date"], configuration_only,
             )
             if baseline != preflight[account]:
-                raise ValueError("v2 cluster state changed after global no-write preflight")
+                raise ValueError("v2 source generations changed after global no-write preflight")
+            if not configuration_only:
+                with store.connection.transaction():
+                    store.commit_cluster_day(batches[account], config.cells)
             if write_gsheet:
-                adapters = {role: ExistingSheetAdapter(
-                    workbook, workbook.get_worksheet_by_id(item.worksheet_id),
-                ) for role, item in targets[account].items()}
-                result_for_cluster = publish_cell_cluster_v2(
-                    store, spreadsheet_id, targets[account], adapters, batches[account], config,
-                    changed_dates=[manifest["report_date"]], additional_batches=history,
-                    configuration_only=configuration_only,
+                facts, through = _current_cell_facts(store, config, manifest["report_date"])
+                matrices = build_cell_cluster_matrices_v2(
+                    config, facts, through, first_report_date=config.first_report_date,
+                )
+                result_for_cluster = publish_cell_date_blocks(
+                    workbook, targets[account], matrices, manifest["report_date"],
+                    metadata=workbook_metadata,
                 )
             else:
-                def render_db(session):
-                    through = max(manifest["report_date"], session.latest_report_date() or manifest["report_date"])
-                    current = _v2_fact_rows(config, session.current_results(config.first_report_date, through))
-                    keyed = {(item["report_date"], item["identity"]["cell_code"]): item for item in current}
-                    for cohort in [*history, batches[account]]:
-                        for item in cohort:
-                            keyed[(item["report_date"], item["identity"]["cell_code"])] = item
-                    facts = list(keyed.values())
-                    matrices = build_cell_cluster_matrices_v2(config, facts,
-                                                              max(item["report_date"] for item in facts))
-                    worksheets = {role: {"worksheet_id": targets[account][role].worksheet_id,
-                        "title": targets[account][role].title,
-                        "values": _v2_publication_values(role, matrix), "matrix": matrix}
-                        for role, matrix in matrices.items()}
-                    source = {}
-                    for item in facts:
-                        source.setdefault(item["report_date"], []).append(item["calculation_id"])
-                    return {"start": config.first_report_date, "end": max(source),
-                        "snapshot": {"schema_version": 2, "spreadsheet_id": spreadsheet_id,
-                                     "worksheets": worksheets,
-                                     "source_calculations": {key: fingerprint(sorted(value))
-                                         for key, value in source.items()}}}
-                result_for_cluster = store.commit_and_stage(
-                    batches[account], config.cells, render_db, write_gsheet=False,
-                    additional_batches=history,
-                )
+                result_for_cluster = {"report_date": manifest["report_date"],
+                                      "persisted_cells": len(batches[account])}
             result["accounts"].append({"account": account, "cells": len(batches[account]),
                                        **result_for_cluster})
     return result

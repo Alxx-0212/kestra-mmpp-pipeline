@@ -82,16 +82,8 @@ def _template(day: dict) -> list[tuple[str, str, str]]:
     return rows
 
 
-def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
-                        reset_dates: set[str] | None = None, dummy: bool = False,
-                        bank_from_credit: bool = False) -> dict:
-    """Render aligned dates and relative cell formulas; only cell bank inputs unlock.
-
-    manual_values keys are (report_date, cell_code), values integer rupiah.
-    Only reset_dates lose those manual values; all other dates retain them.
-    """
-    manual_values = manual_values or {}
-    reset_dates = reset_dates or set()
+def _render_wide_matrix(report: dict, *, dummy: bool = False) -> dict:
+    """Render DB-derived date blocks with formulas and no editable cells."""
     config = report["configuration"]
     codes = [cell["cell_code"] for cell in config["cells"]]
     if not 1 <= len(codes) <= 3 or len(set(codes)) != len(codes):
@@ -108,18 +100,12 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
         expected_day += timedelta(days=1)
     if days[-1]["report_date"] != report["through_date"]:
         raise ValueError("matrix coverage end differs from report through_date")
-    covered = {day["report_date"] for day in days}
-    if not reset_dates <= covered:
-        raise ValueError("manual resets outside report coverage")
-    if any(key[0] not in covered or key[1] not in codes or type(value) is not int
-           for key, value in manual_values.items()):
-        raise ValueError("manual MANDIRI values must be scoped integer inputs")
     offsets = BLOCK_OFFSETS[:len(codes) + 1]
     width = offsets[-1] + 6
     matrix = [[""] * width for _ in range(3)]
     preview = [[""] * width for _ in range(3)]
     row_keys = ["HEADERS", "TITLE", "OPENING"]
-    edited_inputs, reset_audit, ranges = [], [], []
+    ranges = []
     positions = {}
     next_row = 4
     for day in days:
@@ -148,11 +134,10 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
         matrix[2][5] = "=SUM(" + ",".join(f"{column_letter(offset + 6)}3" for offset in offsets[1:]) + ")"
     else:
         matrix[2][2] = "SALDO UNVERIFIED: PRIOR HISTORY NOT REQUIRED FOR DAILY DATA"
-    prior_saldo_rows = {code: 3 for code in codes}
     prior_running = {code: 0 for code in codes}
     prior_bank = {code: 0 for code in codes}
-    prior_running_rows = {}
-    prior_bank_rows = {}
+    opening_saldo_by_date = {}
+    opening_cash_by_date = {}
 
     for day_index, day in enumerate(days):
         date_string = day["report_date"]
@@ -161,6 +146,17 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
         cells = {cell["cell_code"]: cell for cell in day["cells"]}
         if set(cells) != set(codes):
             raise ValueError("matrix day has missing or unknown cells")
+        opening_saldo_by_date[date_string] = {
+            code: cells[code]["opening_saldo"] for code in codes
+        }
+        opening_cash_by_date[date_string] = {
+            code: {"running": prior_running[code], "bank": prior_bank[code]} for code in codes
+        }
+        date_saldo_rows = {code: None for code in codes}
+        previous_date = days[day_index - 1]["report_date"] if day_index else None
+        previous_saldo_label = (
+            detail_categories(previous_date)[-1][0].upper() if previous_date is not None else None
+        )
         states = {}
         for code in codes:
             cell = cells[code]
@@ -191,8 +187,21 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
                             raise ValueError("running saldo intermediate exceeds safe spreadsheet arithmetic")
                         state["saldo"] += debit - credit
                         saldo = state["saldo"]
-                        saldo_formula = f"={saldo_col}{prior_saldo_rows[code]}+{debit_col}{row_number}-{credit_col}{row_number}"
-                        prior_saldo_rows[code] = row_number
+                        if date_saldo_rows[code] is None:
+                            if previous_date is None:
+                                previous_saldo = str(cell["opening_saldo"])
+                            else:
+                                label = previous_saldo_label.replace('"', '""')
+                                previous_saldo = (
+                                    f'IF(COUNTIFS($A:$A,"{previous_date}",$C:$C,"{label}")=1,'
+                                    f'SUMIFS({saldo_col}:{saldo_col},$A:$A,"{previous_date}",'
+                                    f'$C:$C,"{label}"),{cell["opening_saldo"]})'
+                                )
+                            saldo_formula = f"={previous_saldo}+{debit_col}{row_number}-{credit_col}{row_number}"
+                        else:
+                            saldo_formula = (f"={saldo_col}{date_saldo_rows[code]}+"
+                                             f"{debit_col}{row_number}-{credit_col}{row_number}")
+                        date_saldo_rows[code] = row_number
                 elif key == "purchase_count":
                     debit, credit = cell["measures"].get("PEMBELIAN RECHARGE OUT CLUSTER", {}).get("count", 0), ""
                 elif key == "expected_fee":
@@ -218,40 +227,36 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
                     total = next(item["signed"] for item in cell["mandiri"] if item["label"] == "Total")
                     debit = total if isinstance(prior_bank[code], int) and prior_bank[code] > 0 else prior_running[code] + total
                     credit = ""
-                    if code in prior_running_rows:
-                        prev_bank = f"{debit_col}{prior_bank_rows[code]}"
+                    current_net = f"{debit_col}{day_positions['net:Total']}"
+                    if previous_date is not None:
+                        previous_bank_row = f'COUNTIFS($A:$A,"{previous_date}",$C:$C,"MANDIRI")'
+                        previous_bank = f'SUMIFS({debit_col}:{debit_col},$A:$A,"{previous_date}",$C:$C,"MANDIRI")'
+                        previous_running_row = f'COUNTIFS($A:$A,"{previous_date}",$C:$C,"RUNNING TOTAL")'
+                        previous_running = f'SUMIFS({debit_col}:{debit_col},$A:$A,"{previous_date}",$C:$C,"RUNNING TOTAL")'
+                        fallback = (current_net if prior_bank[code] > 0
+                                    else f"{prior_running[code]}+{current_net}")
                         debit_formula = (
-                            f"=IF(AND(ISNUMBER({prev_bank}),{prev_bank}>0),"
-                            f"{debit_col}{day_positions['net:Total']},"
-                            f"{debit_col}{prior_running_rows[code]}+{debit_col}{day_positions['net:Total']})"
+                            f'=IF({previous_bank_row}=1,IF({previous_bank}>0,{current_net},'
+                            f'IF({previous_running_row}=1,{previous_running}+{current_net},{fallback})),{fallback})'
                         )
                     else:
-                        debit_formula = f"={debit_col}{day_positions['net:Total']}"
+                        debit_formula = f"={current_net}"
                     state["running"] = debit
                 elif key == "cash:MANDIRI":
                     credit = ""
-                    default = "PENDING NEXT DAY"
-                    if day_index + 1 < len(days):
-                        following = days[day_index + 1]
-                        next_cell = next(item for item in following["cells"] if item["cell_code"] == code)
-                        source = "kredit" if bank_from_credit else "debet"
-                        default = next_cell["measures"].get("CASHOUT APOLLO", {}).get(source, 0)
-                        bank_source_col = credit_col if bank_from_credit else debit_col
-                        debit_formula = f"={bank_source_col}{positions[following['report_date']]['CASHOUT APOLLO']}"
-                    automatic_default = debit_formula or default
-                    input_key = (date_string, code)
-                    if input_key in manual_values and date_string not in reset_dates:
-                        debit, debit_formula = manual_values[input_key], None
-                    else:
-                        debit = default
-                        if input_key in manual_values:
-                            reset_audit.append({"report_date": date_string, "cell_code": code,
-                                                "previous_value": manual_values[input_key],
-                                                "replacement_value": debit_formula or default})
+                    next_date = (business_date(date_string) + timedelta(days=1)).isoformat()
+                    following = next((item for item in days if item["report_date"] == next_date), None)
+                    next_cell = (next((item for item in following["cells"] if item["cell_code"] == code), None)
+                                 if following else None)
+                    default = (next_cell["measures"].get("CASHOUT APOLLO", {}).get("kredit", 0)
+                               if next_cell else "PENDING NEXT DAY")
+                    debit_formula = (
+                        f'=IF(COUNTIFS($A:$A,"{next_date}",$C:$C,"CASHOUT APOLLO")=1,'
+                        f'SUMIFS({credit_col}:{credit_col},$A:$A,"{next_date}",'
+                        f'$C:$C,"CASHOUT APOLLO"),"PENDING NEXT DAY")'
+                    )
+                    debit = default
                     state["bank"] = debit
-                    edited_inputs.append({"report_date": date_string, "cell_code": code,
-                                          "row": row_number, "column": offset + 4,
-                                           "default": automatic_default if bank_from_credit else debit_formula or default})
                 elif key == "cash:SELISIH":
                     bank = state["bank"]
                     debit = bank - state["running"] if isinstance(bank, int) and bank != 0 else ""
@@ -301,8 +306,6 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
             if balance_available and states[code]["saldo"] != cells[code]["closing_saldo"]:
                 raise ValueError("rendered cell closing balance differs from calculated result")
             prior_running[code], prior_bank[code] = states[code]["running"], states[code]["bank"]
-            prior_running_rows[code] = day_positions["cash:RUNNING TOTAL"]
-            prior_bank_rows[code] = day_positions["cash:MANDIRI"]
         ranges.append({"report_date": date_string, "start_row": start_row, "end_row": len(matrix)})
     if any(type(value) is int and abs(value) > MAX_EXACT_RUPIAH for row in preview for value in row):
         raise ValueError("report amount exceeds exact spreadsheet integer precision")
@@ -315,8 +318,10 @@ def _render_wide_matrix(report: dict, *, manual_values: dict | None = None,
                     "cell_code": None if index == 0 else codes[index - 1],
                     "start_column": offset + 1, "end_column": offset + 6}
                    for index, offset in enumerate(offsets)],
-        "editable_inputs": edited_inputs, "manual_reset_audit": reset_audit,
+        "editable_inputs": [], "manual_reset_audit": [],
         "date_ranges": ranges,
+        "opening_saldo_by_date": opening_saldo_by_date,
+        "opening_cash_by_date": opening_cash_by_date,
     }
 
 
@@ -327,8 +332,9 @@ def render_cell_matrix(report: dict, *, manual_values=None, reset_dates=None, du
     Version 2 remains available to verify/migrate the already published test
     baseline. No source, category, date, or numeric calculation is changed here.
     """
-    wide = _render_wide_matrix(report, manual_values=manual_values, reset_dates=reset_dates, dummy=dummy,
-                               bank_from_credit=presentation_version == 5)
+    if manual_values or reset_dates:
+        raise ValueError("manual MANDIRI Sheet inputs and reset tracking are no longer supported")
+    wide = _render_wide_matrix(report, dummy=dummy)
     if presentation_version == 2:
         return wide
     if presentation_version not in (3, 4, 5):
@@ -348,10 +354,21 @@ def render_cell_matrix(report: dict, *, manual_values=None, reset_dates=None, du
     def remap(value):
         if not isinstance(value, str) or not value.startswith("="):
             return value
+
+        def column_range(match):
+            left, right = match[2], match[4]
+            if left not in letters or right not in letters:
+                raise ValueError("formula references a removed detail/spacer column")
+            return match[1] + letters[left] + ":" + match[3] + letters[right]
+
         def reference(match):
             if match[2] not in letters:
                 raise ValueError("formula references a removed detail/spacer column")
             return match[1] + letters[match[2]] + match[3] + match[4]
+        value = re.sub(
+            r"(?<![A-Za-z0-9_])(\$?)([A-Z]{1,3}):(\$?)([A-Z]{1,3})(?![A-Za-z0-9_])",
+            column_range, value,
+        )
         return re.sub(r"(?<![A-Za-z0-9_])(\$?)([A-Z]{1,3})(\$?)(\d+)", reference, value)
 
     projected = {}
@@ -374,10 +391,7 @@ def render_cell_matrix(report: dict, *, manual_values=None, reset_dates=None, du
         **wide, **projected, "layout_version": presentation_version, "row_keys": ["TITLE", "HEADERS", *wide["row_keys"][2:]],
         "blocks": blocks, "shared_detail_columns": 3,
         "format_palette": REFERENCE_COLORS.copy(),
-        "editable_inputs": [{**entry, "column": columns[entry["column"]], "default": remap(entry["default"])}
-                            for entry in wide["editable_inputs"]],
-        "manual_reset_audit": [{**entry, "replacement_value": remap(entry["replacement_value"])}
-                               for entry in wide["manual_reset_audit"]],
+        "editable_inputs": [], "manual_reset_audit": [],
     }
 
 

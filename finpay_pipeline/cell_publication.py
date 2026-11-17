@@ -8,12 +8,13 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
 from .cell_calculation import build_cluster_report, recalculate_stale_history
-from .cell_contracts import fingerprint
+from .cell_contracts import business_date, fingerprint
 from .cell_database import validate_cluster_batch
 from .cell_sheets import (
     DESCRIPTION_WIDTH_PX, REFERENCE_COLORS, cell_grid_capacity, column_letter,
@@ -369,6 +370,777 @@ def matrix_write_requests(values, sheet_id, *, start_row=0, rows_per_request=250
     return requests
 
 
+def _legacy_sheet_report_date(value):
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        if 0 < value < 100000:
+            return (date(1899, 12, 30) + timedelta(days=int(value))).isoformat()
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        return business_date(text).isoformat()
+    except ValueError:
+        pass
+    for pattern in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _legacy_column_a_spans(rows, first_data_row):
+    spans = {}
+    for index in range(first_data_row, len(rows)):
+        row = rows[index]
+        day = _sheet_report_date(row[0] if row else None)
+        if day is None:
+            continue
+        if day in spans:
+            start, count = spans[day]
+            if index != start + count:
+                raise ValueError("REPORT DATE rows are split into multiple blocks")
+            spans[day] = (start, count + 1)
+        else:
+            spans[day] = (index, 1)
+    return spans
+
+
+def _legacy_matrix_date_block(role, matrix, report_date):
+    values = matrix.get("values", matrix.get("rows"))
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{role} output matrix is empty")
+    ranges = [item for item in matrix.get("date_ranges", [])
+              if _sheet_report_date(item.get("report_date")) == report_date]
+    if len(ranges) > 1:
+        raise ValueError(f"{role} matrix has duplicate date ranges")
+    if ranges:
+        area = ranges[0]
+        start = area["start_row"] - 1
+        rows = values[start:area["end_row"]]
+    else:
+        indexes = [index for index, row in enumerate(values)
+                   if row and _sheet_report_date(row[0]) == report_date]
+        if not indexes:
+            return [], None
+        if indexes != list(range(indexes[0], indexes[-1] + 1)):
+            raise ValueError(f"{role} date rows are not one contiguous block")
+        start = indexes[0]
+        rows = values[start:indexes[-1] + 1]
+    if any(not row or _sheet_report_date(row[0]) != report_date for row in rows):
+        raise ValueError(f"{role} date block lacks REPORT DATE values in column A")
+    width = len(values[0])
+    if any(len(row) != width for row in rows):
+        raise ValueError(f"{role} date block is not rectangular")
+    return [list(row) for row in rows], start
+
+
+def _legacy_shift_date_block_formulas(rows, source_start, target_start):
+    delta = target_start - source_start
+    if not delta:
+        return rows
+    reference = re.compile(r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3})(\$?)(\d+)")
+
+    def shift(value):
+        if not isinstance(value, str) or not value.startswith("="):
+            return value
+
+        def replace(match):
+            row = int(match.group(3))
+            if source_start < row <= source_start + len(rows):
+                return match.group(1) + match.group(2) + str(row + delta)
+            return match.group(0)
+
+        return reference.sub(replace, value)
+
+    return [[shift(value) for value in row] for row in rows]
+
+
+def _legacy_shift_format_request_rows(request, delta):
+    operation = next(iter(request))
+    if operation in ("repeatCell", "updateBorders"):
+        area = request[operation]["range"]
+        area["startRowIndex"] += delta
+        area["endRowIndex"] += delta
+    elif operation == "updateDimensionProperties":
+        area = request[operation]["range"]
+        if area.get("dimension") != "ROWS":
+            return None
+        area["startIndex"] += delta
+        area["endIndex"] += delta
+    elif operation == "autoResizeDimensions":
+        area = request[operation]["dimensions"]
+        if area.get("dimension") != "ROWS":
+            return None
+        area["startIndex"] += delta
+        area["endIndex"] += delta
+    else:
+        return None
+    return request
+
+
+def _legacy_display_only_sheet_requests(target, metadata, has_publication_marker):
+    writer = getattr(target, "writer_email", None)
+    if not writer:
+        raise ValueError("an explicit Sheet writer is required for display-only tabs")
+    sheet_id = target.worksheet_id
+    managed = [item for item in metadata.get("protectedRanges", [])
+               if item.get("description", "").startswith(MANAGED_PREFIX)]
+    computed = [item for item in managed if item.get("description") == MANAGED_PREFIX + "COMPUTED"]
+    requests = []
+    for item in managed:
+        description = item.get("description", "")
+        if description == MANAGED_PREFIX + "BANK INPUT" or description.startswith(GUARD_PREFIX):
+            requests.append({"deleteProtectedRange": {"protectedRangeId": item["protectedRangeId"]}})
+    protected = {
+        "range": {"sheetId": sheet_id},
+        "description": MANAGED_PREFIX + "COMPUTED",
+        "warningOnly": False,
+        "editors": {"users": [writer]},
+        "unprotectedRanges": [],
+    }
+    if computed:
+        current = computed[0]
+        if (current.get("range") != protected["range"]
+                or current.get("unprotectedRanges")
+                or current.get("warningOnly", False)
+                or current.get("editors", {}).get("users") != [writer]):
+            requests.append({"updateProtectedRange": {
+                "protectedRange": {"protectedRangeId": current["protectedRangeId"], **protected},
+                "fields": "range,description,warningOnly,editors,unprotectedRanges",
+            }})
+        requests.extend({"deleteProtectedRange": {"protectedRangeId": item["protectedRangeId"]}}
+                        for item in computed[1:])
+    else:
+        requests.append({"addProtectedRange": {"protectedRange": protected}})
+    if has_publication_marker:
+        requests.append({"updateSheetProperties": {
+            "properties": {"sheetId": sheet_id}, "fields": "tabColorStyle",
+        }})
+        requests.append({"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": 1},
+            "rows": [{"values": [{"note": ""}]}], "fields": "note",
+        }})
+    return requests
+
+
+def _publish_cell_date_blocks_legacy(spreadsheet, targets, matrices, report_date, *, rows_per_request=200,
+                                     metadata=None):
+    """Rewrite one DB-derived report date in existing worksheets without a Sheet snapshot."""
+    report_date = business_date(report_date).isoformat()
+    if not targets or set(targets) != set(matrices):
+        raise ValueError("date publication requires matching worksheet targets and matrices")
+    spreadsheet_id = getattr(spreadsheet, "id", None)
+    if not spreadsheet_id:
+        raise ValueError("an explicit existing spreadsheet is required")
+    if metadata is None:
+        metadata = _read_with_retry(lambda: spreadsheet.fetch_sheet_metadata(params={
+            "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                       "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
+                       "developerMetadata(metadataId,metadataKey,location(sheetId))"),
+        }))
+    if metadata.get("spreadsheetId") != spreadsheet_id:
+        raise ValueError("opened spreadsheet ID differs from configured target")
+    sheet_properties = {item.get("properties", {}).get("sheetId"): item
+                        for item in metadata.get("sheets", [])}
+    roles = list(targets)
+    titles = {}
+    for role in roles:
+        target = targets[role]
+        if target.spreadsheet_id != spreadsheet_id or target.worksheet_id not in sheet_properties:
+            raise ValueError(f"configured {role} worksheet is missing from the existing spreadsheet")
+        properties = sheet_properties[target.worksheet_id].get("properties", {})
+        if getattr(target, "title", None) and properties.get("title") != target.title:
+            raise ValueError(f"configured {role} worksheet ID/title mismatch")
+        titles[role] = properties["title"]
+
+    column_ranges = ["'" + titles[role].replace("'", "''") + "'!A:A" for role in roles]
+    column_result = _read_with_retry(lambda: spreadsheet.values_batch_get(
+        column_ranges, params={"valueRenderOption": "UNFORMATTED_VALUE", "majorDimension": "ROWS"},
+    )).get("valueRanges", [])
+    if len(column_result) != len(roles):
+        raise RuntimeError("Google Sheets returned an incomplete REPORT DATE column batch")
+
+    plans = {}
+    for role, column_range in zip(roles, column_result):
+        matrix = matrices[role]
+        rows, source_start = _matrix_date_block(role, matrix, report_date)
+        date_ranges = matrix.get("date_ranges", [])
+        first_data_row = (min(item["start_row"] for item in date_ranges) - 1
+                          if date_ranges else {"summary": 3, "invoice": 2}.get(role, 1))
+        spans = _column_a_spans(column_range.get("values", []), first_data_row)
+        old = spans.get(report_date)
+        new_count = len(rows)
+        grid = sheet_properties[targets[role].worksheet_id].get("properties", {}).get("gridProperties", {})
+        grid_rows = grid.get("rowCount")
+        if type(grid_rows) is not int:
+            raise ValueError(f"{role} worksheet grid row count is unavailable")
+
+        dimensions = []
+        if old:
+            data_start, old_count = old
+            if new_count > old_count:
+                dimensions.append({"insertDimension": {
+                    "range": {"sheetId": targets[role].worksheet_id, "dimension": "ROWS",
+                              "startIndex": data_start + old_count, "endIndex": data_start + new_count},
+                    "inheritFromBefore": data_start + old_count > 0,
+                }})
+            elif new_count < old_count:
+                dimensions.append({"deleteDimension": {
+                    "range": {"sheetId": targets[role].worksheet_id, "dimension": "ROWS",
+                              "startIndex": data_start + new_count, "endIndex": data_start + old_count},
+                }})
+        elif new_count:
+            later = [(day, span) for day, span in spans.items() if day > report_date]
+            earlier = [(day, span) for day, span in spans.items() if day < report_date]
+            if later:
+                insert_at = min(span[0] for _, span in later)
+                separator_rows = 2 if role == "invoice" else 0
+                data_start = insert_at
+                inserted_count = new_count + separator_rows
+            elif earlier:
+                last_end = max(start + count for start, count in spans.values())
+                separator_rows = 2 if role == "invoice" else 0
+                insert_at = last_end
+                data_start = insert_at + separator_rows
+                inserted_count = new_count + separator_rows
+            else:
+                data_start = first_data_row
+                insert_at = data_start
+                inserted_count = new_count
+            if inserted_count:
+                dimensions.append({"insertDimension": {
+                    "range": {"sheetId": targets[role].worksheet_id, "dimension": "ROWS",
+                              "startIndex": insert_at, "endIndex": insert_at + inserted_count},
+                    "inheritFromBefore": insert_at > 0,
+                }})
+        else:
+            data_start = old[0] if old else first_data_row
+
+        required_grid_rows = data_start + new_count
+        required_insert_end = max((
+            item["insertDimension"]["range"]["endIndex"]
+            for item in dimensions if "insertDimension" in item
+        ), default=0)
+        required_grid_rows = max(required_grid_rows, required_insert_end)
+        if required_grid_rows > grid_rows:
+            dimensions.insert(0, {"appendDimension": {
+                "sheetId": targets[role].worksheet_id, "dimension": "ROWS",
+                "length": required_grid_rows - grid_rows,
+            }})
+
+        if rows:
+            rows = _shift_date_block_formulas(rows, source_start, data_start)
+        value_requests = matrix_write_requests(
+            rows, targets[role].worksheet_id, start_row=data_start,
+            rows_per_request=rows_per_request, allow_formulas=role == "summary",
+        ) if rows else []
+        style_requests = []
+        if rows and matrix.get("style_contract") and isinstance(targets[role], CellWorksheetTarget):
+            from .cell_publication_v2 import _date_format_requests
+            style_requests = _date_format_requests(role, targets[role], matrix, {
+                "start_row": source_start, "row_count": new_count, "spacer_ranges": [],
+            })
+            delta = data_start - source_start
+            style_requests = [shifted for request in style_requests
+                              if (shifted := _shift_format_request_rows(request, delta)) is not None]
+        plans[role] = {
+            "dimensions": dimensions, "values": value_requests, "styles": style_requests,
+            "markers": ([{"updateCells": {
+                "range": {"sheetId": targets[role].worksheet_id,
+                          "startRowIndex": data_start, "endRowIndex": data_start + new_count,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+                "rows": [{"values": [{"userEnteredValue": _typed(row[0], allow_formulas=False)}]}
+                         for row in rows],
+                "fields": "userEnteredValue",
+            }}] if rows else []),
+            "rows": rows, "start": data_start, "count": new_count,
+            "title": titles[role], "grid_rows": grid_rows,
+        }
+
+    managed_requests = []
+    for role in roles:
+        target = targets[role]
+        sheet = sheet_properties[target.worksheet_id]
+        markers = [item for item in metadata.get("developerMetadata", [])
+                   if item.get("metadataKey") == PUBLICATION_METADATA_KEY
+                   and item.get("location", {}).get("sheetId") == target.worksheet_id]
+        managed_requests.extend({"deleteDeveloperMetadata": {"dataFilter": {
+            "developerMetadataLookup": {"metadataId": item["metadataId"]},
+        }}} for item in markers)
+        managed_requests.extend(_display_only_sheet_requests(target, sheet, bool(markers)))
+
+    role_requests = {}
+    all_requests = list(managed_requests)
+    for role in roles:
+        plan = plans[role]
+        role_requests[role] = [*plan["dimensions"], *plan["markers"],
+                               *plan["values"], *plan["styles"]]
+        all_requests.extend(role_requests[role])
+    if any(len(json.dumps({"requests": [request]}).encode("utf-8")) > MAX_REQUEST_BYTES
+           for request in all_requests):
+        raise ValueError("one stateless date subrequest exceeds the configured request-size limit")
+
+    sent_batches = 0
+
+    def send(requests):
+        nonlocal sent_batches
+        if not requests:
+            return
+        if len(json.dumps({"requests": requests}).encode("utf-8")) > MAX_REQUEST_BYTES:
+            raise ValueError("one date write batch exceeds the configured request-size limit")
+        spreadsheet.batch_update({"requests": requests})
+        sent_batches += 1
+
+    if len(json.dumps({"requests": all_requests}).encode("utf-8")) <= MAX_REQUEST_BYTES:
+        send(all_requests)
+    else:
+        headers = list(managed_requests)
+        for role in roles:
+            headers.extend(plans[role]["dimensions"])
+            headers.extend(plans[role]["markers"])
+        if len(json.dumps({"requests": headers}).encode("utf-8")) <= MAX_REQUEST_BYTES:
+            send(headers)
+        else:
+            if managed_requests:
+                send(managed_requests)
+            for role in roles:
+                header = [*plans[role]["dimensions"], *plans[role]["markers"]]
+                if header:
+                    send(header)
+        for role in roles:
+            pending = []
+            for request in [*plans[role]["values"], *plans[role]["styles"]]:
+                candidate = [*pending, request]
+                if len(json.dumps({"requests": candidate}).encode("utf-8")) > MAX_REQUEST_BYTES:
+                    send(pending)
+                    pending = [request]
+                else:
+                    pending = candidate
+            send(pending)
+
+    read_ranges = []
+    for role in roles:
+        plan = plans[role]
+        title = plan["title"].replace("'", "''")
+        if plan["count"]:
+            first, last = plan["start"] + 1, plan["start"] + plan["count"]
+            width = len(plan["rows"][0])
+            read_ranges.append(f"'{title}'!A{first}:{column_letter(width)}{last}")
+        else:
+            read_ranges.append(f"'{title}'!A:A")
+    readback = _read_with_retry(lambda: spreadsheet.values_batch_get(
+        read_ranges, params={"valueRenderOption": "FORMULA", "majorDimension": "ROWS"},
+    )).get("valueRanges", [])
+    if len(readback) != len(roles):
+        raise RuntimeError("Google Sheets returned incomplete date-block readback")
+    for role, value_range in zip(roles, readback):
+        plan = plans[role]
+        if plan["count"]:
+            actual = _padded(value_range.get("values", []), plan["count"], len(plan["rows"][0]))
+            if actual != plan["rows"]:
+                raise ValueError(f"{role} REPORT DATE block readback differs from DB-derived output")
+        elif any(_sheet_report_date(row[0] if row else None) == report_date
+                 for row in value_range.get("values", [])):
+            raise ValueError(f"{role} REPORT DATE block remained after delete")
+    return {"report_date": report_date, "roles": roles, "http_write_batches": sent_batches}
+def _sheet_report_date(value):
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        if 0 < value < 100000:
+            return (date(1899, 12, 30) + timedelta(days=int(value))).isoformat()
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return business_date(value.strip()).isoformat()
+    except ValueError:
+        pass
+    for pattern in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(value.strip(), pattern).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _column_a_spans(rows, first_data_row):
+    spans = {}
+    for index in range(first_data_row, len(rows)):
+        row = rows[index]
+        day = _sheet_report_date(row[0] if row else None)
+        if day is None:
+            continue
+        if day in spans:
+            start, count = spans[day]
+            if index != start + count:
+                raise ValueError("REPORT DATE rows are split into multiple blocks")
+            spans[day] = (start, count + 1)
+        else:
+            spans[day] = (index, 1)
+    return spans
+
+
+def _matrix_date_block(role, matrix, report_date):
+    values = matrix.get("values", matrix.get("rows"))
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{role} output matrix is empty")
+    ranges = [item for item in matrix.get("date_ranges", [])
+              if _sheet_report_date(item.get("report_date")) == report_date]
+    if len(ranges) > 1:
+        raise ValueError(f"{role} matrix has duplicate date ranges")
+    if ranges:
+        area = ranges[0]
+        start = area["start_row"] - 1
+        rows = values[start:area["end_row"]]
+    else:
+        indexes = [index for index, row in enumerate(values)
+                   if row and _sheet_report_date(row[0]) == report_date]
+        if not indexes:
+            return [], None
+        if indexes != list(range(indexes[0], indexes[-1] + 1)):
+            raise ValueError(f"{role} date rows are not one contiguous block")
+        start = indexes[0]
+        rows = values[start:indexes[-1] + 1]
+    if any(not row or _sheet_report_date(row[0]) != report_date for row in rows):
+        raise ValueError(f"{role} date block lacks REPORT DATE values in column A")
+    width = len(values[0])
+    if any(len(row) != width for row in rows):
+        raise ValueError(f"{role} date block is not rectangular")
+    return [list(row) for row in rows], start
+
+
+def _shift_date_block_formulas(rows, source_start, target_start):
+    delta = target_start - source_start
+    if not delta:
+        return rows
+    reference = re.compile(r"(?<![A-Za-z0-9_])(\$?[A-Z]{1,3})(\$?)(\d+)")
+
+    def shift(value):
+        if not isinstance(value, str) or not value.startswith("="):
+            return value
+
+        def replace(match):
+            row = int(match.group(3))
+            if source_start < row <= source_start + len(rows):
+                return match.group(1) + match.group(2) + str(row + delta)
+            return match.group(0)
+
+        return reference.sub(replace, value)
+
+    return [[shift(value) for value in row] for row in rows]
+
+
+def _shift_format_request_rows(request, delta):
+    operation = next(iter(request))
+    if operation in ("repeatCell", "updateBorders"):
+        area = request[operation]["range"]
+        area["startRowIndex"] += delta
+        area["endRowIndex"] += delta
+    elif operation == "updateDimensionProperties":
+        area = request[operation]["range"]
+        if area.get("dimension") != "ROWS":
+            return None
+        area["startIndex"] += delta
+        area["endIndex"] += delta
+    elif operation == "autoResizeDimensions":
+        area = request[operation]["dimensions"]
+        if area.get("dimension") != "ROWS":
+            return None
+        area["startIndex"] += delta
+        area["endIndex"] += delta
+    else:
+        return None
+    return request
+
+
+def _display_only_sheet_requests(target, metadata, has_publication_marker):
+    writer = getattr(target, "writer_email", None)
+    if not writer:
+        raise ValueError("an explicit Sheet writer is required for display-only tabs")
+    sheet_id = target.worksheet_id
+    managed = [item for item in metadata.get("protectedRanges", [])
+               if item.get("description", "").startswith(MANAGED_PREFIX)]
+    computed = [item for item in managed if item.get("description") == MANAGED_PREFIX + "COMPUTED"]
+    requests = []
+    for item in managed:
+        description = item.get("description", "")
+        if description == MANAGED_PREFIX + "BANK INPUT" or description.startswith(GUARD_PREFIX):
+            requests.append({"deleteProtectedRange": {"protectedRangeId": item["protectedRangeId"]}})
+    protected = {
+        "range": {"sheetId": sheet_id},
+        "description": MANAGED_PREFIX + "COMPUTED",
+        "warningOnly": False,
+        "editors": {"users": [writer]},
+        "unprotectedRanges": [],
+    }
+    if computed:
+        current = computed[0]
+        if (current.get("range") != protected["range"]
+                or current.get("unprotectedRanges")
+                or current.get("warningOnly", False)
+                or current.get("editors", {}).get("users") != [writer]):
+            requests.append({"updateProtectedRange": {
+                "protectedRange": {"protectedRangeId": current["protectedRangeId"], **protected},
+                "fields": "range,description,warningOnly,editors,unprotectedRanges",
+            }})
+        requests.extend({"deleteProtectedRange": {"protectedRangeId": item["protectedRangeId"]}}
+                        for item in computed[1:])
+    else:
+        requests.append({"addProtectedRange": {"protectedRange": protected}})
+    if has_publication_marker:
+        requests.append({"updateSheetProperties": {
+            "properties": {"sheetId": sheet_id}, "fields": "tabColorStyle",
+        }})
+        requests.append({"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": 1},
+            "rows": [{"values": [{"note": ""}]}], "fields": "note",
+        }})
+    return requests
+
+
+def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, rows_per_request=200,
+                             metadata=None):
+    """Rewrite one DB-derived date block in existing worksheets without a Sheet snapshot."""
+    report_date = business_date(report_date).isoformat()
+    if not targets or set(targets) != set(matrices):
+        raise ValueError("date publication requires matching worksheet targets and matrices")
+    spreadsheet_id = getattr(spreadsheet, "id", None)
+    if not spreadsheet_id:
+        raise ValueError("an explicit existing spreadsheet is required")
+    if metadata is None:
+        metadata = _read_with_retry(lambda: spreadsheet.fetch_sheet_metadata(params={
+            "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                       "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
+                       "developerMetadata(metadataId,metadataKey,location(sheetId))"),
+        }))
+    if metadata.get("spreadsheetId") != spreadsheet_id:
+        raise ValueError("opened spreadsheet ID differs from configured target")
+    sheet_properties = {item.get("properties", {}).get("sheetId"): item
+                        for item in metadata.get("sheets", [])}
+    roles = list(targets)
+    titles = {}
+    for role in roles:
+        target = targets[role]
+        if target.spreadsheet_id != spreadsheet_id or target.worksheet_id not in sheet_properties:
+            raise ValueError(f"configured {role} worksheet is missing from the existing spreadsheet")
+        properties = sheet_properties[target.worksheet_id].get("properties", {})
+        if getattr(target, "title", None) and properties.get("title") != target.title:
+            raise ValueError(f"configured {role} worksheet ID/title mismatch")
+        titles[role] = properties["title"]
+
+    column_ranges = ["'" + titles[role].replace("'", "''") + "'!A:A" for role in roles]
+    column_result = _read_with_retry(lambda: spreadsheet.values_batch_get(
+        column_ranges, params={"valueRenderOption": "UNFORMATTED_VALUE", "majorDimension": "ROWS"},
+    )).get("valueRanges", [])
+    if len(column_result) != len(roles):
+        raise RuntimeError("Google Sheets returned an incomplete REPORT DATE column batch")
+
+    plans = {}
+    for role, column_range in zip(roles, column_result):
+        matrix = matrices[role]
+        rows, source_start = _matrix_date_block(role, matrix, report_date)
+        date_ranges = matrix.get("date_ranges", [])
+        first_data_row = (min(item["start_row"] for item in date_ranges) - 1
+                          if date_ranges else len(matrix.get("headers", [])) or 1)
+        spans = _column_a_spans(column_range.get("values", []), first_data_row)
+        old = spans.get(report_date)
+        new_count = len(rows)
+        grid = sheet_properties[targets[role].worksheet_id].get("properties", {}).get("gridProperties", {})
+        grid_rows = grid.get("rowCount")
+        if type(grid_rows) is not int:
+            raise ValueError(f"{role} worksheet grid row count is unavailable")
+
+        dimensions = []
+        if old:
+            data_start, old_count = old
+            if new_count > old_count:
+                dimensions.append({"insertDimension": {
+                    "range": {"sheetId": targets[role].worksheet_id, "dimension": "ROWS",
+                              "startIndex": data_start + old_count, "endIndex": data_start + new_count},
+                    "inheritFromBefore": data_start + old_count > 0,
+                }})
+            elif new_count < old_count:
+                dimensions.append({"deleteDimension": {
+                    "range": {"sheetId": targets[role].worksheet_id, "dimension": "ROWS",
+                              "startIndex": data_start + new_count, "endIndex": data_start + old_count},
+                }})
+        elif new_count:
+            later = [(day, span) for day, span in spans.items() if day > report_date]
+            earlier = [(day, span) for day, span in spans.items() if day < report_date]
+            if later:
+                data_start = min(span[0] for _, span in later)
+                inserted_count = new_count + (2 if role == "invoice" else 0)
+                insert_at = data_start
+            elif earlier:
+                last_end = max(start + count for start, count in spans.values())
+                separator_rows = 2 if role == "invoice" else 0
+                insert_at = last_end
+                data_start = insert_at + separator_rows
+                inserted_count = new_count + separator_rows
+            else:
+                data_start = first_data_row
+                insert_at = data_start
+                inserted_count = new_count
+            if inserted_count:
+                dimensions.append({"insertDimension": {
+                    "range": {"sheetId": targets[role].worksheet_id, "dimension": "ROWS",
+                              "startIndex": insert_at, "endIndex": insert_at + inserted_count},
+                    "inheritFromBefore": insert_at > 0,
+                }})
+        else:
+            data_start = old[0] if old else first_data_row
+
+        inserted_rows = sum(
+            item["insertDimension"]["range"]["endIndex"]
+            - item["insertDimension"]["range"]["startIndex"]
+            for item in dimensions if "insertDimension" in item
+        )
+        deleted_rows = sum(
+            item["deleteDimension"]["range"]["endIndex"]
+            - item["deleteDimension"]["range"]["startIndex"]
+            for item in dimensions if "deleteDimension" in item
+        )
+        final_grid_rows = grid_rows + inserted_rows - deleted_rows
+        required_grid_rows = data_start + new_count
+        if required_grid_rows > final_grid_rows:
+            dimensions.insert(0, {"appendDimension": {
+                "sheetId": targets[role].worksheet_id,
+                "dimension": "ROWS",
+                "length": required_grid_rows - final_grid_rows,
+            }})
+
+        if rows:
+            rows = _shift_date_block_formulas(rows, source_start, data_start)
+        value_requests = matrix_write_requests(
+            rows, targets[role].worksheet_id, start_row=data_start,
+            rows_per_request=rows_per_request, allow_formulas=role == "summary",
+        ) if rows else []
+        style_requests = []
+        if rows and matrix.get("style_contract") and isinstance(targets[role], CellWorksheetTarget):
+            from .cell_publication_v2 import _date_format_requests
+            style_requests = _date_format_requests(role, targets[role], matrix, {
+                "start_row": source_start, "row_count": new_count, "spacer_ranges": [],
+            })
+            delta = data_start - source_start
+            style_requests = [shifted for request in style_requests
+                              if (shifted := _shift_format_request_rows(request, delta)) is not None]
+
+        plans[role] = {
+            "dimensions": dimensions, "values": value_requests, "styles": style_requests,
+            "markers": ([{"updateCells": {
+                "range": {"sheetId": targets[role].worksheet_id,
+                          "startRowIndex": data_start, "endRowIndex": data_start + new_count,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+                "rows": [{"values": [{"userEnteredValue": _typed(row[0], allow_formulas=False)}]}
+                         for row in rows],
+                "fields": "userEnteredValue",
+            }}] if rows else []),
+            "rows": rows, "start": data_start, "count": new_count,
+            "source_start": source_start, "matrix": matrix, "title": titles[role],
+            "sheet_id": targets[role].worksheet_id, "grid_rows": grid_rows,
+        }
+
+    # Read-only snapshots and manual edit holes from the older publisher are removed once.
+    managed_requests = []
+    for role in roles:
+        target = targets[role]
+        sheet = sheet_properties[target.worksheet_id]
+        markers = [item for item in metadata.get("developerMetadata", [])
+                   if item.get("metadataKey") == PUBLICATION_METADATA_KEY
+                   and item.get("location", {}).get("sheetId") == target.worksheet_id]
+        managed_requests.extend({"deleteDeveloperMetadata": {"dataFilter": {
+            "developerMetadataLookup": {"metadataId": item["metadataId"]},
+        }}} for item in markers)
+        managed_requests.extend(_display_only_sheet_requests(target, sheet, bool(markers)))
+
+    role_requests = {}
+    all_requests = list(managed_requests)
+    for role in roles:
+        plan = plans[role]
+        role_requests[role] = [*plan["dimensions"], *plan["markers"],
+                               *plan["values"], *plan["styles"]]
+        all_requests.extend(role_requests[role])
+
+    if any(len(json.dumps({"requests": [request]}).encode("utf-8")) > MAX_REQUEST_BYTES
+           for request in all_requests):
+        raise ValueError("one stateless date subrequest exceeds the configured request-size limit")
+
+    sent_batches = 0
+
+    def send(requests):
+        nonlocal sent_batches
+        if not requests:
+            return
+        if len(json.dumps({"requests": requests}).encode("utf-8")) > MAX_REQUEST_BYTES:
+            raise ValueError("one date write batch exceeds the configured request-size limit")
+        spreadsheet.batch_update({"requests": requests})
+        sent_batches += 1
+
+    if len(json.dumps({"requests": all_requests}).encode("utf-8")) <= MAX_REQUEST_BYTES:
+        send(all_requests)
+    else:
+        headers = list(managed_requests)
+        for role in roles:
+            headers.extend(plans[role]["dimensions"])
+            headers.extend(plans[role]["markers"])
+        if len(json.dumps({"requests": headers}).encode("utf-8")) <= MAX_REQUEST_BYTES:
+            send(headers)
+        else:
+            if managed_requests:
+                send(managed_requests)
+            for role in roles:
+                header = [*plans[role]["dimensions"], *plans[role]["markers"]]
+                if header:
+                    send(header)
+        for role in roles:
+            pending = []
+            for request in [*plans[role]["values"], *plans[role]["styles"]]:
+                candidate = [*pending, request]
+                if len(json.dumps({"requests": candidate}).encode("utf-8")) > MAX_REQUEST_BYTES:
+                    send(pending)
+                    pending = [request]
+                else:
+                    pending = candidate
+            send(pending)
+
+    read_ranges = []
+    for role in roles:
+        plan = plans[role]
+        title = plan["title"].replace("'", "''")
+        if plan["count"]:
+            first, last = plan["start"] + 1, plan["start"] + plan["count"]
+            width = len(plan["rows"][0])
+            read_ranges.append(f"'{title}'!A{first}:{column_letter(width)}{last}")
+        else:
+            read_ranges.append(f"'{title}'!A:A")
+    readback = _read_with_retry(lambda: spreadsheet.values_batch_get(
+        read_ranges, params={"valueRenderOption": "FORMULA", "majorDimension": "ROWS"},
+    )).get("valueRanges", [])
+    if len(readback) != len(roles):
+        raise RuntimeError("Google Sheets returned incomplete date-block readback")
+    for role, value_range in zip(roles, readback):
+        plan = plans[role]
+        if plan["count"]:
+            actual = _padded(value_range.get("values", []), plan["count"], len(plan["rows"][0]))
+            if actual != plan["rows"]:
+                raise ValueError(f"{role} REPORT DATE block readback differs from DB-derived output")
+        elif any(_sheet_report_date(row[0] if row else None) == report_date
+                 for row in value_range.get("values", [])):
+            raise ValueError(f"{role} REPORT DATE block remained after delete")
+    return {"report_date": report_date, "roles": roles, "http_write_batches": sent_batches}
+
+
 def _padded(rows, count, width):
     if len(rows) > count or any(len(row) > width for row in rows):
         raise ValueError("unexpected spreadsheet readback dimensions")
@@ -401,28 +1173,8 @@ def _manual_values(old_matrix, actual):
 
 
 def _validate_input_policy(matrix):
-    role = matrix.get("style_contract", {}).get("role")
-    if role is None:
-        return  # Persisted legacy layouts keep their original compatibility policy.
-    inputs = matrix.get("editable_inputs", [])
-    if role != "summary":
-        if inputs:
-            raise ValueError("non-Summary output cannot expose Finance input holes")
-        return
-    expected = {}
-    for area in matrix["date_ranges"]:
-        rows = [row for row in range(area["start_row"], area["end_row"] + 1)
-                if matrix["row_keys"][row - 1] == "CASH:cash:MANDIRI"]
-        if len(rows) != 1:
-            raise ValueError("Summary requires exactly one bank input row per date")
-        for block in matrix["blocks"]:
-            if block["cell_code"] is not None:
-                if matrix["values"][1][block["start_column"] - 1] != "DEBET":
-                    raise ValueError("bank input is not in its approved DEBET column")
-                expected[(area["report_date"], block["cell_code"])] = (rows[0], block["start_column"])
-    actual = {(item["report_date"], item["cell_code"]): (item["row"], item["column"]) for item in inputs}
-    if len(actual) != len(inputs) or actual != expected:
-        raise ValueError("Finance edit holes differ from the exact MANDIRI input contract")
+    if matrix.get("editable_inputs"):
+        raise ValueError("cell visualization matrices cannot contain editable Sheet inputs")
 
 
 def _protection_requests(target, matrix, metadata, guard_id):
@@ -633,12 +1385,10 @@ def _editors_match(editors, users, implicit_owners=()):
 def publish_cell_cluster(store, target, approved_targets, adapter, batch, config,
                          *, changed_dates, rows_per_request=250, additional_batches=None,
                          configuration_only=False):
-    """Commit/render/publish while retaining the caller's live session lock.
-
-    External calls here are operational code for later approved live use.
-    Offline validation uses fake adapters/stores only. Unknown write outcomes
-    persist as UNKNOWN/IN_FLIGHT and require operator-proven request quiescence.
-    """
+    """Reject the retired snapshot/status publisher; use date-block publication."""
+    raise RuntimeError(
+        "stateful cell publication is retired; use finpay_pipeline.cell_format.publish_cell_sheets"
+    )
     target.validate(approved_targets)
     validate_cluster_batch(batch, config.cells)
     if store.cluster_id != config.account[:-2] or store.target_id != target.spreadsheet_id:

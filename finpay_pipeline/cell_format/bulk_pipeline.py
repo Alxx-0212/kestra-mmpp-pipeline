@@ -37,7 +37,6 @@ from .settings import (
 
 MAX_BULK_BYTES = 1024 * 1024 * 1024
 MAX_BULK_INDEX_BYTES = 16 * 1024 * 1024
-MAX_BULK_HANDOFF_BYTES = len(CELL_ROSTER) * daily.MAX_HANDOFF_BYTES
 MAX_BULK_ENTRIES = MAX_CELL_RUNS
 MAX_BULK_SPOOL_BYTES = 2 * MAX_BULK_BYTES
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
@@ -139,10 +138,6 @@ def _daily_prepared_path(cluster_id: str, report_date: str) -> str:
     return f"prepared/{cluster_id}/{report_date}.json"
 
 
-def _handoff_path(cluster_id: str) -> str:
-    return f"handoffs/{cluster_id}.json"
-
-
 def _require_sha256(value, label: str) -> str:
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
         raise ValueError(f"{label} must be a lowercase SHA-256")
@@ -220,49 +215,39 @@ def _validate_index(index: dict, kind: str):
         cluster = entry.get("cluster_id")
         if cluster not in clusters:
             raise ValueError("cell bulk index contains an unselected cluster")
-        if kind == "handoff":
-            key = cluster
-            expected_path = _handoff_path(cluster)
-            if entry.get("path") != expected_path:
-                raise ValueError("cell bulk handoff path differs from its cluster")
-            if type(entry.get("bytes")) is not int or not 0 < entry["bytes"] <= daily.MAX_HANDOFF_BYTES:
-                raise ValueError("cell bulk handoff size is invalid")
-        else:
-            report_date = entry.get("report_date")
-            report_date = validate_reporting_date(report_date)
-            if not start <= report_date <= end:
-                raise ValueError("cell bulk index date is outside its requested range")
-            key = (cluster, report_date)
-            expected_path = (_daily_source_path(cluster, report_date) if kind == "source"
-                             else _daily_prepared_path(cluster, report_date))
-            if entry.get("path") != expected_path:
-                raise ValueError("cell bulk member path differs from its cluster/date")
-            _, codes = account_settings(cluster)
-            if type(entry.get("cells")) is not int or entry["cells"] != len(codes):
-                raise ValueError("cell bulk member has incomplete roster coverage")
-            if kind == "prepared" and (
-                type(entry.get("bytes")) is not int
-                or not 0 < entry["bytes"] <= daily.MAX_PREPARED_BYTES
-            ):
-                raise ValueError("prepared cell member size is invalid")
+        report_date = entry.get("report_date")
+        report_date = validate_reporting_date(report_date)
+        if not start <= report_date <= end:
+            raise ValueError("cell bulk index date is outside its requested range")
+        key = (cluster, report_date)
+        expected_path = (_daily_source_path(cluster, report_date) if kind == "source"
+                         else _daily_prepared_path(cluster, report_date))
+        if entry.get("path") != expected_path:
+            raise ValueError("cell bulk member path differs from its cluster/date")
+        _, codes = account_settings(cluster)
+        if type(entry.get("cells")) is not int or entry["cells"] != len(codes):
+            raise ValueError("cell bulk member has incomplete roster coverage")
+        if kind == "prepared" and (
+            type(entry.get("bytes")) is not int
+            or not 0 < entry["bytes"] <= daily.MAX_PREPARED_BYTES
+        ):
+            raise ValueError("prepared cell member size is invalid")
         _require_sha256(entry.get("sha256"), "cell bulk member checksum")
         if key in by_key:
             raise ValueError("duplicate cell bulk index entry")
         by_key[key] = entry
 
-    if kind == "handoff":
-        if set(by_key) != set(clusters):
-            raise ValueError("cell bulk handoff roster coverage is incomplete")
-    else:
-        expected = {(cluster, day) for cluster in clusters for day in _dates(start, end)}
-        if set(by_key) != expected:
-            raise ValueError("cell bulk range must cover every selected cluster/date")
+    expected = {(cluster, day) for cluster in clusters for day in _dates(start, end)}
+    if set(by_key) != expected:
+        raise ValueError("cell bulk range must cover every selected cluster/date")
     return start, end, clusters, by_key
 
 
 @contextmanager
 def _open_bulk_zip(path, expected_sha256: str, kind: str):
-    limit = MAX_BULK_HANDOFF_BYTES if kind == "handoff" else MAX_BULK_BYTES
+    if kind not in ("source", "prepared"):
+        raise ValueError("unsupported cell bulk artifact kind")
+    limit = MAX_BULK_BYTES
     expected_sha256 = _require_sha256(expected_sha256, "cell bulk artifact checksum")
     snapshot = tempfile.TemporaryFile()
     try:
@@ -300,19 +285,11 @@ def _open_bulk_zip(path, expected_sha256: str, kind: str):
         expected_names = {"index.json"} | {entry["path"] for entry in entries.values()}
         if set(names) != expected_names:
             raise ValueError("cell bulk ZIP has missing or unexpected members")
-        total_limit = MAX_BULK_HANDOFF_BYTES if kind == "handoff" else MAX_BULK_BYTES
-        if sum(info.file_size for info in infos) > total_limit:
+        if sum(info.file_size for info in infos) > MAX_BULK_BYTES:
             raise ValueError("cell bulk ZIP uncompressed size exceeds limit")
-        member_limit = daily.MAX_HANDOFF_BYTES if kind == "handoff" else (
-            MAX_BUNDLE_BYTES if kind == "source" else daily.MAX_PREPARED_BYTES
-        )
+        member_limit = MAX_BUNDLE_BYTES if kind == "source" else daily.MAX_PREPARED_BYTES
         if any(info.file_size > member_limit for info in infos if info.filename != "index.json"):
             raise ValueError("cell bulk ZIP member exceeds size limit")
-        if kind == "handoff" and any(
-            archive.getinfo(entry["path"]).file_size != entry["bytes"]
-            for entry in entries.values()
-        ):
-            raise ValueError("cell bulk handoff size differs from index")
         if kind == "prepared" and any(
             archive.getinfo(entry["path"]).file_size != entry["bytes"]
             for entry in entries.values()
@@ -510,70 +487,36 @@ def _facts_from_batch(config, batch):
     } for item in batch]
 
 
-def _read_handoff_member(archive, entry, scratch_dir: Path):
-    path = _stage_member(archive, entry, scratch_dir, daily.MAX_HANDOFF_BYTES)
-    handoff = daily._read_json(path, entry["sha256"], daily.MAX_HANDOFF_BYTES)
-    return path, handoff
-
-
-def _validate_complete_handoff(handoff, cluster: str, end_date: str):
-    actual_cluster, config = daily._validate_handoff(handoff)
-    if actual_cluster != cluster or handoff["submitted_report_date"] != end_date:
-        raise ValueError("cell bulk handoff differs from requested cluster/end date")
-    first, last = handoff["first_report_date"], handoff["last_report_date"]
-    cells = {cell.cell_code for cell in config.cells}
-    expected_count = ((business_date(last) - business_date(first)).days + 1) * len(cells)
-    if expected_count > 100_000 or len(handoff["selected"]) != expected_count:
-        raise ValueError("cell bulk handoff does not cover complete persisted history")
+def _validate_complete_history(selected, config, through_date):
+    through = business_date(str(through_date)).isoformat()
+    expected_cells = {cell.cell_code for cell in config.cells}
+    expected_count = ((business_date(through) - business_date(REPORTING_START_DATE)).days + 1) * len(expected_cells)
+    if expected_count < len(expected_cells) or expected_count > MAX_BULK_ENTRIES:
+        raise ValueError("persisted cell history exceeds the bounded reporting range")
     expected = {
-        (day, code) for day in _dates(first, last) for code in cells
+        (day, code) for day in _dates(REPORTING_START_DATE, through) for code in expected_cells
     }
-    actual = {(item["report_date"], item["cell_code"]) for item in handoff["selected"]}
+    actual = {(item["report_date"], item["cell_code"]) for item in selected}
     if actual != expected:
-        raise ValueError("cell bulk handoff has missing or duplicate history coverage")
-    return config
+        raise ValueError("persisted cell history does not cover every reporting date and cell")
 
 
-def _write_handoff_bundle(output_path, start, end, cluster_id, clusters, handoff_paths):
-    entries = []
-    for cluster in clusters:
-        path = handoff_paths[cluster]
-        size = path.stat().st_size
-        digest = sha256_file_bounded(path, daily.MAX_HANDOFF_BYTES)
-        entries.append({
-            "cluster_id": cluster, "path": _handoff_path(cluster),
-            "sha256": digest, "bytes": size,
-        })
-    index = {
-        "schema_version": 1, "start_date": start, "end_date": end,
-        "cluster_id": cluster_id, "clusters": clusters,
-        "roster_version": ROSTER_VERSION, "entries": entries,
-    }
-    index_bytes = json.dumps(index, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    total = len(index_bytes) + sum(item["bytes"] for item in entries)
-    if len(index_bytes) > MAX_BULK_INDEX_BYTES or total > MAX_BULK_HANDOFF_BYTES:
-        raise ValueError("cell bulk handoff artifact exceeds size limit")
-
-    def write_archive(pending):
-        with zipfile.ZipFile(pending, "w", compression=zipfile.ZIP_STORED) as output:
-            output.writestr("index.json", index_bytes)
-            for cluster in clusters:
-                output.write(handoff_paths[cluster], arcname=_handoff_path(cluster))
-
-    return _atomic_zip(output_path, write_archive, MAX_BULK_HANDOFF_BYTES)
-
-
-def validate_cell_bulk_sheet_range(start_date: str, end_date: str, cluster_id: str) -> dict:
-    """Validate target settings and selected clusters without opening clients."""
+def validate_cell_bulk_sheet_range(start_date: str, end_date: str, cluster_id: str, *,
+                                   credentials_info=None, sheet_client_factory=None) -> dict:
+    """Validate range settings and optionally preflight exact existing Sheet targets."""
     start, end, clusters, days = _range(start_date, end_date, cluster_id)
     validate_sheet_target_group(clusters)
-    return {"clusters": clusters, "dates": days, "runs": days * len(clusters)}
+    result = {"clusters": clusters, "dates": days, "runs": days * len(clusters)}
+    if credentials_info is not None:
+        result.update(daily.validate_existing_sheet_targets(
+            clusters, credentials_info, sheet_client_factory=sheet_client_factory,
+        ))
+    return result
 
 
 @observed("bulk_persist")
 def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
                        database_password: str | None,
-                       output_path: str = "cell_bulk_handoffs_v1.zip",
                        dry_run: bool = False, target=None,
                        session_factory=cell_publication_session) -> dict:
     """Commit one cluster at a time; each cluster's date cohorts share one transaction."""
@@ -602,10 +545,9 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
             if not database_password:
                 raise ValueError("FINPAY_DB_PASSWORD Kestra secret is required")
             target = database_target() if target is None else target
-            handoff_paths = {}
-            for cluster in clusters:
+            for cluster_index, cluster in enumerate(clusters):
                 report("waiting_for_database_lock", cluster_id=cluster,
-                       completed=len(handoff_paths), total=len(clusters))
+                       completed=cluster_index, total=len(clusters))
                 config = configs[cluster]
                 with session_factory(
                     target, {target}, cluster, "", password=database_password,
@@ -666,36 +608,25 @@ def persist_cell_range(prepared_path: str, prepared_sha256: str, *,
                         build_cell_cluster_matrices_v2(
                             config, committed, committed_through, dummy=True,
                         )
-                        selected = daily._selection(committed)
-                        handoff = {
-                            "schema_version": daily.HANDOFF_SCHEMA_VERSION,
-                            "cluster_id": cluster, "account": config.account,
-                            "submitted_report_date": end,
-                            "first_report_date": REPORTING_START_DATE,
-                            "last_report_date": committed_through,
-                            "roster_fingerprint": roster_fingerprint(config.cells),
-                            "selected": selected,
-                            "history_fingerprint": fingerprint(selected),
-                        }
-                        _validate_complete_handoff(handoff, cluster, end)
-                        handoff_path = scratch_dir / f"handoff-{cluster}.json"
-                        daily._write_json(handoff_path, handoff, daily.MAX_HANDOFF_BYTES)
-                    handoff_paths[cluster] = handoff_path
+                        through_date = committed_through.isoformat() if hasattr(
+                            committed_through, "isoformat",
+                        ) else str(committed_through)
+                        _validate_complete_history(
+                            daily._selection(committed), config, through_date,
+                        )
                 report("cluster_committed", cluster_id=cluster,
-                       completed=len(handoff_paths), total=len(clusters))
-            digest, size = _write_handoff_bundle(
-                output_path, start, end, index["cluster_id"], clusters, handoff_paths,
-            )
+                       completed=cluster_index + 1, total=len(clusters))
     return {
         "status": "PERSISTED", "start_date": start, "end_date": end,
         "cluster_id": index["cluster_id"], "clusters": clusters,
-        "handoff_bundle_sha256": digest, "handoff_bundle_bytes": size,
+        "persisted_dates": len(days) * len(clusters),
         "committed_clusters": len(clusters),
     }
 
 
-def _validate_publication_targets(clusters, start, end, cluster_id, credentials_info):
-    validate_cell_bulk_sheet_range(start, end, cluster_id)
+def _validate_publication_targets(
+    clusters, start, end, cluster_id, credentials_info, *, sheet_client_factory,
+):
     if (not isinstance(credentials_info, dict)
             or not isinstance(credentials_info.get("client_email"), str)
             or not credentials_info["client_email"]):
@@ -703,67 +634,58 @@ def _validate_publication_targets(clusters, start, end, cluster_id, credentials_
     configuration = sheet_configuration()
     if credentials_info["client_email"].casefold() != configuration.writer_email.casefold():
         raise ValueError("Google credential identity differs from the configured cell writer")
+    validate_cell_bulk_sheet_range(
+        start, end, cluster_id, credentials_info=credentials_info,
+        sheet_client_factory=sheet_client_factory,
+    )
 
 
 @observed("bulk_publish")
-def publish_cell_range(handoff_path: str, handoff_sha256: str, *,
+def publish_cell_range(start_date: str, end_date: str, cluster_id: str, *,
                        database_password: str | None, credentials_info: dict | None,
                        dry_run: bool = False, target=None,
                        session_factory=cell_publication_session,
-                       sheet_client_factory=make_cell_sheet_client,
-                       refresh_request_id: str | None = None) -> dict:
-    """Publish once per cluster, serially, through the daily guarded publisher."""
+                       sheet_client_factory=make_cell_sheet_client) -> dict:
+    """Publish requested date blocks serially from persisted database values."""
     if type(dry_run) is not bool:
         raise ValueError("dry_run must be an explicit boolean")
-    daily.validate_refresh_request_id(refresh_request_id)
-    results = []
-    with tempfile.TemporaryDirectory(prefix="finpay-cell-bulk-publish-") as scratch:
-        scratch_dir = Path(scratch)
-        with _open_bulk_zip(handoff_path, handoff_sha256, "handoff") as (
-            archive, index, start, end, clusters, entries,
-        ):
-            for cluster in clusters:
-                entry = entries[cluster]
-                path, handoff = _read_handoff_member(archive, entry, scratch_dir)
-                _validate_complete_handoff(handoff, cluster, end)
-                path.unlink(missing_ok=True)
-            if dry_run:
-                return {
-                    "status": "DRY_RUN", "start_date": start, "end_date": end,
-                    "cluster_id": index["cluster_id"], "clusters": clusters,
-                    "publications": len(clusters),
-                }
-            if not database_password or not credentials_info:
-                raise ValueError("FINPAY_DB_PASSWORD and GCP_SA_KEY Kestra secrets are required")
-            _validate_publication_targets(
-                clusters, start, end, index["cluster_id"], credentials_info,
+    start, end, clusters, day_count = _range(start_date, end_date, cluster_id)
+    if dry_run:
+        return {
+            "status": "DRY_RUN", "start_date": start, "end_date": end,
+            "cluster_id": cluster_id, "clusters": clusters,
+            "publications": day_count * len(clusters),
+        }
+    if not database_password or not credentials_info:
+        raise ValueError("FINPAY_DB_PASSWORD and GCP_SA_KEY Kestra secrets are required")
+    target = database_target() if target is None else target
+    client = None
+
+    def shared_sheet_client(info, **kwargs):
+        nonlocal client
+        if client is None:
+            client = sheet_client_factory(info, **kwargs)
+        return client
+
+    _validate_publication_targets(
+        clusters, start, end, cluster_id, credentials_info,
+        sheet_client_factory=shared_sheet_client,
+    )
+
+    published = 0
+    for cluster in clusters:
+        for day in _dates(start, end):
+            daily.publish_cell_sheets(
+                day, cluster, database_password=database_password,
+                credentials_info=credentials_info, target=target,
+                session_factory=session_factory,
+                sheet_client_factory=shared_sheet_client,
             )
-            target = database_target() if target is None else target
-            client = None
-
-            def shared_sheet_client(info, **kwargs):
-                nonlocal client
-                if client is None:
-                    client = sheet_client_factory(info, **kwargs)
-                return client
-
-            for cluster in clusters:
-                entry = entries[cluster]
-                path = _stage_member(archive, entry, scratch_dir, daily.MAX_HANDOFF_BYTES)
-                result = daily.publish_cell_sheets(
-                    str(path), entry["sha256"], database_password=database_password,
-                    credentials_info=credentials_info, cluster_id=cluster, target=target,
-                    session_factory=session_factory,
-                    sheet_client_factory=shared_sheet_client,
-                    refresh_request_id=refresh_request_id,
-                    publication_start_date=start,
-                )
-                results.append(result)
-                report("cluster_published", cluster_id=cluster,
-                       completed=len(results), total=len(clusters))
-                path.unlink(missing_ok=True)
+            published += 1
+            report("date_block_published", cluster_id=cluster, report_date=day,
+                   completed=published, total=day_count * len(clusters))
     return {
         "status": "COMPLETE", "start_date": start, "end_date": end,
-        "cluster_id": index["cluster_id"], "clusters": clusters,
-        "publications": results,
+        "cluster_id": cluster_id, "clusters": clusters,
+        "publications": published,
     }

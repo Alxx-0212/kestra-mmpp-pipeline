@@ -6,7 +6,6 @@ Prepared members are synthetic and normalized; no source XLSX or Sheet is used.
 """
 from __future__ import annotations
 
-import argparse
 import calendar
 import hashlib
 import json
@@ -612,43 +611,9 @@ def _scale_year(root: Path, dsn: str, schema: str, target, metrics: Metrics):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workload", choices=("month", "year"), required=True)
-    args = parser.parse_args()
-    dsn, _ = _dsn_and_identity()
-    schema, target = _initialize_schema(dsn)
-    scratch = Path(tempfile.mkdtemp(prefix="finpay-cell-scale-")).resolve()
-    tempfile.tempdir = str(scratch)
-    usage = PeakUsage(scratch, dsn)
-    metrics = Metrics()
-    metrics.instrument()
-    usage.start()
-    started = time.perf_counter()
-    try:
-        result = (_scale_month(scratch, dsn, schema, target, metrics)
-                  if args.workload == "month"
-                  else _scale_year(scratch, dsn, schema, target, metrics))
-    finally:
-        usage.stop()
-    elapsed = time.perf_counter() - started
-    measured_stages = [item[key] for item in result["stages"]
-                       for key in ("build_seconds", "persist_seconds", "snapshot_seconds")]
-    within_six_hour_stage_limit = max(measured_stages, default=0) <= 6 * 60 * 60
-    if not within_six_hour_stage_limit:
-        raise AssertionError("a measured stage exceeded the six-hour runtime limit")
-    plan_sha256 = hashlib.sha256(PLAN_PATH.read_bytes()).hexdigest() if PLAN_PATH.is_file() else None
-    print(json.dumps({
-        "plan_sha256": plan_sha256,
-        "workload": args.workload, "database_guard": DATABASE_GUARD,
-        "postgres_version": "18.4", "psycopg_version": psycopg.__version__,
-        "schema": schema, "elapsed_seconds": round(elapsed, 3),
-        "peak_runner_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
-        "peak_scratch_bytes": usage.peak_scratch_bytes,
-        "peak_postgres_temp_bytes": usage.peak_postgres_temp_bytes,
-        "within_six_hour_stage_limit": within_six_hour_stage_limit,
-        "validation_and_rebind_metrics": metrics.values,
-        "result": result,
-    }, sort_keys=True, separators=(",", ":"), default=_json_default))
+    raise RuntimeError(
+        "legacy snapshot-based scale benchmark is retired; it does not measure date-block publication"
+    )
 
 
 if __name__ == "__main__":
