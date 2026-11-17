@@ -2,10 +2,10 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from finpay_pipeline.cell_format import bulk_pipeline, pipeline, settings
-from finpay_pipeline.cell_format.settings import selected_clusters
+from finpay_pipeline.cell_format.settings import account_settings, selected_clusters
 from finpay_pipeline.cell_workflow import make_cell_sheet_client
 from finpay_pipeline.cell_publication import cell_sheet_validation_error, safe_cell_sheet_error
 from finpay_pipeline.cell_publication_v2 import ROLES, cell_worksheet_title
@@ -82,6 +82,7 @@ class FakeWorkbook:
         self.response_sheet_id = None
         self.duplicate_title_after_add = False
         self.next_sheet_id = 1000
+        self.batch_requests = []
         self.client = FakeHttpClient(self._metadata_request)
 
     def _metadata_request(self, method, url, **kwargs):
@@ -114,28 +115,41 @@ class FakeWorkbook:
         return next((item for item in self._worksheets if item.id == worksheet_id), None)
 
     def batch_update(self, body):
-        properties = body["requests"][0]["addSheet"]["properties"]
-        self.add_requests.append(dict(properties))
+        requests = body["requests"]
+        self.batch_requests.append(body)
         if self.fail_add == "before":
             self.fail_add = None
             raise TimeoutError("synthetic addSheet timeout")
-        if any(item.title == properties["title"] for item in self._worksheets):
-            raise ValueError("duplicate worksheet title")
-        worksheet_id = properties.get("sheetId")
-        if worksheet_id is None:
-            worksheet_id = self.next_sheet_id
-            self.next_sheet_id += 1
-        if any(item.id == worksheet_id for item in self._worksheets):
-            raise ValueError("duplicate worksheet ID")
-        worksheet = FakeWorksheet(worksheet_id, properties["title"])
-        self._worksheets.append(worksheet)
-        if self.duplicate_title_after_add:
-            self._worksheets.append(FakeWorksheet(worksheet_id + 1, properties["title"]))
+        replies = []
+        for request in requests:
+            if "updateSheetProperties" in request:
+                properties = request["updateSheetProperties"]["properties"]
+                worksheet = next(item for item in self._worksheets if item.id == properties["sheetId"])
+                worksheet.title = properties["title"]
+                continue
+            if "deleteSheet" in request:
+                sheet_id = request["deleteSheet"]["sheetId"]
+                self._worksheets = [item for item in self._worksheets if item.id != sheet_id]
+                continue
+            properties = request["addSheet"]["properties"]
+            self.add_requests.append(dict(properties))
+            if any(item.title == properties["title"] for item in self._worksheets):
+                raise ValueError("duplicate worksheet title")
+            worksheet_id = properties.get("sheetId")
+            if worksheet_id is None:
+                worksheet_id = self.next_sheet_id
+                self.next_sheet_id += 1
+            if any(item.id == worksheet_id for item in self._worksheets):
+                raise ValueError("duplicate worksheet ID")
+            self._worksheets.append(FakeWorksheet(worksheet_id, properties["title"]))
+            if self.duplicate_title_after_add:
+                self._worksheets.append(FakeWorksheet(worksheet_id + 1, properties["title"]))
+            response_id = worksheet_id if self.response_sheet_id is None else self.response_sheet_id
+            replies.append({"addSheet": {"properties": {"sheetId": response_id}}})
         if self.fail_add == "after":
             self.fail_add = None
             raise TimeoutError("synthetic addSheet response timeout")
-        response_id = worksheet_id if self.response_sheet_id is None else self.response_sheet_id
-        return {"replies": [{"addSheet": {"properties": {"sheetId": response_id}}}]}
+        return {"replies": replies}
 
     def share(self, email, *, perm_type, role, notify):
         self.shares.append((email, perm_type, role, notify))
@@ -301,12 +315,13 @@ class CellSheetTargetTests(unittest.TestCase):
                     "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
                     "CELL_FORMAT_FINANCE_EMAILS": value,
                 })
-        with self.assertRaisesRegex(ValueError, "creation and restoration settings are unsupported"):
-            settings.sheet_configuration({
-                **BASE_ENV,
-                "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
-                "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING": "yes",
-            })
+        legacy_flags = settings.sheet_configuration({
+            **BASE_ENV,
+            "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
+            "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING": "false",
+            "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING": "false",
+        })
+        self.assertEqual(legacy_flags.spreadsheet_name, "Cell Reports")
 
     def test_cluster_selector_trims_sorts_and_rejects_duplicates_or_unknowns(self):
         clusters = selected_clusters("ALL")
@@ -380,8 +395,9 @@ class CellSheetTargetTests(unittest.TestCase):
             resolved, spreadsheet_id = pipeline._spreadsheet_by_name(client, "Cell Reports")
             pipeline._verify_workbook(resolved, spreadsheet_id, "Cell Reports")
             pipeline._verify_workbook_access(resolved, _configuration())
-            targets, _ = pipeline._resolve_existing_cell_targets(
+            targets, _, created_count = pipeline._ensure_cell_targets(
                 resolved, CLUSTER, _configuration(CELL_FORMAT_SPREADSHEET_ID="existing"),
+                create_missing=False,
             )
 
         self.assertIs(resolved, workbook)
@@ -487,7 +503,9 @@ class CellSheetTargetTests(unittest.TestCase):
             CELL_FORMAT_WORKSHEET_IDS=json.dumps(configured),
         )
         workbook = FakeWorkbook("existing", "Cell Reports")
-        targets, _ = pipeline._resolve_existing_cell_targets(workbook, CLUSTER, config)
+        targets, _, created_count = pipeline._ensure_cell_targets(
+            workbook, CLUSTER, config, create_missing=False,
+        )
         self.assertEqual(
             {role: target.worksheet_id for role, target in targets.items()}, configured[ACCOUNT],
         )
@@ -731,21 +749,100 @@ class CellSheetTargetTests(unittest.TestCase):
             [{"emailAddress": "writer@example.test", "role": "owner"}],
         )
         config = _configuration(CELL_FORMAT_SPREADSHEET_ID="existing")
-        targets, _ = pipeline._resolve_existing_cell_targets(workbook, CLUSTER, config)
+        targets, _, created_count = pipeline._ensure_cell_targets(
+            workbook, CLUSTER, config, create_missing=False,
+        )
         self.assertEqual(
             [targets[role].worksheet_id for role in ROLES],
             [worksheet.id for worksheet in worksheets],
         )
         self.assertEqual(workbook.add_requests, [])
         self.assertEqual(workbook.shares, [])
+        self.assertEqual(created_count, 0)
 
-    def test_existing_target_preflight_requires_exact_tabs_and_never_creates(self):
+    def test_name_only_target_preflight_creates_workbook_and_exact_role_tabs(self):
+        client = FakeClient()
+        environment = {
+            **BASE_ENV,
+            "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            result = pipeline.ensure_cell_sheet_targets(
+                [CLUSTER], {"client_email": "writer@example.test"},
+                sheet_client_factory=lambda credentials, **kwargs: client,
+            )
+        self.assertEqual(client.create_calls, ["Cell Reports"])
+        workbook = client.workbooks[result["spreadsheet_id"]]
+        self.assertTrue(result["created_workbook"])
+        self.assertEqual(result["created_worksheets"], len(ROLES))
+        self.assertEqual(
+            {item.title for item in workbook.worksheets()},
+            {cell_worksheet_title(ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME)
+             for role in ROLES},
+        )
+        self.assertEqual(workbook.shares, [
+            ("finance-a@example.test", "user", "writer", False),
+            ("finance-b@example.test", "user", "writer", False),
+        ])
+
+    def test_create_response_timeout_reconciles_one_exact_name(self):
+        client = FakeClient()
+        client.create_mode = "after"
+        environment = {**BASE_ENV, "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports"}
+        with patch.dict("os.environ", environment, clear=True):
+            result = pipeline.ensure_cell_sheet_targets(
+                [CLUSTER], {"client_email": "writer@example.test"},
+                sheet_client_factory=lambda credentials, **kwargs: client,
+            )
+        workbook = client.workbooks[result["spreadsheet_id"]]
+        self.assertTrue(result["created_workbook"])
+        self.assertEqual(client.create_calls, ["Cell Reports"])
+        self.assertEqual(len(workbook.shares), 2)
+        self.assertEqual(result["validated_roles"], len(ROLES))
+
+    def test_ambiguous_duplicate_file_creation_fails_before_tab_provisioning(self):
+        client = FakeClient()
+        client.create_mode = "duplicates"
+        environment = {**BASE_ENV, "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports"}
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "spreadsheet creation outcome is ambiguous"):
+                pipeline.ensure_cell_sheet_targets(
+                    [CLUSTER], {"client_email": "writer@example.test"},
+                    sheet_client_factory=lambda credentials, **kwargs: client,
+                )
+        self.assertEqual(client.create_calls, ["Cell Reports"])
+        self.assertTrue(all(not workbook.shares for workbook in client.workbooks.values()))
+        self.assertTrue(all(not workbook.add_requests for workbook in client.workbooks.values()))
+
+    def test_new_workbook_honors_configured_role_ids_and_removes_default_tab(self):
+        client = FakeClient()
+        environment = {
+            **BASE_ENV,
+            "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
+            "CELL_FORMAT_WORKSHEET_IDS": json.dumps({
+                ACCOUNT: {role: 900 + index for index, role in enumerate(ROLES)},
+            }),
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            result = pipeline.ensure_cell_sheet_targets(
+                [CLUSTER], {"client_email": "writer@example.test"},
+                sheet_client_factory=lambda credentials, **kwargs: client,
+            )
+        workbook = client.workbooks[result["spreadsheet_id"]]
+        self.assertEqual(
+            {sheet.title: sheet.id for sheet in workbook.worksheets()},
+            {cell_worksheet_title(ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME): 900 + index
+             for index, role in enumerate(ROLES)},
+        )
+        self.assertNotIn("Sheet1", {sheet.title for sheet in workbook.worksheets()})
+
+    def test_existing_target_preflight_adds_only_missing_role_tabs_without_sharing(self):
         worksheets = [
             FakeWorksheet(
                 index + 900,
                 cell_worksheet_title(ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME),
             )
-            for index, role in enumerate(ROLES)
+            for index, role in enumerate(ROLES[:-1])
         ]
         permissions = [
             {"emailAddress": email, "role": "writer"}
@@ -762,23 +859,65 @@ class CellSheetTargetTests(unittest.TestCase):
             }),
         }
         with patch.dict("os.environ", environment, clear=True):
-            result = pipeline.validate_existing_sheet_targets(
+            result = pipeline.ensure_cell_sheet_targets(
                 [CLUSTER], {"client_email": "writer@example.test"},
-                sheet_client_factory=lambda credentials: client,
+                sheet_client_factory=lambda credentials, **kwargs: client,
             )
         self.assertEqual(result["validated_roles"], len(ROLES))
         self.assertEqual(client.create_calls, [])
-        self.assertEqual(workbook.add_requests, [])
+        self.assertEqual(len(workbook.add_requests), 1)
+        self.assertFalse(result["created_workbook"])
+        self.assertEqual(result["created_worksheets"], 1)
+        self.assertEqual(workbook.shares, [])
 
-        workbook._worksheets.pop()
+    def test_missing_pinned_workbook_fails_closed_without_name_fallback_or_create(self):
+        client = FakeClient()
+        environment = {
+            **BASE_ENV,
+            "CELL_FORMAT_SPREADSHEET_ID": "pinned-workbook",
+            "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
+        }
         with patch.dict("os.environ", environment, clear=True):
-            with self.assertRaisesRegex(FileNotFoundError, "exact title"):
-                pipeline.validate_existing_sheet_targets(
+            with self.assertRaises(KeyError):
+                pipeline.ensure_cell_sheet_targets(
                     [CLUSTER], {"client_email": "writer@example.test"},
-                    sheet_client_factory=lambda credentials: client,
+                    sheet_client_factory=lambda credentials, **kwargs: client,
                 )
         self.assertEqual(client.create_calls, [])
-        self.assertEqual(workbook.add_requests, [])
+        self.assertEqual(client.drive_queries, [])
+
+    def test_invalid_multi_account_worksheet_map_fails_before_workbook_creation(self):
+        client_factory = Mock()
+        pky_ids = {role: 900 + index for index, role in enumerate(ROLES)}
+        mrw_account, _ = account_settings("422010")
+        base_environment = {
+            **BASE_ENV,
+            "CELL_FORMAT_SPREADSHEET_NAME": "Cell Reports",
+        }
+        with self.subTest(case="missing account"):
+            with patch.dict("os.environ", {
+                **base_environment,
+                "CELL_FORMAT_WORKSHEET_IDS": json.dumps({ACCOUNT: pky_ids}),
+            }, clear=True):
+                with self.assertRaisesRegex(ValueError, "missing a selected account"):
+                    pipeline.ensure_cell_sheet_targets(
+                        [CLUSTER, "422010"], {"client_email": "writer@example.test"},
+                        sheet_client_factory=client_factory,
+                    )
+        with self.subTest(case="duplicate IDs across accounts"):
+            with patch.dict("os.environ", {
+                **base_environment,
+                "CELL_FORMAT_WORKSHEET_IDS": json.dumps({
+                    ACCOUNT: pky_ids,
+                    mrw_account: dict(pky_ids),
+                }),
+            }, clear=True):
+                with self.assertRaisesRegex(ValueError, "unique across clusters"):
+                    pipeline.ensure_cell_sheet_targets(
+                        [CLUSTER, "422010"], {"client_email": "writer@example.test"},
+                        sheet_client_factory=client_factory,
+                    )
+        client_factory.assert_not_called()
 
     def test_existing_workbook_access_requires_writer_and_all_finance_editors(self):
         workbook = FakeWorkbook(
@@ -789,15 +928,18 @@ class CellSheetTargetTests(unittest.TestCase):
             pipeline._verify_workbook_access(workbook, _configuration())
         self.assertEqual(workbook.shares, [])
 
-    def test_client_has_read_only_drive_metadata_scope_without_file_creation_scope(self):
+    def test_client_adds_drive_file_scope_only_for_destination_provisioning(self):
         with patch("google.oauth2.service_account.Credentials.from_service_account_info") as credentials, \
                 patch("google.auth.transport.requests.AuthorizedSession"), \
                 patch("requests.adapters.HTTPAdapter"), patch("gspread.Client"):
             make_cell_sheet_client({"client_email": "writer@example.test"})
-            scopes = credentials.call_args.kwargs["scopes"]
-        self.assertIn("https://www.googleapis.com/auth/spreadsheets", scopes)
-        self.assertIn("https://www.googleapis.com/auth/drive.metadata.readonly", scopes)
-        self.assertNotIn("https://www.googleapis.com/auth/drive.file", scopes)
+            read_scopes = credentials.call_args.kwargs["scopes"]
+            make_cell_sheet_client({"client_email": "writer@example.test"}, include_drive_file=True)
+            create_scopes = credentials.call_args.kwargs["scopes"]
+        self.assertIn("https://www.googleapis.com/auth/spreadsheets", read_scopes)
+        self.assertIn("https://www.googleapis.com/auth/drive.metadata.readonly", read_scopes)
+        self.assertNotIn("https://www.googleapis.com/auth/drive.file", read_scopes)
+        self.assertIn("https://www.googleapis.com/auth/drive.file", create_scopes)
 
 
 if __name__ == "__main__":

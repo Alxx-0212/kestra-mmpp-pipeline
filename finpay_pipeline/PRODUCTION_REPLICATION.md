@@ -15,9 +15,11 @@ the current user for the exact target, scope, operation, and backup plan; any
 no-backup exception requires fresh, explicit authorization from the current user
 for that consequence. Section 6.1 records historical approval only, not current or
 future authorization. Never point test resets or cleanup at production resources.
-Cell workflows require an existing workbook and exact existing worksheet IDs/titles;
-they do not create destinations or change sharing. Obtain current approval for
-production targets and operations.
+Cell workflows resolve a pinned workbook ID or unique exact title. A name-only
+target may create a missing workbook and provision missing alias tabs; only a
+newly created workbook is shared with the configured Finance editor list. A
+missing pinned ID fails closed, and sharing on existing workbooks is unchanged.
+Obtain current approval for production targets, creation, and operations.
 
 Before a live Sheet mutation, verify the exact workbook and role tabs and perform
 a read-only audit of the selected date blocks against persisted rows. Obtain
@@ -32,12 +34,13 @@ execute.
    SHA does not identify uncommitted code. Do not commit without authorization.
 2. Inventory the active writers, schedules, DB identities, workbook ID, worksheet
    IDs, and backups. A workbook title alone is not a unique identity.
-3. Configure one existing destination and cluster group for each bulk flow.
+3. Configure a destination name and optional pinned ID plus a cluster group for each bulk flow.
    Set `cell_spreadsheet_name` from Kestra secret `FINPAY_CELL_SPREADSHEET_NAME`
    or a private flow copy, and pin `cell_spreadsheet_id` when known. Set the
    distinct `legacy_spreadsheet_id` and `cell_cluster_group`. The group accepts
    one numeric cluster, a comma-separated list, or `ALL`; it may be read from
-   `secret('FINPAY_CELL_CLUSTER_GROUP')`. Give each cloned flow a unique ID and
+   `secret('FINPAY_CELL_CLUSTER_GROUP')`. With an empty ID, the unique exact-name
+   workbook is reused or created; duplicate exact names fail. Give each cloned flow a unique ID and
    keep groups disjoint. The daily/range wrappers use the deployment's shared
    target secrets. Do not commit workbook IDs, Finance emails, or credentials.
 4. Configure the writer service-account email and Finance editor identities as
@@ -49,11 +52,14 @@ execute.
    `422180_B=MRW`, `422220_B=TNT`, `422140_B=KOTAMOB`, and `422040_B=BOLMONG`.
     Keep workbook and worksheet IDs stable during a code-to-alias rename; changing
     IDs, workbook, account ownership, or editors is not a title migration. Before
-    execution, read workbook metadata and take the approved backup. The read-only
-    preflight requires all four existing role tabs with exact IDs and titles before
-    persistence. Missing or mismatched targets fail closed. Existing workbook
-    sharing is never changed, and no tab is created, renamed, restored, deleted,
-    or cleared by the workflow.
+     execution, read workbook metadata and take the approved backup. The target
+    preflight verifies exact IDs and titles for all four role tabs before
+    persistence, provisioning missing aliases when permitted by the target
+    configuration. A new workbook is shared only with the configured Finance editors;
+    sharing on existing workbooks is never changed. A missing pinned workbook ID
+    remains a hard stop, and tabs are never renamed or restored from snapshots.
+    Name-only creation uses the service account's My Drive root. Pre-create and
+    pin an ID when a specific folder or shared drive is required.
 6. Agree whether this release includes cell, legacy, or monthly reporting.
    A cell canary does not verify legacy/monthly live behavior or other domains.
 
@@ -287,9 +293,10 @@ variables:
 
 The second clone uses its own destination name and cluster list. The execution
 input `cluster_id` defaults to the group but can still be overridden per run.
-Each destination workbook and all constant alias role tabs must already exist;
-missing or mismatched targets fail the read-only preflight before persistence.
-Existing workbook sharing is not changed.
+The destination name is unique. With no pinned ID, the workflow creates the
+workbook if absent and provisions missing constant alias role tabs before
+persistence. A pinned missing ID or mismatched title/ID blocks. New workbooks are
+shared with the configured Finance editors; existing sharing is not changed.
 Read back definitions/image references. If releasing legacy too, register daily
 v5 before legacy day, then legacy range. Keep compatibility IDs for their callers.
 Keep `finpay_cell_range_v1`'s `daily_cell_range_0500_wita` trigger disabled when
@@ -591,10 +598,12 @@ worksheet as a recovery shortcut. Image rollback does not undo DB/Sheet data.
 
 ### Existing Destination Blockers
 
-Missing or mismatched workbooks/tabs block before persistence when Sheets output
-is enabled. Resolve destination structure through a separately approved workbook
-administration procedure, then rerun the read-only preflight. The cell workflow
-never creates, renames, shares, restores, or adopts a destination. Migration 004
+Duplicate exact workbook names, a missing pinned ID, or a title/ID conflict block
+before persistence when Sheets output is enabled. A name-only target with no
+exact-title match is created; missing role tabs are provisioned with exact aliases.
+The workflow never renames, restores, or adopts a different tab. It shares only a
+new workbook with the configured Finance list and never changes sharing on an
+existing workbook. Migration 004
 removes the retired database write-state tables only after separate approval and
 a verified backup; it is not an automatic workflow action.
 

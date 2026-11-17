@@ -503,12 +503,12 @@ def _validate_complete_history(selected, config, through_date):
 
 def validate_cell_bulk_sheet_range(start_date: str, end_date: str, cluster_id: str, *,
                                    credentials_info=None, sheet_client_factory=None) -> dict:
-    """Validate range settings and optionally preflight exact existing Sheet targets."""
+    """Validate the range and ensure exact workbook/role targets when Sheets is enabled."""
     start, end, clusters, days = _range(start_date, end_date, cluster_id)
     validate_sheet_target_group(clusters)
     result = {"clusters": clusters, "dates": days, "runs": days * len(clusters)}
     if credentials_info is not None:
-        result.update(daily.validate_existing_sheet_targets(
+        result.update(daily.ensure_cell_sheet_targets(
             clusters, credentials_info, sheet_client_factory=sheet_client_factory,
         ))
     return result
@@ -659,13 +659,14 @@ def publish_cell_range(start_date: str, end_date: str, cluster_id: str, *,
     if not database_password or not credentials_info:
         raise ValueError("FINPAY_DB_PASSWORD and GCP_SA_KEY Kestra secrets are required")
     target = database_target() if target is None else target
-    client = None
+    clients = {}
 
     def shared_sheet_client(info, **kwargs):
-        nonlocal client
-        if client is None:
-            client = sheet_client_factory(info, **kwargs)
-        return client
+        provisioning = bool(kwargs.get("include_drive_file", False))
+        key = "provision" if provisioning else "read-write"
+        if key not in clients:
+            clients[key] = sheet_client_factory(info, **kwargs)
+        return clients[key]
 
     _validate_publication_targets(
         clusters, start, end, cluster_id, credentials_info,

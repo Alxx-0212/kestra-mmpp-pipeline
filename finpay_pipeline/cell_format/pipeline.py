@@ -70,13 +70,13 @@ def _cell_config(cluster_id: str, first_report_date: str):
 
 def validate_sheet_range(start_date: str, end_date: str, cluster_id: str, *,
                          credentials_info=None, sheet_client_factory=None) -> dict:
-    """Validate the selected range and, when provided, exact existing Sheet targets."""
+    """Validate the range and ensure exact workbook/role targets when Sheets is enabled."""
     runs = expand_cell_range(start_date, end_date, cluster_id)
     clusters = selected_clusters(cluster_id)
     validate_sheet_target_group(clusters)
     result = {"clusters": list(clusters), "runs": len(runs)}
     if credentials_info is not None:
-        result.update(validate_existing_sheet_targets(
+        result.update(ensure_cell_sheet_targets(
             clusters, credentials_info, sheet_client_factory=sheet_client_factory,
         ))
     return result
@@ -153,6 +153,16 @@ def _verify_workbook_access(workbook, configuration):
         )
 
 
+def _verify_workbook_owner(workbook, writer_email):
+    permissions = _read_with_retry(workbook.list_permissions)
+    if not any(
+        str(item.get("emailAddress", "")).casefold() == writer_email.casefold()
+        and item.get("role") == "owner"
+        for item in permissions
+    ):
+        raise PermissionError("ambiguous workbook creation did not resolve to a writer-owned file")
+
+
 def _spreadsheet_by_name(client, title):
     matches = _spreadsheet_files(client, title)
     if len(matches) > 1:
@@ -167,24 +177,64 @@ def _spreadsheet_by_name(client, title):
 
 
 def resolve_cell_workbook(client, configuration: CellSheetConfiguration):
-    """Open an existing cell workbook; stateless publication never creates one."""
+    """Resolve an existing workbook without creating or retargeting a pinned ID."""
     if configuration.spreadsheet_id:
         spreadsheet_id = configuration.spreadsheet_id
         workbook = _read_with_retry(lambda: client.open_by_key(spreadsheet_id))
         if getattr(workbook, "id", None) != spreadsheet_id:
             raise ValueError("opened cell workbook ID differs from configured target")
         _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
+        if spreadsheet_id == configuration.legacy_spreadsheet_id:
+            raise ValueError("cell-format workbook must be distinct from the legacy workbook")
         return workbook, spreadsheet_id, False
 
     workbook_match = _spreadsheet_by_name(client, configuration.spreadsheet_name)
     if workbook_match is None:
         raise FileNotFoundError("configured cell-format spreadsheet must already exist")
     _verify_workbook(workbook_match[0], workbook_match[1], configuration.spreadsheet_name)
+    if workbook_match[1] == configuration.legacy_spreadsheet_id:
+        raise ValueError("cell-format workbook must be distinct from the legacy workbook")
     return workbook_match[0], workbook_match[1], False
 
 
-def _resolve_existing_cell_targets(workbook, cluster_id, configuration):
-    """Resolve the configured four tabs without creation, adoption, or DB sheet state."""
+def ensure_cell_workbook(client, configuration: CellSheetConfiguration, *, creation_client_factory=None):
+    """Create an exact-name workbook only when no workbook ID is pinned."""
+    if configuration.spreadsheet_id:
+        return resolve_cell_workbook(client, configuration)
+    workbook_match = _spreadsheet_by_name(client, configuration.spreadsheet_name)
+    if workbook_match:
+        _verify_workbook(workbook_match[0], workbook_match[1], configuration.spreadsheet_name)
+        if workbook_match[1] == configuration.legacy_spreadsheet_id:
+            raise ValueError("cell-format workbook must be distinct from the legacy workbook")
+        return workbook_match[0], workbook_match[1], False
+    create_client = client if creation_client_factory is None else creation_client_factory()
+    creation_response_unknown = False
+    try:
+        workbook = create_client.create(configuration.spreadsheet_name)
+        spreadsheet_id = getattr(workbook, "id", None)
+        if not isinstance(spreadsheet_id, str) or not spreadsheet_id:
+            raise RuntimeError("spreadsheet creation did not return an ID")
+        _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
+    except Exception:
+        creation_response_unknown = True
+        try:
+            workbook_match = _spreadsheet_by_name(create_client, configuration.spreadsheet_name)
+        except Exception:
+            raise RuntimeError("spreadsheet creation outcome is ambiguous; exact-name readback failed") from None
+        if workbook_match is None:
+            raise RuntimeError("spreadsheet creation failed and no exact-name workbook is visible") from None
+        workbook, spreadsheet_id = workbook_match
+        _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
+    if creation_response_unknown:
+        _verify_workbook_owner(workbook, configuration.writer_email)
+    if spreadsheet_id == configuration.legacy_spreadsheet_id:
+        raise ValueError("cell-format workbook must be distinct from the legacy workbook")
+    return workbook, spreadsheet_id, True
+
+
+def _ensure_cell_targets(workbook, cluster_id, configuration, *, create_missing=False,
+                         new_workbook=False):
+    """Resolve exact role tabs, optionally adding missing tabs for this account."""
     spreadsheet_id = workbook.id
     if (not spreadsheet_id or (configuration.spreadsheet_id
             and configuration.spreadsheet_id != spreadsheet_id)
@@ -201,53 +251,179 @@ def _resolve_existing_cell_targets(workbook, cluster_id, configuration):
     configured = (configuration.worksheet_ids or {}).get(account)
     if configuration.worksheet_ids is not None and configured is None:
         raise ValueError("CELL_FORMAT_WORKSHEET_IDS is missing the selected account")
-    by_id = {}
-    by_title = {}
-    for sheet in metadata.get("sheets", []):
-        properties = sheet.get("properties", {})
-        sheet_id, title = properties.get("sheetId"), properties.get("title")
-        if type(sheet_id) is not int or not isinstance(title, str) or not title:
-            raise ValueError("Google Sheets returned malformed worksheet identity metadata")
-        if sheet_id in by_id:
-            raise ValueError("Google Sheets returned duplicate worksheet IDs")
-        by_id[sheet_id] = title
-        by_title.setdefault(title, []).append(sheet_id)
-    worksheet_ids = {}
+    def worksheet_index(sheet_metadata):
+        by_id, by_title = {}, {}
+        for item in sheet_metadata.get("sheets", []):
+            properties = item.get("properties", {})
+            sheet_id, title = properties.get("sheetId"), properties.get("title")
+            if type(sheet_id) is not int or not isinstance(title, str) or not title:
+                raise ValueError("Google Sheets returned malformed worksheet identity metadata")
+            if sheet_id in by_id:
+                raise ValueError("Google Sheets returned duplicate worksheet IDs")
+            by_id[sheet_id] = title
+            by_title.setdefault(title, []).append(sheet_id)
+        return by_id, by_title
+
+    by_id, by_title = worksheet_index(metadata)
+    worksheet_ids, missing = {}, []
+    default = None
+    if new_workbook and len(metadata.get("sheets", [])) == 1:
+        properties = metadata["sheets"][0].get("properties", {})
+        if properties.get("title") == "Sheet1":
+            default = properties.get("sheetId")
+    rename_default_role = None
+    if default is not None:
+        if configured:
+            rename_default_role = next(
+                (role for role in ROLES if configured[role] == default), None,
+            )
+        else:
+            rename_default_role = ROLES[0]
+
     for role in ROLES:
         title = cell_worksheet_title(account, role, CELL_FORMAT_NAMING_SCHEME)
         matches = by_title.get(title, [])
-        if len(matches) != 1:
-            raise FileNotFoundError(f"existing {role} worksheet with exact title is required")
-        sheet_id = configured.get(role) if configured else matches[0]
-        if sheet_id not in by_id or by_id[sheet_id] != title or matches[0] != sheet_id:
-            raise ValueError(f"configured {role} worksheet ID/title mismatch")
-        worksheet_ids[role] = sheet_id
+        if len(matches) > 1:
+            raise ValueError("multiple worksheets have the same exact cell alias title")
+        requested_id = configured.get(role) if configured else None
+        if role == rename_default_role:
+            worksheet_ids[role] = default
+            continue
+        if requested_id is not None:
+            existing_title = by_id.get(requested_id)
+            if existing_title is not None:
+                if existing_title != title or (matches and matches[0] != requested_id):
+                    raise ValueError(f"configured {role} worksheet ID/title mismatch")
+                worksheet_ids[role] = requested_id
+            elif matches:
+                raise ValueError(f"configured {role} worksheet ID/title mismatch")
+            else:
+                missing.append((role, title, requested_id))
+        elif matches:
+            worksheet_ids[role] = matches[0]
+        else:
+            missing.append((role, title, None))
+
+    provisioned_roles = len(missing) + (1 if rename_default_role else 0)
+    if missing:
+        if not create_missing:
+            role = missing[0][0]
+            raise FileNotFoundError(f"{role} worksheet with exact title is required")
+        requests = []
+        if rename_default_role:
+            title = cell_worksheet_title(account, rename_default_role, CELL_FORMAT_NAMING_SCHEME)
+            requests.append({"updateSheetProperties": {
+                "properties": {"sheetId": default, "title": title}, "fields": "title",
+            }})
+        for _, title, requested_id in missing:
+            properties = {"title": title, "gridProperties": {"rowCount": 1000, "columnCount": 26}}
+            if requested_id is not None:
+                if requested_id in by_id:
+                    raise ValueError("configured worksheet ID is already used by another tab")
+                properties["sheetId"] = requested_id
+            requests.append({"addSheet": {"properties": properties}})
+        if new_workbook and default is not None and rename_default_role is None:
+            requests.append({"deleteSheet": {"sheetId": default}})
+        mutation_error = None
+        try:
+            workbook.batch_update({"requests": requests})
+        except Exception as exc:
+            mutation_error = exc
+        metadata = _read_with_retry(lambda: workbook.fetch_sheet_metadata(params={
+            "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                       "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
+                       "developerMetadata(metadataId,metadataKey,location(sheetId))"),
+        }))
+        by_id, by_title = worksheet_index(metadata)
+        worksheet_ids = {}
+        for role in ROLES:
+            title = cell_worksheet_title(account, role, CELL_FORMAT_NAMING_SCHEME)
+            matches = by_title.get(title, [])
+            requested_id = configured.get(role) if configured else None
+            if len(matches) != 1:
+                if mutation_error is not None:
+                    raise RuntimeError(
+                        "worksheet creation outcome was ambiguous; exact title/ID readback did not complete",
+                    ) from None
+                raise FileNotFoundError(f"{role} worksheet with exact title is required")
+            sheet_id = requested_id if requested_id is not None else matches[0]
+            if by_id.get(sheet_id) != title or matches[0] != sheet_id:
+                raise ValueError(f"configured {role} worksheet ID/title mismatch")
+            worksheet_ids[role] = sheet_id
+    else:
+        for role in ROLES:
+            title = cell_worksheet_title(account, role, CELL_FORMAT_NAMING_SCHEME)
+            matches = by_title.get(title, [])
+            requested_id = configured.get(role) if configured else None
+            if len(matches) != 1:
+                raise FileNotFoundError(f"{role} worksheet with exact title is required")
+            sheet_id = requested_id if requested_id is not None else matches[0]
+            if by_id.get(sheet_id) != title or matches[0] != sheet_id:
+                raise ValueError(f"configured {role} worksheet ID/title mismatch")
+            worksheet_ids[role] = sheet_id
     targets = sheet_targets(
         cluster_id, spreadsheet_id=spreadsheet_id,
         worksheet_ids=worksheet_ids, configuration=configuration,
     )[2]
-    return targets, metadata
+    return targets, metadata, provisioned_roles
 
 
-def validate_existing_sheet_targets(clusters, credentials_info, *, sheet_client_factory=None):
-    """Read-only preflight of the workbook and exact alias worksheet identities."""
+def ensure_cell_sheet_targets(clusters, credentials_info, *, sheet_client_factory=None):
+    """Ensure the exact target workbook and all requested account role tabs exist."""
     configuration = sheet_configuration()
     if (not isinstance(credentials_info, dict)
             or not isinstance(credentials_info.get("client_email"), str)
             or credentials_info["client_email"].casefold() != configuration.writer_email.casefold()):
         raise ValueError("Google credential identity differs from the configured cell writer")
+    accounts = {account_settings(cluster_id)[0] for cluster_id in clusters}
+    if configuration.worksheet_ids is not None:
+        missing_accounts = accounts - configuration.worksheet_ids.keys()
+        if missing_accounts:
+            raise ValueError("CELL_FORMAT_WORKSHEET_IDS is missing a selected account")
+        selected_ids = [
+            configuration.worksheet_ids[account][role]
+            for account in accounts for role in ROLES
+        ]
+        if len(selected_ids) != len(set(selected_ids)):
+            raise ValueError("configured cell worksheet IDs must be unique across selected accounts")
     if sheet_client_factory is None:
         from ..cell_workflow import make_cell_sheet_client
         sheet_client_factory = make_cell_sheet_client
     client = sheet_client_factory(credentials_info)
-    workbook, spreadsheet_id, created = resolve_cell_workbook(client, configuration)
+    workbook, spreadsheet_id, created = ensure_cell_workbook(
+        client, configuration,
+        creation_client_factory=lambda: sheet_client_factory(
+            credentials_info, include_drive_file=True,
+        ),
+    )
     if created:
-        raise RuntimeError("cell reporting requires an existing workbook")
-    _verify_workbook_access(workbook, configuration)
+        share_errors = []
+        for email in configuration.finance_emails:
+            if email.casefold() == configuration.writer_email.casefold():
+                continue
+            try:
+                workbook.share(email, perm_type="user", role="writer", notify=False)
+            except Exception as exc:
+                share_errors.append(exc)
+        try:
+            _verify_workbook_access(workbook, configuration)
+        except Exception:
+            if share_errors:
+                raise RuntimeError(
+                    "new cell workbook was created but Finance sharing could not be verified"
+                ) from None
+            raise
+    else:
+        _verify_workbook_access(workbook, configuration)
     configs, targets_by_account = {}, {}
+    provisioned_worksheets = 0
     for cluster_id in clusters:
         account, _ = account_settings(cluster_id)
-        targets, _ = _resolve_existing_cell_targets(workbook, cluster_id, configuration)
+        targets, _, created_roles = _ensure_cell_targets(
+            workbook, cluster_id, configuration, create_missing=True,
+            new_workbook=created,
+        )
+        provisioned_worksheets += created_roles
         configs[account] = report_config(cluster_id, REPORTING_START_DATE)
         targets_by_account[account] = targets
     validate_output_targets(
@@ -255,7 +431,8 @@ def validate_existing_sheet_targets(clusters, credentials_info, *, sheet_client_
         configs, targets_by_account,
     )
     return {"spreadsheet_id": spreadsheet_id, "validated_clusters": len(clusters),
-            "validated_roles": len(clusters) * len(ROLES)}
+            "validated_roles": len(clusters) * len(ROLES),
+            "created_workbook": created, "created_worksheets": provisioned_worksheets}
 
 
 @observed("preprocess")
@@ -455,7 +632,9 @@ def publish_cell_sheets(report_date: str, cluster_id: str, *, database_password:
     target = database_target() if target is None else target
     client = sheet_client_factory(credentials_info)
     workbook, spreadsheet_id, _ = resolve_cell_workbook(client, configuration)
-    targets, metadata = _resolve_existing_cell_targets(workbook, cluster_id, configuration)
+    targets, metadata, _ = _ensure_cell_targets(
+        workbook, cluster_id, configuration, create_missing=False,
+    )
     if spreadsheet_id != workbook.id:
         raise ValueError("resolved cell workbook identity changed")
 

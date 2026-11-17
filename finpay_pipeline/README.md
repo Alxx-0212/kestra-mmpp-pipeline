@@ -15,7 +15,7 @@ Build, CI/CD, commissioning, and recovery steps are in
 | Cell acquisition and four-tab reporting | Implemented through the compatibility flows below. |
 | Independent subpackages, date-range acquisition, and staged cell tasks | Implemented; range inputs and task boundaries below. |
 | Cell running SALDO | The database stores no cumulative balance; Sheet formulas calculate SALDO from persisted history and leave it explicitly unverified when required history is missing. The reporting boundary is October 1, 2026. |
-| Cell publication targets | Package defaults fail closed. Configure the existing destination name/ID, legacy ID, writer, and Finance editor identities through Kestra secrets or per-flow variables. All four exact role tabs must already exist; workflows never create or share targets. |
+| Cell publication targets | Configure the destination name/optional pinned ID, legacy ID, writer, and Finance editors through Kestra secrets or per-flow variables. Name-only targets create a missing workbook; missing alias tabs are provisioned automatically. A missing pinned ID fails closed. |
 | Monthly settlement | Preview and gated publication implemented; Finance release requirements remain separate. |
 | Production commissioning and schedules | Not authorized by a local test or this refactor; acquisition schedules remain disabled. |
 
@@ -79,13 +79,14 @@ Each prefix has `Summary`, `Invoice`, `Unusual`, and `Reversal` tabs (for exampl
 `PKY`, `PKY Invoice`, `PKY Unusual`, `PKY Reversal`). Configure a copied
 `finpay_cell_bulk_v1` flow's `cell_spreadsheet_name` and `cell_cluster_group`;
 the group accepts one code, comma-separated codes, or `ALL`. The workbook ID is
-optional if the exact name resolves to one file; duplicate names fail closed. A
-pinned ID and exact-name targets must already exist with all four exact alias
-worksheet titles and IDs. Missing or mismatched targets fail the read-only
-preflight before persistence. Workflows never create or share workbooks, or create,
-rename, restore, or adopt worksheets. Keep tab IDs stable; arbitrary retargeting
-to another workbook or role is rejected. Assign each cluster to only one
-destination flow and give each copied flow a unique ID.
+optional if the exact name resolves to one file; duplicate names fail closed. With
+no pinned ID, a missing exact-name workbook is created and shared only with the
+configured Finance editors. A missing pinned ID fails rather than silently
+rebinding to a new ID. Missing role tabs are created with their exact alias titles
+and configured IDs when supplied. Existing workbook sharing and existing tabs are
+left unchanged. Keep tab IDs stable; arbitrary retargeting to another workbook or
+role is rejected. Assign each cluster to only one destination flow and give each
+copied flow a unique ID.
 
 Flow defaults read `FINPAY_CELL_SPREADSHEET_NAME` and
 `FINPAY_LEGACY_SPREADSHEET_ID` from Kestra secrets; optional
@@ -93,6 +94,8 @@ Flow defaults read `FINPAY_CELL_SPREADSHEET_NAME` and
 and `FINPAY_CELL_FINANCE_EMAILS` configure the writer and expected existing
 Finance access identities.
 A private deployment flow may set these values directly in its `variables` block.
+Name-only creation places the new workbook in the service account's My Drive root;
+pin a pre-created workbook ID when a specific folder or shared drive is required.
 
 `finpay_cell_bulk_v1` accepts inclusive dates, a cluster selector, and 1-4 scrape
 workers (default 2). It preflights every indexed export, retries only failed
@@ -149,10 +152,10 @@ have accepted it. No Telegram plugin upgrade or bot-service change is required.
 The cell day task graph is:
 
 ```text
-preflight_cell_database (non-dry runs only, before acquisition)
-  -> read-only target/schema/table-privilege check
 validate_cell_sheet_targets (when Sheets output is enabled)
-  -> read-only existing-workbook and exact worksheet-ID/title check
+  -> resolve/create name-only workbook and ensure exact role worksheet IDs/titles
+preflight_cell_database (non-dry runs only, before acquisition)
+  -> read-only database/schema/table-privilege check
 acquire_cell_cluster_day -> cell_sources_v2.zip
 preprocess_cell_cluster_day -> cell_prepared_v1.json
 persist_cell_sources_and_calculations -> database current rows
@@ -161,9 +164,11 @@ publish_cell_four_tabs -> requested Summary date block
 
 Day and bulk workflows run the read-only database preflight before DigiPOS
 acquisition when `dry_run=false`, using the existing `FINPAY_DB_*` secrets. When
-Sheets output is enabled, a separate read-only target preflight runs before
-acquisition. Dry runs skip both preflights and do not connect to PostgreSQL or
-Google. The database preflight checks the
+Sheets output is enabled, a target preflight runs before acquisition. It verifies
+the configured workbook and role tabs, creating a name-only workbook or missing
+role tabs when needed; only a new workbook is shared with configured Finance
+editors. Dry runs skip both preflights and do not connect to PostgreSQL or Google.
+The database preflight checks the
 configured target and runtime role's schema/table privileges; it creates no
 schema or tables and applies no DDL or migration. Cell schema setup remains an
 explicit operation.
@@ -179,9 +184,11 @@ the database host and allow Google HTTPS access.
 
 Cell artifacts are size-bounded, with SHA-256 checks performed by application
 code at specific task boundaries. Persistence does not create a Google client.
-When Sheets output is enabled, a read-only preflight verifies the existing
-workbook and exact account/role worksheet IDs and titles before acquisition or DB
-writes; no workbook, worksheet, sharing, or protection changes are made.
+When Sheets output is enabled, the target preflight runs before acquisition or DB
+writes. It opens the exact pinned workbook or resolves the unique configured name,
+creates a missing name-only workbook, and ensures the exact account/role worksheet
+IDs and titles. It shares only a newly created workbook with configured Finance
+editors; existing workbook sharing and unmanaged protections remain unchanged.
 Spreadsheet name/optional ID, distinct legacy ID, writer, and Finance editor
 identities must be configured. `write_gsheet=false` keeps the bulk
 acquisition/preprocessing/DB path independent from Google writes.
@@ -289,12 +296,14 @@ New cell tabs use cluster aliases, not numeric cluster codes:
 Each prefix has `Summary`, `Invoice`, `Unusual`, and `Reversal` worksheets.
 Exact alias titles and worksheet IDs are required contracts. A rename or ID change
 requires a separately approved workbook/configuration change; the workflow fails
-preflight on any mismatch. Arbitrary workbook, worksheet ID, role, or account
-changes remain blocked.
+preflight on any mismatch. Missing role tabs are created by exact title, while
+arbitrary workbook, worksheet ID, role, or account changes remain blocked.
 Workflows may be copied per destination: set the copied flow's `cell_spreadsheet_name`
 and `cell_cluster_group` (a single code, comma-separated group, or `ALL`).
-The destination workbook and all role tabs must already exist. Cell flows never
-create files or tabs, change sharing, or restore missing worksheets.
+With an empty `cell_spreadsheet_id`, the destination workbook is created by exact
+name when absent; missing role tabs are created automatically. A pinned missing
+ID blocks creation. Existing workbooks are never re-shared, and missing tabs are
+not restored from prior snapshots.
 
 The existing v3/v2 compatibility pair requires a schema-v2 configuration FILE,
 its checksum, and the independent `FINPAY_CELL_CONFIG_SHA256` deployment pin.
@@ -316,10 +325,11 @@ rows and continuous panel side rails. Unusual/Reversal display validated relativ
 CELL numbers 1-3, preserve semantic widths and muted stripes, and separate each
 visible date with a top border. Source full cell codes remain in evidence.
 
-All four existing role worksheets are preflighted by exact workbook, title, and
-worksheet ID before persistence when Sheets output is enabled. Missing workbooks
-or tabs fail before data is committed; workflows never create, rename, share, or
-restore destinations. After selected data is persisted, the publisher locates
+All four role worksheets are ensured by exact workbook, title, and worksheet ID
+before persistence when Sheets output is enabled. Name-only missing workbooks and
+missing alias tabs are created; a pinned missing ID fails closed. Only newly
+created workbooks are shared with configured Finance editors. After selected data
+is persisted, the publisher locates
 each requested date from column A and inserts, replaces, or resizes only that
 date's block. Range and bulk flows finish persistence for their full selection
 before beginning the date-block publication pass. Other dates remain untouched.
@@ -470,7 +480,7 @@ keys are sorted, while list order is preserved.
 ## Publication Safety
 
 - Keep date-block writes sequential and preserve the existing Kestra retry/backoff and 30-second cohort pause.
-- Require the exact existing workbook and all four exact worksheet IDs/titles before persistence when Sheets output is enabled; workflows never create, rename, share, or restore a destination.
+- Before persistence, resolve the exact workbook by pinned ID or unique exact name. Create a missing name-only workbook and missing alias tabs; a missing pinned ID fails closed. Share only new workbooks with configured Finance editors; preserve sharing on existing workbooks.
 - Persist all selected range data before starting its Sheet publication pass. Locate date blocks by `REPORT DATE` in column A and replace only requested dates; repeated writes of the same persisted date block are idempotent.
 - Batch each date's row mutations, four-role values, and managed protection updates into `spreadsheets.batchUpdate` requests, splitting only when the byte bound requires it. Remove only legacy MANDIRI input holes and publisher guards; preserve unmanaged protections and sharing. Readback remains separate; mutation requests are not retried by the HTTP adapter.
 - Do not store publication snapshots, write statuses, manual MANDIRI overrides, or reset records. SALDO and combined MANDIRI are formula-derived from persisted date data.

@@ -73,13 +73,19 @@ tasks:
       runs = expand_cell_range(
           os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
       )
+      target_status = {"created_workbook": False, "created_worksheets": 0}
       if (os.environ["DRY_RUN"].lower() == "false"
               and os.environ["WRITE_GSHEET"].lower() == "true"):
-          validate_cell_bulk_sheet_range(
+          target_status = validate_cell_bulk_sheet_range(
               os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
               credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
           )
-      Kestra.outputs({"clusters": len({run["cluster_id"] for run in runs}), "runs": len(runs)})
+      Kestra.outputs({
+          "clusters": len({run["cluster_id"] for run in runs}),
+          "runs": len(runs),
+          "workbook_created": target_status["created_workbook"],
+          "worksheets_created": target_status["created_worksheets"],
+      })
 
   - id: preflight_cell_database
     type: io.kestra.plugin.scripts.python.Script

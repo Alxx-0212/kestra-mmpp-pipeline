@@ -85,14 +85,20 @@ tasks:
       runs = expand_cell_range(
           os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
       )
+      target_status = {"created_workbook": False, "created_worksheets": 0}
       if (os.environ["DRY_RUN"].lower() == "false"
               and os.environ["WRITE_GSHEET"].lower() == "true"):
-          validate_sheet_range(
+          target_status = validate_sheet_range(
               os.environ["START_DATE"], os.environ["END_DATE"], os.environ["CLUSTER_ID"],
               credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
           )
       Kestra.logger().info("Range ready: " + str(len(runs)) + " sequential cluster/date cohorts")
-      Kestra.outputs({"runs": [dict(run, ordinal=index + 1) for index, run in enumerate(runs)], "count": len(runs)})
+      Kestra.outputs({
+          "runs": [dict(run, ordinal=index + 1) for index, run in enumerate(runs)],
+          "count": len(runs),
+          "workbook_created": target_status["created_workbook"],
+          "worksheets_created": target_status["created_worksheets"],
+      })
 
   - id: process_cell_range_sequentially
     type: io.kestra.plugin.core.flow.ForEach

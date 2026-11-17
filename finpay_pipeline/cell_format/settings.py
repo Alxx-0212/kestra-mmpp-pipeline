@@ -112,13 +112,6 @@ def _parse_worksheet_ids(value):
 def sheet_configuration(environment=None) -> CellSheetConfiguration:
     """Resolve and validate target settings without constructing Google clients."""
     environment = os.environ if environment is None else environment
-    obsolete_settings = (
-        "CELL_FORMAT_CREATE_SPREADSHEET_IF_MISSING",
-        "CELL_FORMAT_CREATE_WORKSHEETS_IF_MISSING",
-        "CELL_FORMAT_RESTORE_MISSING_PUBLISHED_WORKSHEETS",
-    )
-    if any(name in environment for name in obsolete_settings):
-        raise ValueError("cell-format destination creation and restoration settings are unsupported")
     spreadsheet_id = _setting(environment, "CELL_FORMAT_SPREADSHEET_ID", CELL_FORMAT_SPREADSHEET_ID)
     spreadsheet_name = _setting(environment, "CELL_FORMAT_SPREADSHEET_NAME", CELL_FORMAT_SPREADSHEET_NAME)
     if not isinstance(spreadsheet_id, str):

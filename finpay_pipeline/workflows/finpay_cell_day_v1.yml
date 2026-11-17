@@ -74,16 +74,21 @@ tasks:
       GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
     script: |
       import os
+      from kestra import Kestra
       from finpay_pipeline.cell_workflow import decode_cell_google_credentials
       from finpay_pipeline.cell_format import validate_sheet_range
       from finpay_pipeline.cell_observability import observed
 
       validate_sheet_range = observed("target_validation")(validate_sheet_range)
-      validate_sheet_range(
+      target = validate_sheet_range(
           os.environ["REPORT_DATE"], os.environ["REPORT_DATE"],
           os.environ["CLUSTER_ID"],
           credentials_info=decode_cell_google_credentials(os.environ["GCP_SA_KEY"]),
       )
+      Kestra.outputs({
+          "workbook_created": target["created_workbook"],
+          "worksheets_created": target["created_worksheets"],
+      })
 
   - id: preflight_cell_database
     type: io.kestra.plugin.scripts.python.Script
