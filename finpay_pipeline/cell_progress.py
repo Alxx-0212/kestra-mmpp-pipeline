@@ -20,7 +20,9 @@ _TEXT_FIELDS = {
     "cluster_id", "report_date", "start_date", "end_date", "account",
     "cell_code", "role",
 }
-_COUNT_FIELDS = {"attempt", "completed", "total", "rows", "bytes", "count"}
+_COUNT_FIELDS = {
+    "attempt", "completed", "total", "rows", "bytes", "count", "roles", "requests",
+}
 _ALLOWED_FIELDS = _TEXT_FIELDS | _COUNT_FIELDS
 _OUTPUT_LOCK = threading.Lock()
 

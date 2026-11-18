@@ -5,7 +5,7 @@ import threading
 import unittest
 from contextlib import redirect_stdout
 
-from finpay_pipeline.cell_observability import observed
+from finpay_pipeline.cell_observability import observed, report
 from finpay_pipeline.cell_progress import Progress
 
 
@@ -168,6 +168,23 @@ class CellProgressTests(unittest.TestCase):
         serialized = json.dumps(records)
         self.assertNotIn("synthetic-secret", serialized)
         self.assertNotIn("synthetic-row-id", serialized)
+
+    def test_date_block_publish_progress_accepts_role_and_request_counts(self):
+        output = io.StringIO()
+
+        @observed("publish")
+        def publish_date_block():
+            report("date_block_published", roles=4, requests=1)
+
+        with redirect_stdout(output):
+            publish_date_block()
+        records = [
+            json.loads(json.loads(line[2:-2])["logs"][0]["message"])
+            for line in output.getvalue().splitlines()
+        ]
+        event = next(record for record in records if record["event"] == "date_block_published")
+        self.assertEqual(event["roles"], 4)
+        self.assertEqual(event["requests"], 1)
 
     def test_heartbeat_thread_is_stopped_and_joined_on_exit(self):
         heartbeat_seen = threading.Event()
