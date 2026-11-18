@@ -197,7 +197,8 @@ cell/date cohort. It does not require other dates or clear the current cohort if
 acquisition or validation fails; immutable source generations and row hashes are
 retained. A standalone day or range publication reads persisted database facts,
 then replaces or appends only each requested date block in Summary, Invoice,
-Unusual, and Reversal. Other dates remain in place. A range persists every
+Unusual, and Reversal, while reasserting the shared headers and Summary opening
+row from the same database-derived matrix. Other dates remain in place. A range persists every
 selected cluster/date before its publication pass begins; bulk likewise finishes
 all selected persistence before publishing its requested date blocks. No Sheet
 snapshot, publication epoch, or write-state row is used. Daily database results
@@ -332,7 +333,8 @@ created workbooks are shared with configured Finance editors. After selected dat
 is persisted, the publisher locates
 each requested date from column A and inserts, replaces, or resizes only that
 date's block. Range and bulk flows finish persistence for their full selection
-before beginning the date-block publication pass. Other dates remain untouched.
+before beginning the date-block publication pass. The publisher restores static
+headers/opening rows and managed layout without rewriting other date blocks.
 SALDO formulas recalculate over the persisted history; combined MANDIRI references
 the following date's `CASHOUT APOLLO` KREDIT and displays `PENDING NEXT DAY` if
 that source date is unavailable. The database stores no publication snapshots or

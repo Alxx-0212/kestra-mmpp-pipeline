@@ -242,6 +242,7 @@ def _ensure_cell_targets(workbook, cluster_id, configuration, *, create_missing=
         raise ValueError("opened cell workbook differs from the configured target")
     metadata = _read_with_retry(lambda: workbook.fetch_sheet_metadata(params={
         "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                   "merges,basicFilter,"
                    "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
                    "developerMetadata(metadataId,metadataKey,location(sheetId))"),
     }))
@@ -331,6 +332,7 @@ def _ensure_cell_targets(workbook, cluster_id, configuration, *, create_missing=
             mutation_error = exc
         metadata = _read_with_retry(lambda: workbook.fetch_sheet_metadata(params={
             "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                       "merges,basicFilter,"
                        "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
                        "developerMetadata(metadataId,metadataKey,location(sheetId))"),
         }))

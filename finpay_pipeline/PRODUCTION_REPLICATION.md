@@ -262,12 +262,16 @@ docker run --rm --pull never --network none \
 ```
 
 For `--pipeline legacy`, supply `--base-image` and `--legacy-scraper-image`
-instead. `--pipeline both` requires all four. The literal source-to-image mapping
-is `finpay-pipeline:3.11` to base, `finpay-cell-reporting:2.0` to reporting,
-`finpay-digipos-cell-scraper:2.0` to cell scraper, and
-`finpay-digipos-scraper:1.0` to legacy scraper. Only the three primary cell flows or
-three primary legacy flows are rendered; compatibility/monthly flow deployment
-requires its own explicitly reviewed release artifact.
+instead. `--pipeline both` requires all four. The source-to-image mapping is
+`finpay-pipeline:3.11` to base, `finpay-cell-reporting:2.0` and
+`finpay-cell-reporting:dev-cell-range-20261115` to reporting,
+`finpay-digipos-cell-scraper:2.0` and
+`finpay-digipos-cell-scraper:dev-cell-range-20261115` to cell scraper, and
+`finpay-digipos-scraper:1.0` to legacy scraper. Development aliases use the same
+immutable release digest as their corresponding stable source image. Only the
+three primary cell flows or three primary legacy flows are rendered;
+compatibility/monthly flow deployment requires its own explicitly reviewed
+release artifact.
 Register files from the artifact's `flows/` subdirectory; the checksum manifest
 sits beside that directory and is not itself a workflow.
 
@@ -558,8 +562,9 @@ Require all of the following:
 - DB source counts, selected generation/calculation/configuration hashes, and
   requested date/cell coverage agree. No synthetic opening transaction exists;
   raw source balances remain intact.
-- Four-tab requested date blocks and formulas match persisted current data after
-  batched readback. A green tab alone does not prove database persistence.
+- Four-tab requested date blocks, shared headers/opening row, formulas, and managed
+  layout match persisted current data after batched readback. A green tab alone
+  does not prove database persistence.
 - Summary starts at zero. Offline multi-day tests prove carry-forward; a one-day
   live canary must not be presented as live multi-day coverage.
 - Unrelated tab fingerprints and workbook sharing remain unchanged.

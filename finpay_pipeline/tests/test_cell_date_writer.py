@@ -1,5 +1,6 @@
 import re
 import unittest
+from unittest.mock import patch
 
 from finpay_pipeline.cell_publication import CellWorksheetTarget, publish_cell_date_blocks
 
@@ -14,6 +15,9 @@ class FakeSpreadsheet:
         self.batches = []
         self.row_count = {role: 2000 for role in targets}
         self.column_count = {role: 32 for role in targets}
+        self.merges = {role: [] for role in targets}
+        self.grid_properties = {role: {} for role in targets}
+        self.column_widths = {role: {} for role in targets}
 
     def fetch_sheet_metadata(self, params=None):
         sheets = []
@@ -28,6 +32,7 @@ class FakeSpreadsheet:
                     },
                 },
                 "protectedRanges": list(self.protections[role]),
+                "merges": list(self.merges[role]),
             })
         return {"spreadsheetId": self.id, "sheets": sheets,
                 "developerMetadata": list(self.metadata)}
@@ -61,7 +66,12 @@ class FakeSpreadsheet:
         for request in requests:
             operation, value = next(iter(request.items()))
             if operation == "appendDimension":
-                self.row_count[self._role_for_id(value["sheetId"])] += value["length"]
+                role = self._role_for_id(value["sheetId"])
+                dimension = value["dimension"]
+                if dimension == "ROWS":
+                    self.row_count[role] += value["length"]
+                else:
+                    self.column_count[role] += value["length"]
             elif operation in ("insertDimension", "deleteDimension"):
                 span = value["range"]
                 role = self._role_for_id(span["sheetId"])
@@ -107,8 +117,22 @@ class FakeSpreadsheet:
             elif operation == "deleteDeveloperMetadata":
                 metadata_id = value["dataFilter"]["developerMetadataLookup"]["metadataId"]
                 self.metadata = [item for item in self.metadata if item["metadataId"] != metadata_id]
-            elif operation in ("updateSheetProperties", "repeatCell", "updateBorders",
-                               "updateDimensionProperties", "autoResizeDimensions"):
+            elif operation == "updateSheetProperties":
+                role = self._role_for_id(value["properties"]["sheetId"])
+                self.grid_properties[role].update(value["properties"].get("gridProperties", {}))
+            elif operation == "updateDimensionProperties":
+                dimension = value["range"]["dimension"]
+                if dimension == "COLUMNS":
+                    role = self._role_for_id(value["range"]["sheetId"])
+                    self.column_widths[role][value["range"]["startIndex"]] = value["properties"]["pixelSize"]
+            elif operation == "mergeCells":
+                role = self._role_for_id(value["range"]["sheetId"])
+                self.merges[role].append(dict(value["range"]))
+            elif operation == "unmergeCells":
+                role = self._role_for_id(value["range"]["sheetId"])
+                self.merges[role] = [item for item in self.merges[role]
+                                     if item != value["range"]]
+            elif operation in ("repeatCell", "updateBorders", "autoResizeDimensions", "setBasicFilter"):
                 continue
             else:
                 raise AssertionError(f"unexpected batch request: {operation}")
@@ -152,8 +176,21 @@ def _matrix(role, dates, rows_per_date):
         if rows_per_date[day]:
             date_ranges.append({"report_date": day, "start_row": start,
                                 "end_row": len(values)})
-    return {"values": values, "date_ranges": date_ranges,
-            "headers": values[:header_rows]}
+    headers = values[:header_rows] if role in ("summary", "invoice") else values[0]
+    return {"values": values, "date_ranges": date_ranges, "headers": headers}
+
+
+def _detail_history_matrix(report_date, later_date):
+    headers = ["REPORT DATE", "CELL", "NO", "TRANSACTION DATE", "TRANSACTION ID",
+               "BASE ID", "TRANSACTION", "KREDIT", "DEBET", "SALDO AWAL",
+               "SALDO AKHIR", "NOMOR RS", "REMARKS", "REASON"]
+
+    def row(day, label):
+        return [day, label, 1, *([""] * (len(headers) - 3))]
+
+    values = [headers, row(report_date, "replacement-0"), row(report_date, "replacement-1"),
+              row(later_date, "later")]
+    return {"values": values, "rows": values, "headers": headers}
 
 
 class StatelessCellDateWriterTests(unittest.TestCase):
@@ -224,6 +261,66 @@ class StatelessCellDateWriterTests(unittest.TestCase):
         self.assertEqual(sum(row[0] == day for row in spreadsheet.rows["invoice"]), 1)
         self.assertEqual(sum(row[0] == day for row in spreadsheet.rows["unusual"]), 1)
         self.assertEqual(spreadsheet.rows, first_rows)
+
+    def test_empty_tabs_receive_summary_opening_and_static_layout(self):
+        day = "2026-10-01"
+        matrices = {
+            role: _matrix(role, [day], {day: 1})
+            for role in self.targets
+        }
+        summary = matrices["summary"]
+        summary["values"][2][:6] = [day, "OPENING", "OPENING BALANCE", 0, 0, 1000]
+        for role, matrix in matrices.items():
+            width = len(matrix["values"][0])
+            matrix["style_contract"] = {
+                "widths": [100] * width,
+                "frozen_rows": 2 if role in ("summary", "invoice") else 1,
+                "frozen_columns": 3 if role == "summary" else 0,
+                "merges": [[0, 2, 0, 1]] if role == "summary" else [],
+            }
+        spreadsheet = FakeSpreadsheet(self.targets, {role: [] for role in self.targets})
+        for role in self.targets:
+            spreadsheet.column_count[role] = 2
+
+        with patch("finpay_pipeline.cell_publication_v2._date_format_requests", return_value=[]):
+            publish_cell_date_blocks(spreadsheet, self.targets, matrices, day)
+
+        self.assertEqual(spreadsheet.rows["summary"][0][:3],
+                         ["REPORT DATE", "SECTION", "KETERANGAN"])
+        self.assertEqual(spreadsheet.rows["summary"][2][:6],
+                         [day, "OPENING", "OPENING BALANCE", 0, 0, 1000])
+        self.assertEqual(spreadsheet.column_count["summary"], 6)
+        self.assertEqual(spreadsheet.grid_properties["summary"]["frozenColumnCount"], 3)
+        self.assertEqual(len(spreadsheet.merges["summary"]), 1)
+        self.assertEqual(spreadsheet.column_widths["summary"], {index: 100 for index in range(6)})
+
+    def test_detail_history_without_date_ranges_rewrites_first_block_idempotently(self):
+        day, later = "2026-10-01", "2026-10-02"
+        matrices = {
+            role: _matrix(role, [day, later], {day: 1, later: 1})
+            for role in self.targets
+        }
+        matrices["unusual"] = _detail_history_matrix(day, later)
+        initial = {role: [row[:] for row in matrix["values"]]
+                   for role, matrix in matrices.items()}
+        unusual_headers = matrices["unusual"]["headers"]
+        unusual_width = len(unusual_headers)
+        initial["unusual"] = [
+            unusual_headers,
+            [day, "old", 1, *([""] * (unusual_width - 3))],
+            [later, "keep", 1, *([""] * (unusual_width - 3))],
+        ]
+        spreadsheet = FakeSpreadsheet(self.targets, initial)
+
+        publish_cell_date_blocks(spreadsheet, self.targets, matrices, day)
+        first_rows = [row[:] for row in spreadsheet.rows["unusual"]]
+        publish_cell_date_blocks(spreadsheet, self.targets, matrices, day)
+
+        detail_rows = [row for row in spreadsheet.rows["unusual"] if row and row[0] in (day, later)]
+        self.assertEqual([row[:2] for row in detail_rows], [
+            [day, "replacement-0"], [day, "replacement-1"], [later, "keep"],
+        ])
+        self.assertEqual(spreadsheet.rows["unusual"], first_rows)
 
 
 if __name__ == "__main__":

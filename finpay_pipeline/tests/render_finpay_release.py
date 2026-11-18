@@ -17,7 +17,9 @@ FLOW_FILES = {
 IMAGE_ARGUMENTS = {
     "finpay-pipeline:3.11": "base_image",
     "finpay-cell-reporting:2.0": "report_image",
+    "finpay-cell-reporting:dev-cell-range-20261115": "report_image",
     "finpay-digipos-cell-scraper:2.0": "cell_scraper_image",
+    "finpay-digipos-cell-scraper:dev-cell-range-20261115": "cell_scraper_image",
     "finpay-digipos-scraper:1.0": "legacy_scraper_image",
 }
 IMAGE_LINE = re.compile(r"(?m)^([ \t]*(?:-[ \t]+)?containerImage:[ \t]*)([^#\r\n]+?)([ \t]*(?:#.*)?)$")
@@ -84,7 +86,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pipeline", choices=("cell", "legacy", "both"), default="cell")
     parser.add_argument("--output-directory", required=True, type=Path)
-    for argument in IMAGE_ARGUMENTS.values():
+    for argument in dict.fromkeys(IMAGE_ARGUMENTS.values()):
         parser.add_argument("--" + argument.replace("_", "-"))
     args = parser.parse_args()
     try:

@@ -542,6 +542,7 @@ def _publish_cell_date_blocks_legacy(spreadsheet, targets, matrices, report_date
     if metadata is None:
         metadata = _read_with_retry(lambda: spreadsheet.fetch_sheet_metadata(params={
             "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                       "merges,basicFilter,"
                        "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
                        "developerMetadata(metadataId,metadataKey,location(sheetId))"),
         }))
@@ -581,6 +582,9 @@ def _publish_cell_date_blocks_legacy(spreadsheet, targets, matrices, report_date
         grid_rows = grid.get("rowCount")
         if type(grid_rows) is not int:
             raise ValueError(f"{role} worksheet grid row count is unavailable")
+        grid_columns = grid.get("columnCount")
+        if type(grid_columns) is not int:
+            raise ValueError(f"{role} worksheet grid column count is unavailable")
 
         dimensions = []
         if old:
@@ -680,8 +684,11 @@ def _publish_cell_date_blocks_legacy(spreadsheet, targets, matrices, report_date
     all_requests = list(managed_requests)
     for role in roles:
         plan = plans[role]
-        role_requests[role] = [*plan["dimensions"], *plan["markers"],
-                               *plan["values"], *plan["styles"]]
+        role_requests[role] = [
+            *plan["dimensions"], *plan["layout_before"], *plan["preamble_values"],
+            *plan["layout_after"], *plan["preamble_styles"], *plan["markers"],
+            *plan["values"], *plan["styles"],
+        ]
         all_requests.extend(role_requests[role])
     if any(len(json.dumps({"requests": [request]}).encode("utf-8")) > MAX_REQUEST_BYTES
            for request in all_requests):
@@ -704,6 +711,10 @@ def _publish_cell_date_blocks_legacy(spreadsheet, targets, matrices, report_date
         headers = list(managed_requests)
         for role in roles:
             headers.extend(plans[role]["dimensions"])
+            headers.extend(plans[role]["layout_before"])
+            headers.extend(plans[role]["preamble_values"])
+            headers.extend(plans[role]["layout_after"])
+            headers.extend(plans[role]["preamble_styles"])
             headers.extend(plans[role]["markers"])
         if len(json.dumps({"requests": headers}).encode("utf-8")) <= MAX_REQUEST_BYTES:
             send(headers)
@@ -711,7 +722,11 @@ def _publish_cell_date_blocks_legacy(spreadsheet, targets, matrices, report_date
             if managed_requests:
                 send(managed_requests)
             for role in roles:
-                header = [*plans[role]["dimensions"], *plans[role]["markers"]]
+                header = [
+                    *plans[role]["dimensions"], *plans[role]["layout_before"],
+                    *plans[role]["preamble_values"], *plans[role]["layout_after"],
+                    *plans[role]["preamble_styles"], *plans[role]["markers"],
+                ]
                 if header:
                     send(header)
         for role in roles:
@@ -725,24 +740,34 @@ def _publish_cell_date_blocks_legacy(spreadsheet, targets, matrices, report_date
                     pending = candidate
             send(pending)
 
-    read_ranges = []
+    read_ranges, readback_specs = [], []
     for role in roles:
         plan = plans[role]
         title = plan["title"].replace("'", "''")
+        width = len(plan["matrix"].get("values", plan["matrix"].get("rows"))[0])
+        if plan["preamble_count"]:
+            read_ranges.append(f"'{title}'!A1:{column_letter(width)}{plan['preamble_count']}")
+            readback_specs.append((role, "preamble"))
         if plan["count"]:
             first, last = plan["start"] + 1, plan["start"] + plan["count"]
-            width = len(plan["rows"][0])
             read_ranges.append(f"'{title}'!A{first}:{column_letter(width)}{last}")
         else:
-            read_ranges.append(f"'{title}'!A:A")
+            read_ranges.append(f"'{title}'!A{plan['preamble_count'] + 1}:A")
+        readback_specs.append((role, "date"))
     readback = _read_with_retry(lambda: spreadsheet.values_batch_get(
         read_ranges, params={"valueRenderOption": "FORMULA", "majorDimension": "ROWS"},
     )).get("valueRanges", [])
-    if len(readback) != len(roles):
+    if len(readback) != len(readback_specs):
         raise RuntimeError("Google Sheets returned incomplete date-block readback")
-    for role, value_range in zip(roles, readback):
+    for (role, kind), value_range in zip(readback_specs, readback):
         plan = plans[role]
-        if plan["count"]:
+        if kind == "preamble":
+            expected = plan["preamble_rows"]
+            actual = _padded(value_range.get("values", []), len(expected),
+                             len(plan["matrix"].get("values", plan["matrix"].get("rows"))[0]))
+            if actual != expected:
+                raise ValueError(f"{role} opening/header readback differs from DB-derived output")
+        elif plan["count"]:
             actual = _padded(value_range.get("values", []), plan["count"], len(plan["rows"][0]))
             if actual != plan["rows"]:
                 raise ValueError(f"{role} REPORT DATE block readback differs from DB-derived output")
@@ -909,9 +934,59 @@ def _display_only_sheet_requests(target, metadata, has_publication_marker):
     return requests
 
 
+def _cell_layout_requests(target, matrix, sheet_metadata, preamble_count):
+    contract = matrix.get("style_contract")
+    if not contract:
+        return [], []
+    values = matrix.get("values", matrix.get("rows"))
+    widths = contract.get("widths")
+    if (not values or not isinstance(widths, list) or len(widths) != len(values[0])
+            or any(type(width) is not int or width <= 0 for width in widths)):
+        raise ValueError("cell style contract has invalid column widths")
+    sheet_id = target.worksheet_id
+    after_values = [{"updateSheetProperties": {"properties": {"sheetId": sheet_id,
+        "gridProperties": {"frozenRowCount": contract["frozen_rows"],
+                           "frozenColumnCount": contract["frozen_columns"],
+                           "hideGridlines": True}},
+        "fields": "gridProperties(frozenRowCount,frozenColumnCount,hideGridlines)"}}]
+    for column, width in enumerate(widths):
+        after_values.append({"updateDimensionProperties": {"range": {
+            "sheetId": sheet_id, "dimension": "COLUMNS",
+            "startIndex": column, "endIndex": column + 1,
+        }, "properties": {"pixelSize": width}, "fields": "pixelSize"}})
+
+    expected_merges = {tuple(area) for area in contract.get("merges", [])}
+    existing_merges = sheet_metadata.get("merges", [])
+    before_values = []
+    for merge in existing_merges:
+        box = (merge.get("startRowIndex", 0), merge.get("endRowIndex", 0),
+               merge.get("startColumnIndex", 0), merge.get("endColumnIndex", 0))
+        if box in expected_merges:
+            before_values.append({"unmergeCells": {"range": {
+                "sheetId": sheet_id, "startRowIndex": box[0], "endRowIndex": box[1],
+                "startColumnIndex": box[2], "endColumnIndex": box[3],
+            }}})
+            continue
+        if box[0] < preamble_count and box[1] > 0:
+            if box[0] < 0 or box[1] > preamble_count:
+                raise ValueError("an existing merge crosses the managed cell preamble")
+            before_values.append({"unmergeCells": {"range": {
+                "sheetId": sheet_id, "startRowIndex": box[0], "endRowIndex": box[1],
+                "startColumnIndex": box[2], "endColumnIndex": box[3],
+            }}})
+    for box in sorted(expected_merges):
+        if box[0] < 0 or box[1] > preamble_count or box[0] >= box[1]:
+            raise ValueError("cell style merge falls outside the managed preamble")
+        after_values.append({"mergeCells": {"range": {
+            "sheetId": sheet_id, "startRowIndex": box[0], "endRowIndex": box[1],
+            "startColumnIndex": box[2], "endColumnIndex": box[3],
+        }, "mergeType": "MERGE_ALL"}})
+    return before_values, after_values
+
+
 def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, rows_per_request=200,
                              metadata=None):
-    """Rewrite one DB-derived date block in existing worksheets without a Sheet snapshot."""
+    """Rewrite one DB-derived date block and reassert its shared preamble/layout."""
     report_date = business_date(report_date).isoformat()
     if not targets or set(targets) != set(matrices):
         raise ValueError("date publication requires matching worksheet targets and matrices")
@@ -921,6 +996,7 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
     if metadata is None:
         metadata = _read_with_retry(lambda: spreadsheet.fetch_sheet_metadata(params={
             "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+                       "merges,basicFilter,"
                        "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
                        "developerMetadata(metadataId,metadataKey,location(sheetId))"),
         }))
@@ -952,7 +1028,7 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
         rows, source_start = _matrix_date_block(role, matrix, report_date)
         date_ranges = matrix.get("date_ranges", [])
         first_data_row = (min(item["start_row"] for item in date_ranges) - 1
-                          if date_ranges else len(matrix.get("headers", [])) or 1)
+                          if date_ranges else {"summary": 3, "invoice": 2}.get(role, 1))
         spans = _column_a_spans(column_range.get("values", []), first_data_row)
         old = spans.get(report_date)
         new_count = len(rows)
@@ -960,6 +1036,9 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
         grid_rows = grid.get("rowCount")
         if type(grid_rows) is not int:
             raise ValueError(f"{role} worksheet grid row count is unavailable")
+        grid_columns = grid.get("columnCount")
+        if type(grid_columns) is not int:
+            raise ValueError(f"{role} worksheet grid column count is unavailable")
 
         dimensions = []
         if old:
@@ -1019,9 +1098,32 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
                 "dimension": "ROWS",
                 "length": required_grid_rows - final_grid_rows,
             }})
+        required_grid_columns = len(matrix.get("values", matrix.get("rows"))[0])
+        if required_grid_columns > grid_columns:
+            dimensions.insert(0, {"appendDimension": {
+                "sheetId": targets[role].worksheet_id,
+                "dimension": "COLUMNS",
+                "length": required_grid_columns - grid_columns,
+            }})
 
         if rows:
             rows = _shift_date_block_formulas(rows, source_start, data_start)
+        values = matrix.get("values", matrix.get("rows"))
+        preamble_rows = [list(row) for row in values[:first_data_row]]
+        preamble_values = matrix_write_requests(
+            preamble_rows, targets[role].worksheet_id, start_row=0,
+            rows_per_request=rows_per_request, allow_formulas=role == "summary",
+        ) if preamble_rows else []
+        layout_before, layout_after = _cell_layout_requests(
+            targets[role], matrix, sheet_properties[targets[role].worksheet_id], first_data_row,
+        )
+        preamble_styles = []
+        if preamble_rows and matrix.get("style_contract") and isinstance(targets[role], CellWorksheetTarget):
+            from .cell_publication_v2 import _date_format_requests
+            preamble_styles = [request for request in _date_format_requests(
+                role, targets[role], matrix,
+                {"start_row": 0, "row_count": first_data_row, "spacer_ranges": []},
+            ) if "setBasicFilter" not in request]
         value_requests = matrix_write_requests(
             rows, targets[role].worksheet_id, start_row=data_start,
             rows_per_request=rows_per_request, allow_formulas=role == "summary",
@@ -1037,7 +1139,11 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
                               if (shifted := _shift_format_request_rows(request, delta)) is not None]
 
         plans[role] = {
-            "dimensions": dimensions, "values": value_requests, "styles": style_requests,
+            "dimensions": dimensions, "layout_before": layout_before,
+            "layout_after": layout_after,
+            "preamble_values": preamble_values, "preamble_styles": preamble_styles,
+            "preamble_rows": preamble_rows, "preamble_count": first_data_row,
+            "values": value_requests, "styles": style_requests,
             "markers": ([{"updateCells": {
                 "range": {"sheetId": targets[role].worksheet_id,
                           "startRowIndex": data_start, "endRowIndex": data_start + new_count,
@@ -1068,8 +1174,11 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
     all_requests = list(managed_requests)
     for role in roles:
         plan = plans[role]
-        role_requests[role] = [*plan["dimensions"], *plan["markers"],
-                               *plan["values"], *plan["styles"]]
+        role_requests[role] = [
+            *plan["dimensions"], *plan["layout_before"], *plan["preamble_values"],
+            *plan["layout_after"], *plan["preamble_styles"], *plan["markers"],
+            *plan["values"], *plan["styles"],
+        ]
         all_requests.extend(role_requests[role])
 
     if any(len(json.dumps({"requests": [request]}).encode("utf-8")) > MAX_REQUEST_BYTES
@@ -1093,6 +1202,10 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
         headers = list(managed_requests)
         for role in roles:
             headers.extend(plans[role]["dimensions"])
+            headers.extend(plans[role]["layout_before"])
+            headers.extend(plans[role]["preamble_values"])
+            headers.extend(plans[role]["layout_after"])
+            headers.extend(plans[role]["preamble_styles"])
             headers.extend(plans[role]["markers"])
         if len(json.dumps({"requests": headers}).encode("utf-8")) <= MAX_REQUEST_BYTES:
             send(headers)
@@ -1100,7 +1213,11 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
             if managed_requests:
                 send(managed_requests)
             for role in roles:
-                header = [*plans[role]["dimensions"], *plans[role]["markers"]]
+                header = [
+                    *plans[role]["dimensions"], *plans[role]["layout_before"],
+                    *plans[role]["preamble_values"], *plans[role]["layout_after"],
+                    *plans[role]["preamble_styles"], *plans[role]["markers"],
+                ]
                 if header:
                     send(header)
         for role in roles:
@@ -1114,24 +1231,34 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
                     pending = candidate
             send(pending)
 
-    read_ranges = []
+    read_ranges, readback_specs = [], []
     for role in roles:
         plan = plans[role]
         title = plan["title"].replace("'", "''")
+        width = len(plan["matrix"].get("values", plan["matrix"].get("rows"))[0])
+        if plan["preamble_count"]:
+            read_ranges.append(f"'{title}'!A1:{column_letter(width)}{plan['preamble_count']}")
+            readback_specs.append((role, "preamble"))
         if plan["count"]:
             first, last = plan["start"] + 1, plan["start"] + plan["count"]
-            width = len(plan["rows"][0])
             read_ranges.append(f"'{title}'!A{first}:{column_letter(width)}{last}")
         else:
-            read_ranges.append(f"'{title}'!A:A")
+            read_ranges.append(f"'{title}'!A{plan['preamble_count'] + 1}:A")
+        readback_specs.append((role, "date"))
     readback = _read_with_retry(lambda: spreadsheet.values_batch_get(
         read_ranges, params={"valueRenderOption": "FORMULA", "majorDimension": "ROWS"},
     )).get("valueRanges", [])
-    if len(readback) != len(roles):
+    if len(readback) != len(readback_specs):
         raise RuntimeError("Google Sheets returned incomplete date-block readback")
-    for role, value_range in zip(roles, readback):
+    for (role, kind), value_range in zip(readback_specs, readback):
         plan = plans[role]
-        if plan["count"]:
+        if kind == "preamble":
+            expected = plan["preamble_rows"]
+            actual = _padded(value_range.get("values", []), len(expected),
+                             len(plan["matrix"].get("values", plan["matrix"].get("rows"))[0]))
+            if actual != expected:
+                raise ValueError(f"{role} opening/header readback differs from DB-derived output")
+        elif plan["count"]:
             actual = _padded(value_range.get("values", []), plan["count"], len(plan["rows"][0]))
             if actual != plan["rows"]:
                 raise ValueError(f"{role} REPORT DATE block readback differs from DB-derived output")
