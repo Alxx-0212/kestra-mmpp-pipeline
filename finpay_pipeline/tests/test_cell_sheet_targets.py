@@ -76,6 +76,7 @@ class FakeWorkbook:
         self.add_requests = []
         self.fail_add = None
         self.metadata_failures = []
+        self.metadata_calls = 0
         self.permission_failures = []
         self.worksheet_listing_failures = []
         self.worksheet_lookup_failures = []
@@ -92,6 +93,7 @@ class FakeWorkbook:
 
     def fetch_sheet_metadata(self, params=None):
         _raise_next(self.metadata_failures)
+        self.metadata_calls += 1
         return {
             "spreadsheetId": self.id,
             "properties": {"title": self.title},
@@ -277,6 +279,33 @@ class CellSheetTargetTests(unittest.TestCase):
             pipeline.resolve_cell_workbook(client, config)
         self.assertEqual(client.drive_queries, [])
         self.assertEqual(client.create_calls, [])
+
+    def test_deferred_workbook_verification_is_combined_with_role_metadata_read(self):
+        config = _configuration(CELL_FORMAT_SPREADSHEET_ID="selected")
+        worksheets = [
+            FakeWorksheet(900 + index, cell_worksheet_title(
+                ACCOUNT, role, settings.CELL_FORMAT_NAMING_SCHEME,
+            ))
+            for index, role in enumerate(ROLES)
+        ]
+        workbook = FakeWorkbook("selected", config.spreadsheet_name, worksheets)
+        client = FakeClient([workbook])
+
+        resolved, spreadsheet_id, created = pipeline.resolve_cell_workbook(
+            client, config, verify_metadata=False,
+        )
+        self.assertIs(resolved, workbook)
+        self.assertEqual(spreadsheet_id, "selected")
+        self.assertFalse(created)
+        self.assertEqual(workbook.metadata_calls, 0)
+
+        targets, metadata, created_roles = pipeline._ensure_cell_targets(
+            workbook, CLUSTER, config, create_missing=False,
+        )
+        self.assertEqual(workbook.metadata_calls, 1)
+        self.assertEqual(metadata["properties"]["title"], config.spreadsheet_name)
+        self.assertEqual(created_roles, 0)
+        self.assertEqual(set(targets), set(ROLES))
 
     def test_name_only_preflight_needs_no_worksheet_ids_or_google_client(self):
         clusters = selected_clusters("ALL")[:2]

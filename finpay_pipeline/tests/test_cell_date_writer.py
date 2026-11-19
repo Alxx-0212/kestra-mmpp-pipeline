@@ -1,8 +1,12 @@
+import json
 import re
 import unittest
 from unittest.mock import patch
 
-from finpay_pipeline.cell_publication import CellWorksheetTarget, publish_cell_date_blocks
+from finpay_pipeline.cell_publication import (
+    CellWorksheetTarget, _bounded_date_write_batches, _invoice_spacer_ranges,
+    publish_cell_date_blocks,
+)
 
 
 class FakeSpreadsheet:
@@ -18,11 +22,15 @@ class FakeSpreadsheet:
         self.merges = {role: [] for role in targets}
         self.grid_properties = {role: {} for role in targets}
         self.column_widths = {role: {} for role in targets}
+        self.cell_formats = {role: {} for role in targets}
+        self.grid_data_reads = 0
 
     def fetch_sheet_metadata(self, params=None):
+        if params and params.get("includeGridData"):
+            self.grid_data_reads += 1
         sheets = []
         for role, target in self.targets.items():
-            sheets.append({
+            sheet = {
                 "properties": {
                     "sheetId": target.worksheet_id,
                     "title": target.title,
@@ -33,7 +41,51 @@ class FakeSpreadsheet:
                 },
                 "protectedRanges": list(self.protections[role]),
                 "merges": list(self.merges[role]),
-            })
+            }
+            if params and params.get("includeGridData"):
+                ranges = params.get("ranges", [])
+                if isinstance(ranges, str):
+                    ranges = [ranges]
+                data = []
+                for a1_range in ranges:
+                    match = re.fullmatch(r"'((?:[^']|'')*)'!([A-Z]+)(\d*)[: ]([A-Z]+)?(\d*)", a1_range)
+                    if not match or match.group(1).replace("''", "'") != target.title:
+                        continue
+                    start_column = _column_index(match.group(2))
+                    end_column = _column_index(match.group(4) or match.group(2)) + 1
+                    start_row = int(match.group(3) or "1") - 1
+                    if match.group(5):
+                        end_row = int(match.group(5))
+                    else:
+                        end_row = max((index + 1 for index, row in enumerate(self.rows[role])
+                                       if any(value not in ("", None) for value in row)), default=start_row)
+                    row_data = []
+                    for row_index in range(start_row, end_row):
+                        source = self.rows[role][row_index] if row_index < len(self.rows[role]) else []
+                        cells = []
+                        for column in range(start_column, end_column):
+                            value = source[column] if column < len(source) else ""
+                            cell = {}
+                            if value not in ("", None):
+                                if isinstance(value, str):
+                                    key = "formulaValue" if value.startswith("=") else "stringValue"
+                                    cell["userEnteredValue"] = {key: value}
+                                elif type(value) in (int, float):
+                                    cell["userEnteredValue"] = {"numberValue": value}
+                                else:
+                                    cell["userEnteredValue"] = {"stringValue": str(value)}
+                            entered_format = self.cell_formats[role].get((row_index, column), {})
+                            if entered_format:
+                                cell["userEnteredFormat"] = entered_format
+                            cell["effectiveFormat"] = entered_format or {
+                                "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}
+                            }
+                            cells.append(cell)
+                        row_data.append({"values": cells})
+                    data.append({"startRow": start_row, "startColumn": start_column,
+                                 "rowData": row_data})
+                sheet["data"] = data
+            sheets.append(sheet)
         return {"spreadsheetId": self.id, "sheets": sheets,
                 "developerMetadata": list(self.metadata)}
 
@@ -132,7 +184,16 @@ class FakeSpreadsheet:
                 role = self._role_for_id(value["range"]["sheetId"])
                 self.merges[role] = [item for item in self.merges[role]
                                      if item != value["range"]]
-            elif operation in ("repeatCell", "updateBorders", "autoResizeDimensions", "setBasicFilter"):
+            elif operation == "repeatCell":
+                area = value["range"]
+                role = self._role_for_id(area["sheetId"])
+                background = value.get("cell", {}).get("userEnteredFormat", {}).get("backgroundColor")
+                if background is not None:
+                    for row in range(area.get("startRowIndex", 0), area.get("endRowIndex", len(self.rows[role]))):
+                        for column in range(area.get("startColumnIndex", 0),
+                                            area.get("endColumnIndex", self.column_count[role])):
+                            self.cell_formats[role][(row, column)] = {"backgroundColor": background}
+            elif operation in ("updateBorders", "autoResizeDimensions", "setBasicFilter"):
                 continue
             else:
                 raise AssertionError(f"unexpected batch request: {operation}")
@@ -236,6 +297,197 @@ class StatelessCellDateWriterTests(unittest.TestCase):
                 and not item.get("unprotectedRanges") for item in spreadsheet.protections[role])
             for role in self.targets
         ))
+
+    def test_invoice_spacers_are_whitened_in_the_existing_batch_update(self):
+        days = ["2026-11-13", "2026-11-14", "2026-11-15"]
+        matrices = {
+            role: _matrix(role, days, {day: 1 for day in days})
+            for role in self.targets
+        }
+        invoice = matrices["invoice"]
+        invoice["style_contract"] = {
+            "widths": [100] * len(invoice["values"][0]),
+            "frozen_rows": 2,
+            "frozen_columns": 0,
+            "merges": [],
+        }
+        initial = {role: [row[:] for row in matrix["values"]]
+                   for role, matrix in matrices.items()}
+        spreadsheet = FakeSpreadsheet(self.targets, initial)
+        spacer_ranges = _invoice_spacer_ranges(invoice, days[1])
+        accounting = {"red": 249 / 255, "green": 229 / 255, "blue": 178 / 255}
+        white = {"red": 1.0, "green": 1.0, "blue": 1.0}
+        width = len(invoice["values"][0])
+        for start, end in spacer_ranges:
+            for row in range(start, end):
+                for column in range(width):
+                    spreadsheet.cell_formats["invoice"][(row, column)] = {
+                        "backgroundColor": accounting,
+                    }
+
+        def white_spacer_requests(role, target, matrix, patch):
+            if role != "invoice":
+                return []
+            return [{"repeatCell": {
+                "range": {"sheetId": target.worksheet_id, "startRowIndex": start,
+                          "endRowIndex": end, "startColumnIndex": 0,
+                          "endColumnIndex": len(matrix["values"][0])},
+                "cell": {"userEnteredFormat": {"backgroundColor": white}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }} for start, end in patch["spacer_ranges"]]
+
+        with patch("finpay_pipeline.cell_publication_v2._date_format_requests",
+                   side_effect=white_spacer_requests):
+            result = publish_cell_date_blocks(spreadsheet, self.targets, matrices, days[1])
+
+        self.assertEqual(result["http_write_batches"], 1)
+        self.assertEqual(len(spreadsheet.batches), 1)
+        for start, end in spacer_ranges:
+            for row in range(start, end):
+                self.assertEqual(
+                    spreadsheet.cell_formats["invoice"][(row, 0)]["backgroundColor"], white,
+                )
+        self.assertTrue(any(
+            request.get("repeatCell", {}).get("cell", {}).get("userEnteredFormat", {}).get("backgroundColor") == white
+            for request in spreadsheet.batches[0]
+        ))
+        self.assertEqual(spreadsheet.grid_data_reads, 1)
+
+    def test_invoice_spacer_griddata_readback_rejects_accounting_fill(self):
+        days = ["2026-11-13", "2026-11-14", "2026-11-15"]
+        matrices = {
+            role: _matrix(role, days, {day: 1 for day in days})
+            for role in self.targets
+        }
+        invoice = matrices["invoice"]
+        invoice["style_contract"] = {
+            "widths": [100] * len(invoice["values"][0]),
+            "frozen_rows": 2,
+            "frozen_columns": 0,
+            "merges": [],
+        }
+        spreadsheet = FakeSpreadsheet(
+            self.targets,
+            {role: [row[:] for row in matrix["values"]]
+             for role, matrix in matrices.items()},
+        )
+        accounting = {"red": 249 / 255, "green": 229 / 255, "blue": 178 / 255}
+
+        def accounting_spacer_requests(role, target, matrix, patch):
+            if role != "invoice":
+                return []
+            return [{"repeatCell": {
+                "range": {"sheetId": target.worksheet_id, "startRowIndex": start,
+                          "endRowIndex": end, "startColumnIndex": 0,
+                          "endColumnIndex": len(matrix["values"][0])},
+                "cell": {"userEnteredFormat": {"backgroundColor": accounting}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }} for start, end in patch["spacer_ranges"]]
+
+        with patch("finpay_pipeline.cell_publication_v2._date_format_requests",
+                   side_effect=accounting_spacer_requests):
+            with self.assertRaisesRegex(ValueError, "invoice spacer background is not white"):
+                publish_cell_date_blocks(spreadsheet, self.targets, matrices, days[1])
+        self.assertEqual(spreadsheet.grid_data_reads, 1)
+
+    def test_overflow_batches_keep_spacer_styles_with_a_date_value_write(self):
+        value_requests = [
+            {"updateCells": {"range": {"sheetId": 12, "startRowIndex": index,
+                                        "endRowIndex": index + 1, "startColumnIndex": 0,
+                                        "endColumnIndex": 4}, "rows": [], "fields": "userEnteredValue"}}
+            for index in (30, 31)
+        ]
+        spacer_fill = {"repeatCell": {
+            "range": {"sheetId": 12, "startRowIndex": 10, "endRowIndex": 12,
+                      "startColumnIndex": 0, "endColumnIndex": 11},
+            "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}}},
+            "fields": "userEnteredFormat.backgroundColor",
+        }}
+        spacer_border = {"updateBorders": {
+            "range": {"sheetId": 12, "startRowIndex": 10, "endRowIndex": 12,
+                      "startColumnIndex": 0, "endColumnIndex": 11},
+            "top": {"style": "NONE"}, "bottom": {"style": "NONE"},
+        }}
+        unrelated_style = {"repeatCell": {
+            "range": {"sheetId": 12, "startRowIndex": 30, "endRowIndex": 31,
+                      "startColumnIndex": 0, "endColumnIndex": 4},
+            "cell": {"userEnteredFormat": {"horizontalAlignment": "RIGHT"}},
+            "fields": "userEnteredFormat.horizontalAlignment",
+        }}
+        paired = [value_requests[0], spacer_fill, spacer_border]
+        max_bytes = len(json.dumps({"requests": paired}).encode("utf-8"))
+
+        batches = _bounded_date_write_batches(
+            value_requests, [spacer_fill, spacer_border, unrelated_style], [(10, 12)], max_bytes,
+        )
+
+        self.assertGreater(len(batches), 1)
+        self.assertEqual(batches[0], paired)
+        self.assertTrue(any(value_requests[1] in batch for batch in batches))
+        self.assertTrue(any(unrelated_style in batch for batch in batches))
+
+    def test_publisher_overflow_keeps_invoice_spacer_fill_with_date_values(self):
+        days = ["2026-11-13", "2026-11-14", "2026-11-15"]
+        matrices = {
+            role: _matrix(role, days, {day: 8 for day in days})
+            for role in self.targets
+        }
+        invoice = matrices["invoice"]
+        invoice["style_contract"] = {
+            "widths": [100] * len(invoice["values"][0]),
+            "frozen_rows": 2,
+            "frozen_columns": 0,
+            "merges": [],
+        }
+        spreadsheet = FakeSpreadsheet(
+            self.targets,
+            {role: [row[:] for row in matrix["values"]]
+             for role, matrix in matrices.items()},
+        )
+        spacer_ranges = _invoice_spacer_ranges(invoice, days[1])
+        white = {"red": 1.0, "green": 1.0, "blue": 1.0}
+        width = len(invoice["values"][0])
+
+        def white_spacer_requests(role, target, matrix, patch):
+            if role != "invoice":
+                return []
+            return [{"repeatCell": {
+                "range": {"sheetId": target.worksheet_id, "startRowIndex": start,
+                          "endRowIndex": end, "startColumnIndex": 0,
+                          "endColumnIndex": len(matrix["values"][0])},
+                "cell": {"userEnteredFormat": {"backgroundColor": white}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }} for start, end in patch["spacer_ranges"]]
+
+        date_range = next(item for item in invoice["date_ranges"]
+                          if item["report_date"] == days[1])
+        date_start = date_range["start_row"] - 1
+        date_end = date_range["end_row"]
+        with patch("finpay_pipeline.cell_publication.MAX_REQUEST_BYTES", 6000), \
+                patch("finpay_pipeline.cell_publication_v2._date_format_requests",
+                      side_effect=white_spacer_requests):
+            result = publish_cell_date_blocks(
+                spreadsheet, self.targets, matrices, days[1], rows_per_request=1,
+            )
+
+        self.assertGreater(result["http_write_batches"], 1)
+        white_spacer_batches = []
+        for batch in spreadsheet.batches:
+            has_white_spacer = any(
+                request.get("repeatCell", {}).get("range", {}).get("startRowIndex") == start
+                and request.get("repeatCell", {}).get("range", {}).get("endRowIndex") == end
+                and request.get("repeatCell", {}).get("cell", {}).get("userEnteredFormat", {}).get("backgroundColor") == white
+                for request in batch for start, end in spacer_ranges
+            )
+            has_date_values = any(
+                request.get("updateCells", {}).get("range", {}).get("sheetId") == self.targets["invoice"].worksheet_id
+                and date_start <= request["updateCells"]["range"].get("startRowIndex", -1) < date_end
+                and request["updateCells"]["range"].get("endColumnIndex") == width
+                for request in batch
+            )
+            if has_white_spacer and has_date_values:
+                white_spacer_batches.append(batch)
+        self.assertTrue(white_spacer_batches)
 
     def test_missing_date_appends_once_and_repeat_rewrite_does_not_duplicate(self):
         day = "2026-11-14"

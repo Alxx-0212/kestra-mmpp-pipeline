@@ -176,14 +176,15 @@ def _spreadsheet_by_name(client, title):
     return workbook, spreadsheet_id
 
 
-def resolve_cell_workbook(client, configuration: CellSheetConfiguration):
+def resolve_cell_workbook(client, configuration: CellSheetConfiguration, *, verify_metadata=True):
     """Resolve an existing workbook without creating or retargeting a pinned ID."""
     if configuration.spreadsheet_id:
         spreadsheet_id = configuration.spreadsheet_id
         workbook = _read_with_retry(lambda: client.open_by_key(spreadsheet_id))
         if getattr(workbook, "id", None) != spreadsheet_id:
             raise ValueError("opened cell workbook ID differs from configured target")
-        _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
+        if verify_metadata:
+            _verify_workbook(workbook, spreadsheet_id, configuration.spreadsheet_name)
         if spreadsheet_id == configuration.legacy_spreadsheet_id:
             raise ValueError("cell-format workbook must be distinct from the legacy workbook")
         return workbook, spreadsheet_id, False
@@ -191,19 +192,22 @@ def resolve_cell_workbook(client, configuration: CellSheetConfiguration):
     workbook_match = _spreadsheet_by_name(client, configuration.spreadsheet_name)
     if workbook_match is None:
         raise FileNotFoundError("configured cell-format spreadsheet must already exist")
-    _verify_workbook(workbook_match[0], workbook_match[1], configuration.spreadsheet_name)
+    if verify_metadata:
+        _verify_workbook(workbook_match[0], workbook_match[1], configuration.spreadsheet_name)
     if workbook_match[1] == configuration.legacy_spreadsheet_id:
         raise ValueError("cell-format workbook must be distinct from the legacy workbook")
     return workbook_match[0], workbook_match[1], False
 
 
-def ensure_cell_workbook(client, configuration: CellSheetConfiguration, *, creation_client_factory=None):
+def ensure_cell_workbook(client, configuration: CellSheetConfiguration, *, creation_client_factory=None,
+                         verify_metadata=True):
     """Create an exact-name workbook only when no workbook ID is pinned."""
     if configuration.spreadsheet_id:
-        return resolve_cell_workbook(client, configuration)
+        return resolve_cell_workbook(client, configuration, verify_metadata=verify_metadata)
     workbook_match = _spreadsheet_by_name(client, configuration.spreadsheet_name)
     if workbook_match:
-        _verify_workbook(workbook_match[0], workbook_match[1], configuration.spreadsheet_name)
+        if verify_metadata:
+            _verify_workbook(workbook_match[0], workbook_match[1], configuration.spreadsheet_name)
         if workbook_match[1] == configuration.legacy_spreadsheet_id:
             raise ValueError("cell-format workbook must be distinct from the legacy workbook")
         return workbook_match[0], workbook_match[1], False
@@ -241,13 +245,15 @@ def _ensure_cell_targets(workbook, cluster_id, configuration, *, create_missing=
             or spreadsheet_id == configuration.legacy_spreadsheet_id):
         raise ValueError("opened cell workbook differs from the configured target")
     metadata = _read_with_retry(lambda: workbook.fetch_sheet_metadata(params={
-        "fields": ("spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
+        "fields": ("spreadsheetId,properties(title),sheets(properties(sheetId,title,gridProperties(rowCount,columnCount),tabColorStyle),"
                    "merges,basicFilter,"
                    "protectedRanges(protectedRangeId,description,range,unprotectedRanges,warningOnly,editors)),"
                    "developerMetadata(metadataId,metadataKey,location(sheetId))"),
     }))
     if metadata.get("spreadsheetId") != spreadsheet_id:
         raise ValueError("cell workbook metadata ID differs from configured target")
+    if configuration.spreadsheet_name and metadata.get("properties", {}).get("title") != configuration.spreadsheet_name:
+        raise ValueError("cell workbook title differs from configured exact target")
     account, _ = account_settings(cluster_id)
     configured = (configuration.worksheet_ids or {}).get(account)
     if configuration.worksheet_ids is not None and configured is None:
@@ -397,6 +403,7 @@ def ensure_cell_sheet_targets(clusters, credentials_info, *, sheet_client_factor
         creation_client_factory=lambda: sheet_client_factory(
             credentials_info, include_drive_file=True,
         ),
+        verify_metadata=False,
     )
     if created:
         share_errors = []
@@ -633,7 +640,9 @@ def publish_cell_sheets(report_date: str, cluster_id: str, *, database_password:
         raise ValueError("Google credential identity differs from the configured cell writer")
     target = database_target() if target is None else target
     client = sheet_client_factory(credentials_info)
-    workbook, spreadsheet_id, _ = resolve_cell_workbook(client, configuration)
+    workbook, spreadsheet_id, _ = resolve_cell_workbook(
+        client, configuration, verify_metadata=False,
+    )
     targets, metadata, _ = _ensure_cell_targets(
         workbook, cluster_id, configuration, create_missing=False,
     )

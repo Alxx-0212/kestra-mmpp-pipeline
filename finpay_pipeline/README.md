@@ -203,8 +203,9 @@ selected cluster/date before its publication pass begins; bulk likewise finishes
 all selected persistence before publishing its requested date blocks. No Sheet
 snapshot, publication epoch, or write-state row is used. Daily database results
 never store cumulative SALDO; the Summary uses formulas so later balances
-recalculate. Combined MANDIRI is formula-derived from the next day's
-`CASHOUT APOLLO` KREDIT and displays `PENDING NEXT DAY` when that date is absent.
+recalculate. Combined MANDIRI locates the next date's displayed
+`TRANSFER MASUK DARI FINPAY` row and uses its KREDIT, sourced from the underlying
+`CASHOUT APOLLO` measure. It displays `PENDING NEXT DAY` when that date is absent.
 Manual MANDIRI inputs and reset tracking are unsupported. Full-history coverage
 checks remain for bulk calculations; the requested Sheet range itself is never
 widened implicitly. The configured balance boundary remains `2026-10-01`, and
@@ -335,15 +336,16 @@ each requested date from column A and inserts, replaces, or resizes only that
 date's block. Range and bulk flows finish persistence for their full selection
 before beginning the date-block publication pass. The publisher restores static
 headers/opening rows and managed layout without rewriting other date blocks.
-SALDO formulas recalculate over the persisted history; combined MANDIRI references
-the following date's `CASHOUT APOLLO` KREDIT and displays `PENDING NEXT DAY` if
-that source date is unavailable. The database stores no publication snapshots or
+SALDO formulas recalculate over the persisted history; combined MANDIRI looks up
+the following date's `TRANSFER MASUK DARI FINPAY` row and reads its KREDIT, sourced
+from `CASHOUT APOLLO`. It displays `PENDING NEXT DAY` if that source date is unavailable. The database stores no publication snapshots or
 `PENDING`/`IN_FLIGHT`/`UNKNOWN` write state. Date-block row mutations, values,
 and managed display-only protection updates across the four role tabs share one
 `spreadsheets.batchUpdate` when the payload fits the configured byte limit;
 larger payloads split into bounded batches. The writer removes legacy MANDIRI
 input holes and temporary publisher guards, but leaves unmanaged protections and
-workbook sharing unchanged. Readback is a separate batched phase.
+workbook sharing unchanged. One targeted grid-data readback verifies date-block
+values/formulas and white Invoice spacer backgrounds.
 The current source configures the dedicated cell Google client with a 30-second
 connection timeout and a 300-second response-read timeout (the prior source values
 were 10/120 seconds). This source change does not update a deployed image
@@ -381,9 +383,10 @@ date blocks; manual MANDIRI values and publication-state gates are unsupported.
 
 A byte-different XLSX creates a new source generation because generation identity
 includes the source-file SHA-256. If its normalized-row fingerprint and row count
-are unchanged, the persisted business rows remain equivalent. Combined MANDIRI is
-derived from the following date's `CASHOUT APOLLO` KREDIT and is never manually
-edited or reset in Google Sheets.
+are unchanged, the persisted business rows remain equivalent. Combined MANDIRI
+looks up the following date's displayed `TRANSFER MASUK DARI FINPAY` row and uses
+its KREDIT, sourced from `CASHOUT APOLLO`; it is never manually edited or reset in
+Google Sheets.
 
 ## Data Contracts
 

@@ -3,6 +3,8 @@ import unittest
 
 from finpay_pipeline.cell_calculation import CellReportConfig
 from finpay_pipeline.cell_contracts import fingerprint
+from finpay_pipeline.cell_publication import CellWorksheetTarget, _invoice_spacer_ranges
+from finpay_pipeline.cell_publication_v2 import _date_format_requests, bind_cell_style_contract
 from finpay_pipeline.cell_invoice_sheets import (
     INVOICE_COLORS, SALES_FEE_LABEL, build_cell_invoice_matrix, invoice_format_requests,
 )
@@ -227,6 +229,36 @@ class CellInvoiceSheetTests(unittest.TestCase):
                 and item["updateBorders"].get("right", {}).get("style") == "SOLID_MEDIUM" for item in requests))
         self.assertEqual(matrix["values"][matrix["qris_subtitle_rows"][0] - 1][1], "QRISDUWIT")
         self.assertTrue(matrix["qris_child_rows"])
+
+    def test_date_scoped_formatting_repaints_day_spacers_white(self):
+        matrix = build_cell_invoice_matrix(
+            self.config, self.facts("2026-10-01") + self.facts("2026-10-02"),
+        )
+        bind_cell_style_contract("invoice", matrix)
+        spacers = _invoice_spacer_ranges(matrix, "2026-10-02")
+        date_range = matrix["date_ranges"][1]
+        target = CellWorksheetTarget(
+            "invoice", "test-sheet", 9, "PKY Invoice", "writer@example.test",
+            ("viewer@example.test",),
+        )
+
+        requests = _date_format_requests("invoice", target, matrix, {
+            "start_row": date_range["start_row"] - 1,
+            "row_count": date_range["end_row"] - date_range["start_row"] + 1,
+            "spacer_ranges": spacers,
+        })
+
+        for start, end in spacers:
+            self.assertTrue(any(
+                (repeat := request.get("repeatCell", {}))
+                and repeat.get("range") == {
+                    "sheetId": 9, "startRowIndex": start, "endRowIndex": end,
+                    "startColumnIndex": 0, "endColumnIndex": len(matrix["values"][0]),
+                }
+                and repeat.get("cell", {}).get("userEnteredFormat", {}).get("backgroundColor")
+                == INVOICE_COLORS["white"]
+                for request in requests
+            ))
 
     def test_final_section_title_alignment_is_not_overwritten_by_body_rules(self):
         matrix = build_cell_invoice_matrix(self.config, self.facts("2026-10-01"))

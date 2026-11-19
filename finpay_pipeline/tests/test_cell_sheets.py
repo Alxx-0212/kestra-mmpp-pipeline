@@ -73,7 +73,8 @@ class CellSheetDesignTests(unittest.TestCase):
             self.assertIn("SUMIFS", formula)
             self.assertIn(f"{credit_col}:{credit_col}", formula)
             self.assertIn('"2026-10-14"', formula)
-            self.assertIn('"CASHOUT APOLLO"', formula)
+            self.assertIn('"TRANSFER MASUK DARI FINPAY"', formula)
+            self.assertNotIn('"CASHOUT APOLLO"', formula)
         detail = next(index + 1 for index, key in enumerate(matrix["row_keys"])
                       if key.startswith("DETAIL:") and matrix["values"][index][0] == "2026-10-13")
         saldo_col = self.block(matrix, "412111")["start_column"] + 1
@@ -92,6 +93,19 @@ class CellSheetDesignTests(unittest.TestCase):
         self.assertEqual(matrix["numeric_preview"][row - 1][block["start_column"] - 1],
                          "PENDING NEXT DAY")
         self.assertEqual(matrix["editable_inputs"], [])
+
+    def test_detail_row_order_keeps_transfer_first_and_hold_once(self):
+        matrix = current_matrix(self.report, dummy=True, presentation_version=5)
+        for date_range in matrix["date_ranges"][:3]:
+            day = date_range["report_date"]
+            with self.subTest(day=day):
+                labels = [matrix["values"][index][2]
+                          for index in range(date_range["start_row"] - 1, date_range["end_row"])
+                          if matrix["row_keys"][index].startswith("DETAIL:")]
+                self.assertEqual(labels[0], "TRANSFER MASUK DARI FINPAY")
+                self.assertEqual(labels.count("BIAYA FEE BAR A ST (HOLD)"), 1)
+                self.assertGreater(labels.index("BIAYA FEE BAR A ST (HOLD)"),
+                                   labels.index("BIAYA FEE ST"))
 
     def test_no_invoice_linkaja_or_legacy_panels(self):
         matrix = render_cell_matrix(self.report, dummy=True)
@@ -331,7 +345,8 @@ class CompactSheetDesignTests(unittest.TestCase):
                 block = next(item for item in matrix["blocks"] if item["cell_code"] == code)
                 formula = matrix["values"][row - 1][block["start_column"] - 1]
                 self.assertIn("SUMIFS", formula)
-                self.assertIn('"CASHOUT APOLLO"', formula)
+                self.assertIn('"TRANSFER MASUK DARI FINPAY"', formula)
+                self.assertNotIn('"CASHOUT APOLLO"', formula)
                 if day["report_date"] != report["days"][-1]["report_date"]:
                     self.assertIn('"' + (report["days"][report["days"].index(day) + 1]["report_date"]) + '"', formula)
                 else:

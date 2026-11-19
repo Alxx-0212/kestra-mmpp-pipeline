@@ -191,11 +191,11 @@ def _render_wide_matrix(report: dict, *, dummy: bool = False) -> dict:
                             if previous_date is None:
                                 previous_saldo = str(cell["opening_saldo"])
                             else:
-                                label = previous_saldo_label.replace('"', '""')
+                                previous_label = previous_saldo_label.replace('"', '""')
                                 previous_saldo = (
-                                    f'IF(COUNTIFS($A:$A,"{previous_date}",$C:$C,"{label}")=1,'
+                                    f'IF(COUNTIFS($A:$A,"{previous_date}",$C:$C,"{previous_label}")=1,'
                                     f'SUMIFS({saldo_col}:{saldo_col},$A:$A,"{previous_date}",'
-                                    f'$C:$C,"{label}"),{cell["opening_saldo"]})'
+                                    f'$C:$C,"{previous_label}"),{cell["opening_saldo"]})'
                                 )
                             saldo_formula = f"={previous_saldo}+{debit_col}{row_number}-{credit_col}{row_number}"
                         else:
@@ -245,15 +245,16 @@ def _render_wide_matrix(report: dict, *, dummy: bool = False) -> dict:
                 elif key == "cash:MANDIRI":
                     credit = ""
                     next_date = (business_date(date_string) + timedelta(days=1)).isoformat()
+                    transfer_label = detail_categories(next_date)[0][0].upper()
                     following = next((item for item in days if item["report_date"] == next_date), None)
                     next_cell = (next((item for item in following["cells"] if item["cell_code"] == code), None)
                                  if following else None)
                     default = (next_cell["measures"].get("CASHOUT APOLLO", {}).get("kredit", 0)
                                if next_cell else "PENDING NEXT DAY")
                     debit_formula = (
-                        f'=IF(COUNTIFS($A:$A,"{next_date}",$C:$C,"CASHOUT APOLLO")=1,'
+                        f'=IF(COUNTIFS($A:$A,"{next_date}",$C:$C,"{transfer_label}")=1,'
                         f'SUMIFS({credit_col}:{credit_col},$A:$A,"{next_date}",'
-                        f'$C:$C,"CASHOUT APOLLO"),"PENDING NEXT DAY")'
+                        f'$C:$C,"{transfer_label}"),"PENDING NEXT DAY")'
                     )
                     debit = default
                     state["bank"] = debit

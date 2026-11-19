@@ -844,6 +844,82 @@ def _matrix_date_block(role, matrix, report_date):
     return [list(row) for row in rows], start
 
 
+def _invoice_spacer_ranges(matrix, report_date):
+    date_ranges = matrix.get("date_ranges", [])
+    selected = [index for index, item in enumerate(date_ranges)
+                if _sheet_report_date(item.get("report_date")) == report_date]
+    if len(selected) > 1:
+        raise ValueError("invoice matrix has duplicate date ranges")
+    if not selected:
+        return []
+
+    index = selected[0]
+    adjacent = []
+    if index:
+        adjacent.append((date_ranges[index - 1], date_ranges[index]))
+    if index + 1 < len(date_ranges):
+        adjacent.append((date_ranges[index], date_ranges[index + 1]))
+
+    spacers = []
+    for left, right in adjacent:
+        # Date ranges use 1-based starts and exclusive end rows in matrix slices.
+        start = left["end_row"]
+        end = right["start_row"] - 1
+        gap_rows = end - start
+        if gap_rows == 0:
+            continue
+        if gap_rows != 2:
+            raise ValueError("invoice day separators must contain exactly two rows")
+        spacers.append((start, end))
+    return spacers
+
+
+def _bounded_date_write_batches(value_requests, style_requests, spacer_ranges, max_bytes):
+    def size(requests):
+        return len(json.dumps({"requests": requests}).encode("utf-8"))
+
+    spacer_styles, remaining_styles = [], []
+    for request in style_requests:
+        operation = next(iter(request))
+        area = request[operation].get("range", {}) if operation in ("repeatCell", "updateBorders") else {}
+        if any(area.get("startRowIndex", 0) < end and area.get("endRowIndex", 0) > start
+               for start, end in spacer_ranges):
+            spacer_styles.append(request)
+        else:
+            remaining_styles.append(request)
+
+    paired_index = None
+    if spacer_styles:
+        if not value_requests:
+            raise ValueError("invoice spacer formatting requires a date value write")
+        paired_index = min(
+            range(len(value_requests)),
+            key=lambda index: size([value_requests[index], *spacer_styles]),
+        )
+        if size([value_requests[paired_index], *spacer_styles]) > max_bytes:
+            raise ValueError("invoice spacer formatting cannot share a bounded date write")
+
+    units = []
+    for index, request in enumerate(value_requests):
+        unit = [request]
+        if index == paired_index:
+            unit.extend(spacer_styles)
+        units.append(unit)
+    units.extend([[request] for request in remaining_styles])
+
+    batches, pending = [], []
+    for unit in units:
+        if size(unit) > max_bytes:
+            raise ValueError("one date write batch exceeds the configured request-size limit")
+        if pending and size([*pending, *unit]) > max_bytes:
+            batches.append(pending)
+            pending = []
+        pending.extend(unit)
+    if pending:
+        batches.append(pending)
+    return batches
+
+
 def _shift_date_block_formulas(rows, source_start, target_start):
     delta = target_start - source_start
     if not delta:
@@ -1110,6 +1186,7 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
             rows = _shift_date_block_formulas(rows, source_start, data_start)
         values = matrix.get("values", matrix.get("rows"))
         preamble_rows = [list(row) for row in values[:first_data_row]]
+        spacer_ranges = _invoice_spacer_ranges(matrix, report_date) if role == "invoice" else []
         preamble_values = matrix_write_requests(
             preamble_rows, targets[role].worksheet_id, start_row=0,
             rows_per_request=rows_per_request, allow_formulas=role == "summary",
@@ -1132,7 +1209,8 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
         if rows and matrix.get("style_contract") and isinstance(targets[role], CellWorksheetTarget):
             from .cell_publication_v2 import _date_format_requests
             style_requests = _date_format_requests(role, targets[role], matrix, {
-                "start_row": source_start, "row_count": new_count, "spacer_ranges": [],
+                "start_row": source_start, "row_count": new_count,
+                "spacer_ranges": spacer_ranges,
             })
             delta = data_start - source_start
             style_requests = [shifted for request in style_requests
@@ -1144,6 +1222,10 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
             "preamble_values": preamble_values, "preamble_styles": preamble_styles,
             "preamble_rows": preamble_rows, "preamble_count": first_data_row,
             "values": value_requests, "styles": style_requests,
+            "target_spacer_ranges": [(start + data_start - source_start,
+                                      end + data_start - source_start)
+                                     for start, end in spacer_ranges]
+                                    if rows and matrix.get("style_contract") else [],
             "markers": ([{"updateCells": {
                 "range": {"sheetId": targets[role].worksheet_id,
                           "startRowIndex": data_start, "endRowIndex": data_start + new_count,
@@ -1185,6 +1267,16 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
            for request in all_requests):
         raise ValueError("one stateless date subrequest exceeds the configured request-size limit")
 
+    overflow_role_batches = None
+    if len(json.dumps({"requests": all_requests}).encode("utf-8")) > MAX_REQUEST_BYTES:
+        overflow_role_batches = {
+            role: _bounded_date_write_batches(
+                plans[role]["values"], plans[role]["styles"],
+                plans[role]["target_spacer_ranges"], MAX_REQUEST_BYTES,
+            )
+            for role in roles
+        }
+
     sent_batches = 0
 
     def send(requests):
@@ -1221,15 +1313,8 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
                 if header:
                     send(header)
         for role in roles:
-            pending = []
-            for request in [*plans[role]["values"], *plans[role]["styles"]]:
-                candidate = [*pending, request]
-                if len(json.dumps({"requests": candidate}).encode("utf-8")) > MAX_REQUEST_BYTES:
-                    send(pending)
-                    pending = [request]
-                else:
-                    pending = candidate
-            send(pending)
+            for batch in overflow_role_batches[role]:
+                send(batch)
 
     read_ranges, readback_specs = [], []
     for role in roles:
@@ -1237,35 +1322,77 @@ def publish_cell_date_blocks(spreadsheet, targets, matrices, report_date, *, row
         title = plan["title"].replace("'", "''")
         width = len(plan["matrix"].get("values", plan["matrix"].get("rows"))[0])
         if plan["preamble_count"]:
-            read_ranges.append(f"'{title}'!A1:{column_letter(width)}{plan['preamble_count']}")
-            readback_specs.append((role, "preamble"))
+            count = plan["preamble_count"]
+            read_ranges.append(f"'{title}'!A1:{column_letter(width)}{count}")
+            readback_specs.append({"role": role, "kind": "preamble", "start_row": 0,
+                                   "count": count, "width": width})
         if plan["count"]:
             first, last = plan["start"] + 1, plan["start"] + plan["count"]
             read_ranges.append(f"'{title}'!A{first}:{column_letter(width)}{last}")
+            readback_specs.append({"role": role, "kind": "date", "start_row": plan["start"],
+                                   "count": plan["count"], "width": width})
         else:
             read_ranges.append(f"'{title}'!A{plan['preamble_count'] + 1}:A")
-        readback_specs.append((role, "date"))
-    readback = _read_with_retry(lambda: spreadsheet.values_batch_get(
-        read_ranges, params={"valueRenderOption": "FORMULA", "majorDimension": "ROWS"},
-    )).get("valueRanges", [])
-    if len(readback) != len(readback_specs):
-        raise RuntimeError("Google Sheets returned incomplete date-block readback")
-    for (role, kind), value_range in zip(readback_specs, readback):
+            readback_specs.append({"role": role, "kind": "absent",
+                                   "start_row": plan["preamble_count"], "width": 1})
+        for start, end in plan["target_spacer_ranges"]:
+            read_ranges.append(f"'{title}'!A{start + 1}:{column_letter(width)}{end}")
+            readback_specs.append({"role": role, "kind": "spacer", "start_row": start,
+                                   "count": end - start, "width": width})
+
+    readback = _read_with_retry(lambda: spreadsheet.fetch_sheet_metadata(params={
+        "includeGridData": True,
+        "ranges": read_ranges,
+        "fields": "sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(userEnteredValue,effectiveFormat(backgroundColor)))))",
+    }))
+    grid_blocks = {}
+    for sheet in readback.get("sheets", []):
+        sheet_id = sheet.get("properties", {}).get("sheetId")
+        role = next((item for item in roles if plans[item]["sheet_id"] == sheet_id), None)
+        if role is None:
+            continue
+        for block in sheet.get("data", []):
+            grid_blocks[(role, block.get("startRow", 0), block.get("startColumn", 0))] = block
+
+    for spec in readback_specs:
+        role, kind = spec["role"], spec["kind"]
         plan = plans[role]
-        if kind == "preamble":
-            expected = plan["preamble_rows"]
-            actual = _padded(value_range.get("values", []), len(expected),
-                             len(plan["matrix"].get("values", plan["matrix"].get("rows"))[0]))
+        block = grid_blocks.get((role, spec["start_row"], 0), {"rowData": []})
+        grid_rows = block.get("rowData", [])
+        actual_rows = [[_grid_cell_value(cell) for cell in row.get("values", [])]
+                       for row in grid_rows]
+        if kind == "absent":
+            if any(_sheet_report_date(row[0] if row else None) == report_date
+                   for row in actual_rows):
+                raise ValueError(f"{role} REPORT DATE block remained after delete")
+        elif kind in ("preamble", "date"):
+            expected = plan["preamble_rows"] if kind == "preamble" else plan["rows"]
+            actual = _padded(actual_rows, spec["count"], spec["width"])
             if actual != expected:
-                raise ValueError(f"{role} opening/header readback differs from DB-derived output")
-        elif plan["count"]:
-            actual = _padded(value_range.get("values", []), plan["count"], len(plan["rows"][0]))
-            if actual != plan["rows"]:
-                raise ValueError(f"{role} REPORT DATE block readback differs from DB-derived output")
-        elif any(_sheet_report_date(row[0] if row else None) == report_date
-                 for row in value_range.get("values", [])):
-            raise ValueError(f"{role} REPORT DATE block remained after delete")
+                description = "opening/header" if kind == "preamble" else "REPORT DATE block"
+                raise ValueError(f"{role} {description} readback differs from DB-derived output")
+        else:
+            for row_offset in range(spec["count"]):
+                row = grid_rows[row_offset] if row_offset < len(grid_rows) else {}
+                for column in range(spec["width"]):
+                    cells = row.get("values", [])
+                    cell = cells[column] if column < len(cells) else {}
+                    color = cell.get("effectiveFormat", {}).get("backgroundColor")
+                    if color and any(abs(color.get(channel, 0.0) - 1.0) > 1e-6
+                                     for channel in ("red", "green", "blue")):
+                        raise ValueError(
+                            f"invoice spacer background is not white at row "
+                            f"{spec['start_row'] + row_offset + 1}, column {column + 1}"
+                        )
     return {"report_date": report_date, "roles": roles, "http_write_batches": sent_batches}
+
+
+def _grid_cell_value(cell):
+    value = cell.get("userEnteredValue", {})
+    for key in ("formulaValue", "stringValue", "numberValue", "boolValue"):
+        if key in value:
+            return value[key]
+    return ""
 
 
 def _padded(rows, count, width):
