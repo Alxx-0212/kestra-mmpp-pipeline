@@ -24,6 +24,9 @@ CELL_MIGRATION = Path(__file__).parent / "migrations/003_finpay_cell_reporting_v
 CELL_STATE_RETIREMENT_MIGRATION = (
     Path(__file__).parent / "migrations/004_finpay_cell_remove_publication_state.sql"
 )
+CELL_RUNTIME_PRIVILEGE_MIGRATION = (
+    Path(__file__).parent / "migrations/005_finpay_cell_runtime_privileges_v1.sql"
+)
 
 
 def _json(value) -> str:

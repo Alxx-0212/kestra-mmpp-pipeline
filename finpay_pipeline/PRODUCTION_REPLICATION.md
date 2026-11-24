@@ -301,19 +301,24 @@ The destination name is unique. With no pinned ID, the workflow creates the
 workbook if absent and provisions missing constant alias role tabs before
 persistence. A pinned missing ID or mismatched title/ID blocks. New workbooks are
 shared with the configured Finance editors; existing sharing is not changed.
-Read back definitions/image references. If releasing legacy too, register daily
-v5 before legacy day, then legacy range. Keep compatibility IDs for their callers.
-Keep `finpay_cell_range_v1`'s `daily_cell_range_0500_wita` trigger disabled when
-registering the flow. It targets the previous day at 05:00 `Asia/Makassar` for
-`ALL` clusters; activation requires separate approval. Do not enable monthly
-publication or schedules as an incidental deployment step.
+Register `finpay_cell_day_v1` before `finpay_cell_range_v1`, namespace
+`finance.finpay`, then register `finpay_cell_daily_trigger_v1`. Keep the daily
+wrapper trigger disabled during initial registration. Keep
+`finpay_cell_range_v1` date-explicit and free of a schedule trigger. The wrapper's
+Schedule trigger must pass only static inputs; resolve `trigger.date` in the
+wrapper's Subflow task and pass the previous date to the range flow. On Kestra
+`v1.3.26`, placing `trigger.date` in Schedule trigger `inputs` creates an immediate
+FAILED execution before any range task starts. After definition readback and
+validation, enabling the wrapper schedule requires explicit approval. Do not enable
+monthly publication or unrelated schedules as an incidental deployment step.
 
 ### Execute A Per-Day Range
 
-`finpay_cell_range_v1` is the sequential range wrapper; it starts one
+`finpay_cell_range_v1` is the sequential range processor; it starts one
 `finpay_cell_day_v1` child for each cluster/date cohort. It persists every selected
-cohort before the separate publication pass writes only those date blocks. Keep
-its scheduled trigger disabled and execute it manually from the Kestra UI:
+cohort before the separate publication pass writes only those date blocks. It has
+no schedule trigger; execute it manually with explicit dates or call it through
+`finpay_cell_daily_trigger_v1`.
 
 Before running, set the flow variable `cell_reporting_network` to the exact
 shared Docker network that can resolve the configured database host. This is a

@@ -17,7 +17,7 @@ Build, CI/CD, commissioning, and recovery steps are in
 | Cell running SALDO | The database stores no cumulative balance; Sheet formulas calculate SALDO from persisted history and leave it explicitly unverified when required history is missing. The reporting boundary is October 1, 2026. |
 | Cell publication targets | Configure the destination name/optional pinned ID, legacy ID, writer, and Finance editors through Kestra secrets or per-flow variables. Name-only targets create a missing workbook; missing alias tabs are provisioned automatically. A missing pinned ID fails closed. |
 | Monthly settlement | Preview and gated publication implemented; Finance release requirements remain separate. |
-| Production commissioning and schedules | Not authorized by a local test or this refactor; acquisition schedules remain disabled. |
+| Production commissioning and schedules | Require explicit approval; local tests/refactors do not change Kestra runtime state. |
 
 This guide describes operating contracts, not a test-results ledger. Keep temporary
 execution results out of the README and remove scratch artifacts after review.
@@ -34,22 +34,28 @@ validation/calculation utilities without routing cell sources into legacy tables
 | Cell format | `finpay_cell_range_v1` | `finpay_cell_day_v1` in date-scoped mode, with four explicit stages. |
 | Bulk cell | `finpay_cell_bulk_v1` | Range acquisition/preprocessing, persist every selected cluster/date, then publish date blocks. |
 
-`finpay_cell_range_v1` defines a disabled daily schedule for 05:00
-`Asia/Makassar`. If separately commissioned and enabled, it processes the previous
-day for `ALL` clusters serially through the per-cluster/day flow. Each operational
-day task retries up to six total attempts (one initial attempt plus five retries)
-with exponential delays of 30s, 60s, then a 120s cap. The range expander and cohort
-progress logs use the same retry policy. A recovered task resets its future retry
-sequence to the 30s minimum. The range parent does not replay a day subflow after
-the child exhausts its retries, and terminal Telegram notifications remain
-single-attempt. The cell publisher keeps no publication snapshots or write-state
-rows. Rewriting the same date block is idempotent, while mutation retries remain
-disabled in the Google HTTP transport. After each successful live date/cluster cohort,
-the range waits 30s before starting the next cohort; this also preserves spacing
-when a new per-cohort Sheets client is created. Dry runs and database-only runs
-skip this wait.
-The schedule is dormant by default; local workflow edits do not authorize production
-activation.
+Daily scheduling is owned by `finpay_cell_daily_trigger_v1`, which calls the
+manual date-explicit `finpay_cell_range_v1` flow.
+
+`finpay_cell_daily_trigger_v1` owns the daily schedule at 05:00
+`Asia/Makassar`. It sends static trigger inputs, then resolves `trigger.date` in
+the wrapper task and calls `finpay_cell_range_v1` for the previous day and `ALL`
+clusters. On the installed Kestra `v1.3.26`, `trigger.date` fails inside Schedule
+trigger `inputs`; keep those inputs static and derive dates in task context. The
+range flow remains the manually runnable, date-explicit range processor. Each
+operational day task retries up to six total attempts (one initial attempt plus
+five retries) with exponential delays of 30s, 60s, then a 120s cap. The range
+expander and cohort progress logs use the same retry policy. A recovered task
+resets its future retry sequence to the 30s minimum. The range parent does not
+replay a day subflow after the child exhausts its retries, and terminal Telegram
+notifications remain single-attempt. The cell publisher keeps no publication
+snapshots or write-state rows. Rewriting the same date block is idempotent, while
+mutation retries remain disabled in the Google HTTP transport. After each
+successful live date/cluster cohort, the range waits 30s before starting the next
+cohort; this also preserves spacing when a new per-cohort Sheets client is created.
+Dry runs and database-only runs skip this wait.
+The current registered scheduler is enabled only under explicit authorization;
+local workflow edits alone do not change Kestra runtime state.
 
 The daily cell acquisition task also copies validated XLSX files to the Docker
 host bind mount `/tmp/finpay inbox/<cluster>/<date>/<inbox_generation_sha256>/<cell>/`. The
@@ -174,13 +180,16 @@ schema or tables and applies no DDL or migration. Cell schema setup remains an
 explicit operation.
 
 Bulk and range/day reporting tasks explicitly use the `cell_reporting_network`
-flow variable (default `bridge`). For a Compose-local database hostname such as
-`postgres`, set this variable to the exact shared Docker network name before
-running either entry point; the range parent forwards it to each day child.
+flow variable. These local flow defaults must match the exact shared Docker
+network name for the active Compose project (currently
+`kestra-mmpp-local-20261020_mmpp-finance-network`); the range parent forwards its
+value to each day child. Render the project-specific name when deploying to a
+different Compose project.
 `kestra.plugins.configurations` does not set this runner-instance property, so
 every nested reporting `taskRunner` must declare `networkMode`. Cell acquisition
 retains its separate host network. The selected reporting network must resolve
-the database host and allow Google HTTPS access.
+the database host and allow Google HTTPS access. The range expander timeout is
+`PT3M` to allow its Google target preflight to complete without immediate retries.
 
 Cell artifacts are size-bounded, with SHA-256 checks performed by application
 code at specific task boundaries. Persistence does not create a Google client.
@@ -465,9 +474,12 @@ Cell migration `003_finpay_cell_reporting_v1.sql` remains explicit and never app
 as an ordinary write side effect. Follow it with
 `004_finpay_cell_remove_publication_state.sql` only after separate approval and a
 verified backup of the exact `finpay` database; migration 004 drops obsolete
-publication, target-operation, manual-reset, and dirty-date tables. This change
-does not execute either migration against a database. Empty verified cell-days
-may supersede current data; incomplete or failed downloads must not clear it.
+publication, target-operation, manual-reset, and dirty-date tables. Then apply
+`005_finpay_cell_runtime_privileges_v1.sql` to grant the `finpay` runtime role only
+the schema/table privileges checked by `preflight_cell_database`; it grants no
+DELETE or DDL privileges. Verify the runtime role against the migration before
+acquisition. Empty verified cell-days may supersede current data; incomplete or
+failed downloads must not clear it.
 
 Cell database state is split by purpose:
 

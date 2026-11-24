@@ -6,7 +6,7 @@ concurrency:
   behavior: QUEUE
 
 variables:
-  cell_reporting_network: "bridge"
+  cell_reporting_network: "kestra-mmpp-local-20261020_mmpp-finance-network"
   cell_spreadsheet_id: ""
   cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
   legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"

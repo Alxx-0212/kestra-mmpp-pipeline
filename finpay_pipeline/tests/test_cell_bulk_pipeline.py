@@ -657,7 +657,10 @@ class CellBulkPipelineTests(unittest.TestCase):
     def test_bulk_reporting_tasks_explicitly_select_the_configured_network(self):
         workflow = Path(__file__).parents[1] / "workflows" / "finpay_cell_bulk_v1.yml"
         text = workflow.read_text(encoding="utf-8")
-        self.assertIn('  cell_reporting_network: "bridge"', text)
+        self.assertIn(
+            '  cell_reporting_network: "kestra-mmpp-local-20261020_mmpp-finance-network"',
+            text,
+        )
         for task_id in (
             "preflight_cell_bulk_targets", "preflight_cell_database",
             "preprocess_cell_bulk", "persist_cell_bulk", "publish_cell_bulk",

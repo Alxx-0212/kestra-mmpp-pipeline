@@ -11,7 +11,8 @@ from unittest.mock import Mock
 
 from finpay_pipeline.cell_contracts import configured_cells, fingerprint
 from finpay_pipeline.cell_database import (
-    CELL_MIGRATION, CELL_STATE_RETIREMENT_MIGRATION, CellDatabaseTarget, CellStore, cell_publication_session,
+    CELL_MIGRATION, CELL_STATE_RETIREMENT_MIGRATION, CELL_RUNTIME_PRIVILEGE_MIGRATION,
+    CellDatabaseTarget, CellStore, cell_publication_session,
     preflight_cell_database, prepare_cell_day, safe_cell_database_error, validate_cluster_batch,
 )
 
@@ -599,6 +600,25 @@ class CellDatabaseTests(unittest.TestCase):
         self.assertIn("DROP TABLE IF EXISTS public.finpay_cell_publications_v1", retirement)
         self.assertIn("DROP TABLE IF EXISTS public.finpay_cell_target_operations_v1", retirement)
         self.assertIn("DROP TABLE IF EXISTS public.finpay_cell_manual_resets_v1", retirement)
+
+
+    def test_runtime_privilege_migration_grants_only_preflight_required_access(self):
+        ddl = CELL_RUNTIME_PRIVILEGE_MIGRATION.read_text(encoding="utf-8")
+
+        self.assertIn("current_database() <> 'finpay'", ddl)
+        self.assertIn("GRANT USAGE ON SCHEMA public TO finpay", ddl)
+        for statement in (
+            "GRANT SELECT, INSERT ON TABLE public.finpay_cell_configs_v1 TO finpay",
+            "GRANT SELECT, INSERT ON TABLE public.finpay_cell_sources_v1 TO finpay",
+            "GRANT SELECT, INSERT ON TABLE public.finpay_cell_ledger_v1 TO finpay",
+            "GRANT SELECT, INSERT ON TABLE public.finpay_cell_calculations_v1 TO finpay",
+            "GRANT SELECT, INSERT, UPDATE ON TABLE public.finpay_cell_current_v1 TO finpay",
+            "GRANT SELECT ON TABLE public.finpay_cell_current_results_v1 TO finpay",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, ddl)
+        self.assertNotIn("GRANT ALL", ddl.upper())
+        self.assertNotIn("DROP TABLE", ddl.upper())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,49 @@
+id: finpay_cell_daily_trigger_v1
+namespace: finance.finpay
+
+description: "Schedules the prior business date and calls the range workflow."
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: cluster_id
+    type: STRING
+    required: true
+  - id: dry_run
+    type: BOOLEAN
+    required: true
+  - id: write_gsheet
+    type: BOOLEAN
+    required: true
+  - id: send_telegram
+    type: BOOLEAN
+    required: true
+
+triggers:
+  - id: daily_cell_range_0500_wita
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 5 * * *"
+    timezone: Asia/Makassar
+    disabled: false
+    inputs:
+      cluster_id: ALL
+      dry_run: false
+      write_gsheet: true
+      send_telegram: false
+
+tasks:
+  - id: invoke_finpay_cell_range
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: finance.finpay
+    flowId: finpay_cell_range_v1
+    wait: true
+    transmitFailed: true
+    inputs:
+      start_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+      end_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+      cluster_id: "{{ inputs.cluster_id }}"
+      dry_run: "{{ inputs.dry_run }}"
+      write_gsheet: "{{ inputs.write_gsheet }}"
+      send_telegram: "{{ inputs.send_telegram }}"

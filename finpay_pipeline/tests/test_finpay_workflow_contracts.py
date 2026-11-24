@@ -331,21 +331,73 @@ class FinPayWorkflowContractTest(unittest.TestCase):
                 with self.subTest(task=task_id, env=env_name):
                     self.assertIn(env_name + ":", task)
 
-    def test_cell_range_schedule_is_disabled_and_targets_previous_day(self):
-        flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
-        trigger = flow.split("\ntriggers:\n", 1)[1].split("\ninputs:\n", 1)[0]
+    def test_range_manual_contract_and_daily_scheduler_resolve_previous_day_in_task_context(self):
+        range_path = REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml"
+        daily_path = REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_daily_trigger_v1.yml"
+        self.assertTrue(daily_path.exists(), "daily trigger wrapper flow is missing")
+        range_flow = range_path.read_text()
+        daily_flow = daily_path.read_text()
 
+        self.assertNotRegex(range_flow, r"(?m)^triggers:$")
+        range_inputs = range_flow.split("\ninputs:\n", 1)[1].split("\ntasks:\n", 1)[0]
+        self.assertIn("- id: start_date\n    type: STRING\n    required: true", range_inputs)
+        self.assertIn("- id: end_date\n    type: STRING\n    required: true", range_inputs)
+
+        self.assertRegex(daily_flow, r"(?m)^id: finpay_cell_daily_trigger_v1$")
+        self.assertRegex(daily_flow, r"(?m)^namespace: finance\.finpay$")
+        trigger = daily_flow.split("\ntriggers:\n", 1)[1].split("\ntasks:\n", 1)[0]
         self.assertIn("id: daily_cell_range_0500_wita", trigger)
         self.assertIn("type: io.kestra.plugin.core.trigger.Schedule", trigger)
         self.assertIn('cron: "0 5 * * *"', trigger)
         self.assertIn("timezone: Asia/Makassar", trigger)
-        self.assertIn("disabled: true", trigger)
-        previous_day = "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
-        self.assertIn(f'start_date: "{previous_day}"', trigger)
-        self.assertIn(f'end_date: "{previous_day}"', trigger)
-        self.assertIn('cluster_id: "ALL"', trigger)
+        self.assertIn("disabled: false", trigger)
+        self.assertNotIn("trigger.date", trigger)
+        self.assertNotIn("start_date:", trigger)
+        self.assertNotIn("end_date:", trigger)
+        self.assertIn("cluster_id: ALL", trigger)
         self.assertIn("dry_run: false", trigger)
         self.assertIn("write_gsheet: true", trigger)
+        self.assertIn("send_telegram: false", trigger)
+
+        previous_day = "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+        task = _task_block(daily_flow, "invoke_finpay_cell_range")
+        self.assertIn("type: io.kestra.plugin.core.flow.Subflow", task)
+        self.assertIn("namespace: finance.finpay", task)
+        self.assertIn("flowId: finpay_cell_range_v1", task)
+        self.assertIn(f'start_date: "{previous_day}"', task)
+        self.assertIn(f'end_date: "{previous_day}"', task)
+        self.assertIn('cluster_id: "{{ inputs.cluster_id }}"', task)
+        self.assertIn('dry_run: "{{ inputs.dry_run }}"', task)
+        self.assertIn('write_gsheet: "{{ inputs.write_gsheet }}"', task)
+        self.assertIn('send_telegram: "{{ inputs.send_telegram }}"', task)
+
+    def test_range_and_day_reporting_use_compose_network_and_range_expander_has_headroom(self):
+        project_network = "kestra-mmpp-local-20261020_mmpp-finance-network"
+        range_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
+        day_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
+
+        self.assertIn(f'  cell_reporting_network: "{project_network}"', range_flow)
+        self.assertIn(f'  cell_reporting_network: "{project_network}"', day_flow)
+        self.assertIn(
+            '      networkMode: "{{ vars.cell_reporting_network }}"',
+            _task_block(range_flow, "expand_cell_range"),
+        )
+        self.assertIn("timeout: PT3M", _task_block(range_flow, "expand_cell_range"))
+        for task_id in (
+            "validate_cell_sheet_targets", "preflight_cell_database",
+            "preprocess_cell_cluster_day", "persist_cell_sources_and_calculations",
+            "publish_cell_four_tabs",
+        ):
+            with self.subTest(task=task_id):
+                self.assertIn(
+                    '      networkMode: "{{ inputs.cell_reporting_network }}"',
+                    _task_block(day_flow, task_id),
+                )
+        self.assertIn(
+            'cell_reporting_network: "{{ vars.cell_reporting_network }}"',
+            range_flow.split("flowId: finpay_cell_day_v1", 1)[1],
+        )
+        self.assertIn("networkMode: host", _task_block(day_flow, "acquire_cell_cluster_day"))
 
     def test_cell_day_processing_tasks_use_six_attempt_exponential_retries(self):
         flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
@@ -472,7 +524,10 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         range_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_range_v1.yml").read_text()
         day_flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
 
-        self.assertIn('cell_reporting_network: "bridge"', range_flow)
+        self.assertIn(
+            'cell_reporting_network: "kestra-mmpp-local-20261020_mmpp-finance-network"',
+            range_flow,
+        )
         self.assertIn(
             'networkMode: "{{ vars.cell_reporting_network }}"',
             _task_block(range_flow, "expand_cell_range"),

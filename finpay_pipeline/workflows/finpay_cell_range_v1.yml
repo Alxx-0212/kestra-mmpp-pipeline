@@ -7,24 +7,11 @@ concurrency:
 
 variables:
   cell_cluster_group: "ALL"
-  cell_reporting_network: "bridge"
+  cell_reporting_network: "kestra-mmpp-local-20261020_mmpp-finance-network"
   cell_spreadsheet_id: ""
   cell_spreadsheet_name: "{{ secret('FINPAY_CELL_SPREADSHEET_NAME') }}"
   legacy_spreadsheet_id: "{{ secret('FINPAY_LEGACY_SPREADSHEET_ID') }}"
   cell_worksheet_ids_json: ""
-
-triggers:
-  - id: daily_cell_range_0500_wita
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 5 * * *"
-    timezone: Asia/Makassar
-    disabled: true
-    inputs:
-      start_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
-      end_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
-      cluster_id: "ALL"
-      dry_run: false
-      write_gsheet: true
 
 inputs:
   - id: start_date
@@ -55,7 +42,7 @@ tasks:
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
       networkMode: "{{ vars.cell_reporting_network }}"
-    timeout: PT1M
+    timeout: PT3M
     retry:
       type: exponential
       interval: PT30S
