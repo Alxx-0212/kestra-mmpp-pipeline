@@ -9,11 +9,11 @@
     - id: source_file
       type: FILE
       displayName: "LinkAja CSV file"
-      description: "Upload one LinkAja CSV export for one cluster. Filename should be laporan-<cluster_id>-....csv."
+      description: "Upload one LinkAja CSV export for one top-level cluster; a Telkomsel export may include multiple child cells."
       required: true
 
     - id: dry_run
-      type: BOOLEAN
+      type: BOOL
       displayName: "Dry run?"
       description: "true → validate only. false → apply pending LinkAja schema migrations, replace affected raw transaction IDs, and calculate database-backed daily results."
       defaults: false
@@ -21,11 +21,11 @@
     - id: source_filename
       type: STRING
       displayName: "Original source filename"
-      description: "Optional original basename if Kestra stores the FILE as a temporary upload handle."
+      description: "Optional original basename for temporary uploads; if it does not identify the cluster, Top Organization must be consistent."
       defaults: ""
 
     - id: write_gsheet
-      type: BOOLEAN
+      type: BOOL
       displayName: "Write Google Sheets?"
       description: "Write the shared daily LinkAja summary and per-cluster detail tabs after PostgreSQL succeeds."
       defaults: true
@@ -104,11 +104,11 @@
       outputFiles:
         - linkaja_database_result.json
       env:
-        FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
-        FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
-        FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
-        FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
-        FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+        LINKAJA_DB_HOST: "{{ secret('LINKAJA_DB_HOST') }}"
+        LINKAJA_DB_PORT: "{{ secret('LINKAJA_DB_PORT') }}"
+        LINKAJA_DB_NAME: "{{ secret('LINKAJA_DB_NAME') }}"
+        LINKAJA_DB_USER: "{{ secret('LINKAJA_DB_USER') }}"
+        LINKAJA_DB_PASSWORD: "{{ secret('LINKAJA_DB_PASSWORD') }}"
       script: |
         import sys
         from kestra import Kestra
@@ -130,6 +130,7 @@
                 "normalized_linkaja.csv",
                 manifest,
                 dsn,
+                include_detail_rows=False,
             )
         except Exception as exc:
             print(f"❌ LinkAja PostgreSQL processing failed: {exc}", file=sys.stderr)
@@ -142,7 +143,8 @@
         print(f"✅ Impacted transaction IDs: {result['impacted_transaction_ids']}")
         print(f"✅ Current transaction rows: {result['transaction_rows']}")
         print(f"📅 Summary dates          : {', '.join(result['report_dates'])}")
-        print(f"📒 Ledger measure rows    : {len(result['detail_rows'])}")
+        print(f"💰 Cluster fee rows       : {len(result['fee_rows'])}")
+        print(f"🧩 Cell fee rows          : {len(result['cell_fee_rows'])}")
         Kestra.outputs({
             "cluster_id": result["cluster_id"],
             "schema_version": migration["current_version"],
@@ -151,8 +153,8 @@
             "impacted_transaction_ids": result["impacted_transaction_ids"],
             "transaction_rows": result["transaction_rows"],
             "report_dates": result["report_dates"],
-            "detail_rows": len(result["detail_rows"]),
-            "ledger_measure_rows": len(result["detail_rows"]),
+            "fee_rows": len(result["fee_rows"]),
+            "cell_fee_rows": len(result["cell_fee_rows"]),
         })
 
     - id: write_linkaja_daily_sheets
@@ -175,7 +177,7 @@
         - linkaja_google_write_result.json
       env:
         SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
-        TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
+        TARGET_SPREADSHEET: "Salinan dari Salinan dari Monitoring Finpay & LinkAja"
       script: |
         import json
         import os
@@ -186,7 +188,6 @@
         sys.path.insert(0, "/app")
         from linkaja_fee_pipeline.sheets import (
             make_gspread_client,
-            process_linkaja_detail_sheet_upload,
             process_linkaja_fee_sheet_upload,
         )
 
@@ -207,13 +208,7 @@
                 target_worksheet="LinkAja",
                 rows=result.get("fee_rows", []),
                 gspread_client=client,
-            )
-            detail_result = process_linkaja_detail_sheet_upload(
-                target_spreadsheet=os.environ["TARGET_SPREADSHEET"],
-                cluster_id=result["cluster_id"],
-                rows=result.get("detail_rows", []),
-                report_dates=result.get("report_dates", []),
-                gspread_client=client,
+                cell_rows=result.get("cell_fee_rows", []),
             )
         finally:
             if credential_path and os.path.exists(credential_path):
@@ -222,16 +217,13 @@
         write_result = {
             "spreadsheet": os.environ["TARGET_SPREADSHEET"],
             "summary": summary_result,
-            "detail": detail_result,
         }
         with open("linkaja_google_write_result.json", "w", encoding="utf-8") as handle:
             json.dump(write_result, handle, indent=2, default=str)
         print(f"✅ LinkAja summary worksheet: {summary_result['worksheet']}")
-        print(f"✅ LinkAja detail worksheet: {detail_result['worksheet']}")
         Kestra.outputs({
             "summary_worksheet": summary_result["worksheet"],
-            "detail_worksheet": detail_result["worksheet"],
             "summary_rows": summary_result["rows"],
-            "detail_rows": detail_result["rows"],
-            "report_dates": detail_result["report_dates"],
+            "cell_rows": summary_result["cell_rows"],
+            "report_dates": result.get("report_dates", []),
         })

@@ -44,9 +44,11 @@ the production workflow until dbt output parity is established.
 
 ### Inputs and side effects
 
-The daily workflow accepts one CSV export for one cluster. After PostgreSQL
-persistence, it writes the current daily fee summary and per-cluster ledger
-detail to the shared monitoring spreadsheet.
+The daily workflow accepts one CSV export for one cluster. A new Telkomsel
+export may contain that cluster's child cells in the same CSV. PostgreSQL keeps
+the cluster transaction grain while the daily fee result also includes one row
+per cell for the shared monitoring spreadsheet. This flow publishes the fee
+summary only; it does not calculate or write the cluster detail worksheet.
 
 Daily evidence is retained independently of the compatibility current-state
 table. `linkaja_source_loads` tracks exact file generations, while
@@ -59,10 +61,19 @@ monthly reversal analysis.
 
 | Input | Meaning |
 |---|---|
-| `source_file` | Required LinkAja CSV. The filename normally identifies the cluster, for example `laporan-411311-...csv`. |
-| `source_filename` | Optional original basename for API uploads where Kestra stores the FILE under a temporary `.upl` handle. |
+| `source_file` | Required LinkAja CSV for one top-level cluster; a Telkomsel export can contain several child cells. |
+| `source_filename` | Optional original basename for API uploads where Kestra stores the FILE under a temporary `.upl` handle. When the basename is not `laporan-<cluster_id>-...`, the source `Top Organization` must consistently identify the cluster. |
 | `dry_run` | `true` validates and normalizes only. It does not run migrations or write PostgreSQL rows. |
 | `write_gsheet` | Defaults to `true`. When `false`, PostgreSQL persists normally but Google Sheets writes are skipped. |
+
+Cluster identity is the numeric prefix of `Top Organization`, checked against
+the filename when it contains a cluster ID. Current codes are `422040`
+(BOLMONG), `422140` (KOTAMOBAGU), `422220` (TNT), `422100` (TDR), `422090`
+(MRT), `422010` (BGI), `422180` (MRW), and `412110` (PKY). Historical rows
+may retain the prior IDs `421306` (MRT), `421307` (TDR), `411311` (PKY),
+`421315` (BGI), `421318` (MRW), and `421320` (TNT). These IDs are preserved
+as stored; they are not translated to current codes. The text `cluster_id`
+contract requires no schema migration for this code change.
 
 For `dry_run=false`, the workflow does the following in order:
 
@@ -71,21 +82,42 @@ source CSV
 -> validate_and_normalize_linkaja_csv
 -> normalized_linkaja.csv + linkaja_manifest.json
 -> persist_and_summarize_linkaja
-   -> apply pending schema migrations
-   -> replace affected raw transaction IDs atomically
-   -> calculate live daily views and daily summary rows
+    -> apply pending schema migrations
+    -> replace affected raw transaction IDs atomically
+    -> calculate daily cluster and cell fee rows
 -> linkaja_database_result.json
 -> write_linkaja_daily_sheets (when enabled)
-   -> shared `LinkAja` fee summary
-   -> per-cluster `- LinkAja Detail` sheet
-   -> linkaja_google_write_result.json
+    -> shared `LinkAja` fee summary only
+    -> linkaja_google_write_result.json
 ```
 
+The detail writer remains in the package but is intentionally outside this
+fee-first flow. The daily fee workflow neither writes nor deletes detail tabs;
+any pre-existing detail tabs are left untouched and may contain older data.
+Remove them only through a separately authorized workbook cleanup. No separate
+daily detail Kestra workflow is registered. When a current code shares a display
+label with a legacy ID, its detail worksheet title includes the current ID;
+legacy worksheet titles remain stable.
+
 Google writes use the existing Kestra `GCP_SA_KEY` secret and target
-`Salinan dari Monitoring Finpay & LinkAja`. Sheet tasks execute after database
+`Salinan dari Salinan dari Monitoring Finpay & LinkAja`. Sheet tasks execute after database
 commit; a Google failure therefore leaves the database current but the sheet
-stale until the same file is retried. The writer is idempotent by report date
-and cluster and updates the existing monitoring layout.
+stale until the same file is retried. The writer is idempotent by report date,
+cluster, and cell. The summary uses a three-row header: cluster, cells for
+multi-cell clusters (or the cluster block for legacy clusters), then metric
+headings. A multi-cell cluster has one shared report-date column and the
+expected/in-cluster fee columns per cell. Adjacent cell groups have no blank
+column; a medium vertical border separates them below the cluster title. One
+blank column remains between cluster groups. The aggregate cluster fee is
+reconciled against the cells before commit but is not published as a separate
+block. No cluster or cell `TOTAL FEE` column is shown.
+When historical aggregate rows have no cell attribution, the writer preserves
+their original cluster ID in a `CLUSTER` group with the same date and two fee
+columns; it does not assign those rows to a current cell.
+
+The monthly settlement workflow remains a separate legacy output targeting
+`Salinan dari Monitoring Finpay & LinkAja` (one `Salinan` prefix); this daily
+fee-summary release does not redirect it.
 
 Retry scope includes historical posting dates and prior original IDs retained in
 the immutable ledger for the incoming transaction IDs. A committed correction
@@ -135,15 +167,31 @@ Use both levels of the source deliberately:
 | Ledger-row level | What changed in one named account. |
 | Transaction level | One completed business event grouped by `cluster_id + transaction_id`. |
 
-The company-side purchase account is identified only when both conditions are
-true:
+The company-side purchase account must contain
+`Organization MFS Purchase Account`. For the legacy export, its organization
+must equal `Top Organization`. In the new cell export, `Parent Organization`
+must have the same cluster prefix as `Top Organization`; the `Organization`
+value can then identify the owning cell.
 
-1. `Organization = Top Organization`.
-2. `Account` contains `Organization MFS Purchase Account`.
+Cell fee ownership is scenario-specific because the export contains both sides
+of a transfer:
+
+- Out-cluster expected fees use the cell on the company Purchase Account row.
+- In-cluster fees use the cell on the fee-bearing `Parent Organization` row.
+- Reversal state is still resolved at `cluster_id + transaction_id`; cell fees
+  are reconciled to cluster fees before the database transaction commits.
+- The cell roster includes append-only source versions so a transaction
+  corrected from one cell to another writes zeroes for the old cell/date instead
+  of leaving stale Google Sheets values.
+- If a distinct child `Parent Organization` is detected but cannot be mapped to
+  a cell, the load fails before commit rather than publishing cluster-only fees.
 
 Do not hard-code an account number. Account numbers can vary between clusters.
 Do not combine the company Purchase Account with a retailer or agent General
-Account: they may be the two sides of the same internal transfer.
+Account: they may be the two sides of the same internal transfer. A transaction
+that touches two cells may have two cell identifiers across its ledger rows;
+assign each fee from its own account side rather than assigning the whole
+transaction to both cells.
 
 At transaction grain, the ledger signed amount is:
 
@@ -169,12 +217,21 @@ balance reconciliation, not an amount to sum.
 | Relation | Type | Grain and responsibility |
 |---|---|---|
 | `linkaja_schema_migrations` | Table | Applied schema version, migration name, checksum, and timestamp. |
+| `linkaja_raw_stage` | Temporary table | One normalized upload staged for validation and atomic replacement; dropped at commit. |
 | `linkaja_raw_transactions` | Table | One normalized source ledger row. It retains both sides of internal transfers. |
+| `linkaja_source_loads` | Table | Exact source-file generations, coverage, and current/superseded state. |
+| `linkaja_ledger_versions` | Table | Append-only normalized ledger-row evidence retained across reruns. |
 | `linkaja_transaction_base_v` | View | One completed transaction fact before current reversal enrichment. |
 | `linkaja_transactions_current_v` | View | Current transaction fact with reversal, transfer-scope, and unusual-state columns. Daily SQL reads this view. |
 | `linkaja_transactions` | Table | Physical, immutable-in-practice monthly snapshot for a cluster and report month at a selected cutoff. Daily ingestion does not write it. |
 | `linkaja_monthly_refreshes` | Table | Audit row for a successful monthly publication. |
 | `linkaja_monthly_fee_summary_v` | View | Monthly Digipos and PPOB fee release summary calculated from the published snapshot. |
+
+The daily fee flow does not persist a separate fee-summary table. It persists
+source ledger rows and load history, then derives cluster/cell fee rows from
+the current views and fee-bearing source rows for the affected dates. The
+physical `linkaja_transactions` table is the monthly snapshot and is not written
+by this daily flow.
 
 ### Raw ledger table
 
@@ -294,13 +351,13 @@ each report date.
 
 ### Daily report surfaces for Taipy
 
-`linkaja_database_result.json` contains execution-scoped results for the
-affected dates. Its `fee_rows` expose report date, cluster, expected
-out-cluster fee, in-cluster fee, total fee, source-row count, and source-file
-provenance. Its `detail_rows` expose reversal-aware scenario labels, company
-debit/credit, source Fee, missing Fee count, expected and in-cluster fee
-measures, completed in-cluster reversal count/fee, and unresolved reversal
-count.
+`linkaja_database_result.json` contains execution-scoped fee results for the
+affected dates. Its `fee_rows` expose report date, cluster, expected out-cluster
+fee, in-cluster fee, total fee, source-row count, and source-file provenance.
+Its `cell_fee_rows` expose the same fee metrics for each cell. The fee-only daily
+flow leaves `detail_rows` empty; transaction detail remains queryable from
+`linkaja_transactions_current_v` and the raw ledger tables for a future separate
+detail workflow.
 
 For a dashboard, use PostgreSQL as the canonical query source rather than
 accumulating execution JSON files:
@@ -524,7 +581,7 @@ calculation, Google rendering, and status recording. A failed requested Sheet
 write raises and activates retries even for a preview. Published failures record
 `FAILED` inside the writer before raising; the existing following task records
 `COMPLETE` after a successful retry. Preview failures add no database audit row.
-The writer uses the existing `FINPAY_DB_*` secret mappings and inherits the
+The writer uses the LinkAja-specific `LINKAJA_DB_*` secret mappings and inherits the
 finance task network; that network needs PostgreSQL access and Google HTTPS
 egress. A database outage can prevent failure auditing, but the task still fails.
 
@@ -568,6 +625,11 @@ Schema DDL belongs only in the immutable SQL files under
 | 006 | `ledger_signed_amount` | Redefines `signed_amount` as total ledger debit minus total ledger credit and places it beside those totals in the live view. |
 | 007 | `monthly_fee_category_stability` | Returns stable Digipos/PPOB rows and bases fee completeness on missing active fees, while retaining reversed evidence. |
 | 008 | `dashboard_reconciliation_views` | Adds daily four-category fee evidence, actual-withdrawal Mandiri cycles, exception rows, and source-load freshness for read-only dashboard consumers. |
+| 009 | `versioned_source_and_impacts` | Keeps append-only source versions and records the transaction/date impact of replacements. |
+| 010 | `reversal_edge_states` | Persists reversal-edge status and preserves complete versus unresolved reversal evidence. |
+| 011 | `monthly_google_status` | Audits monthly Google Sheets publication status. |
+| 012 | `row_scoped_source_current` | Scopes source currentness to exact file identity and transaction rows. |
+| 013 | `cell_purchase_account_scope` | Recognizes cell-owned Purchase Accounts under the cluster organization without changing transaction grain. |
 
 The migration runner:
 
@@ -583,6 +645,12 @@ The migration runner:
 Never edit an applied migration file. Add a new numbered migration for any
 schema change. Do not create a competing schema through ad hoc SQL in a Kestra
 task.
+
+Migration 013 changes only the live transaction-base view. To roll it back,
+restore the prior `linkaja_transaction_base_v` definition from migration 004,
+including its original `Organization = Top Organization` Purchase Account
+predicate, through the normal DBA-approved migration process. Do not remove or
+rewrite raw cell rows or edit either migration file.
 
 ## Reconciliation Read Models
 
@@ -704,6 +772,90 @@ FROM linkaja_monthly_refreshes
 WHERE cluster_id = '411311'
 ORDER BY report_month, refreshed_at DESC;
 ```
+
+## Production Database Setup
+
+The target deployment uses a dedicated `linkaja` database on the existing
+PostgreSQL instance; it does not add another container or volume. SSH source/
+config inspection on 2026-11-24 found the remote daily and monthly LinkAja flows
+still use `FINPAY_DB_*`, and a sanitized check matched `SECRET_FINPAY_DB_NAME`
+to `finpay`. The live database catalog, schema version, and LinkAja data
+location were not verified. The SSH target's Compose project is named
+`kestra-mmpp-local-20261020` and a `dev`-tagged task container was present, so
+confirm environment identity before production writes.
+
+The current worktree changes LinkAja to `LINKAJA_DB_*`. This is a proposed cutover and is not deployed to production.
+
+### Database Provisioning
+
+The Compose provisioner (`docker/provision/01-provision-databases.sh`) creates missing databases and roles:
+
+- Database: `${LINKAJA_DB_NAME}` (default: `linkaja`)
+- Role: `${LINKAJA_DB_USER}` (default: `linkaja`)
+- Password: from Docker secret `/run/secrets/linkaja_db_password`
+
+The provisioner also reapplies role passwords and database ownership for all
+configured databases. Since production FinPay is already provisioned, do not
+run this shared service solely for LinkAja. If `linkaja` and its role already
+exist, the workflow migration runner creates the schema after connecting. If
+either is absent, the current Compose project has no LinkAja-only provisioner;
+use an approved DBA action or add a targeted provisioner rather than invoking
+the shared service.
+
+### Kestra Secret Configuration
+
+The LinkAja workflows read these Kestra secrets (namespace: `finance.linkaja`):
+
+| Secret | Purpose |
+|---|---|
+| `LINKAJA_DB_HOST` | PostgreSQL host |
+| `LINKAJA_DB_PORT` | PostgreSQL port (5432) |
+| `LINKAJA_DB_NAME` | Database name (`linkaja`) |
+| `LINKAJA_DB_USER` | Database role (`linkaja`) |
+| `LINKAJA_DB_PASSWORD` | Role password |
+
+The daily workflow `linkaja_fee_pipeline_v1` and monthly workflow `linkaja_monthly_materialization_v1` both use these secrets.
+With the Compose `env` secret provider, configure them as base64 `SECRET_LINKAJA_DB_*` variables in the protected `.env_encoded` file. The production `.env_encoded` inspected for this review has no `SECRET_LINKAJA_DB_NAME` entry; the actual file was not modified. The Kestra password and Docker secret `/run/secrets/linkaja_db_password` must decode to the same value.
+
+### Connection Helper
+
+`linkaja_fee_pipeline.database.linkaja_postgres_dsn_from_env()` builds the DSN from `LINKAJA_DB_*` environment variables with sensible defaults:
+
+```python
+dsn = linkaja_postgres_dsn_from_env()  # uses LINKAJA_DB_* prefix
+```
+
+Tests use a dedicated disposable `LINKAJA_TEST_DSN`; they must not use the production `linkaja` or `finpay` database.
+
+### Cutover from FinPay Database
+
+The checked-in production source and encoded DB-name setting direct the active
+LinkAja flow to `finpay`; the registered Kestra revision and relation presence
+were not queried. The requested initial rollout is schema-only: existing
+LinkAja history, if present in `finpay`, remains there and the new `linkaja`
+database starts its reporting history at cutover. Historical continuity is not
+included; if it becomes a requirement, stop and approve a separate inventory,
+backup, and transfer/replay plan. Do not use an untested wildcard
+`pg_dump | psql` pipeline.
+
+After the target is verified and any approved migration is complete, configure `LINKAJA_DB_*`, deploy only the LinkAja flows, run a dry-run and one full canary, then reconcile database fees against Google Sheets. Do not switch or disable the active FinPay-targeted flow until the canary passes.
+
+### Verification
+
+Run a read-only preflight using the exact connection mapping of the active flow. The first query must identify the current production target before inspecting schema or data:
+
+```sql
+BEGIN READ ONLY;
+SELECT current_database(), current_user, current_setting('server_version');
+
+SELECT to_regclass('public.linkaja_schema_migrations') AS migrations_table,
+       to_regclass('public.linkaja_raw_transactions') AS raw_table,
+       to_regclass('public.linkaja_source_loads') AS source_loads_table,
+       to_regclass('public.linkaja_transactions_current_v') AS current_view;
+ROLLBACK;
+```
+
+Only if the migration table exists, read its latest version and the required aggregate counts. No production catalog query or row-count check has been completed from this worktree. After cutover, the workflow DSN must resolve to `linkaja`, not `finpay`.
 
 ## Validation and Testing
 

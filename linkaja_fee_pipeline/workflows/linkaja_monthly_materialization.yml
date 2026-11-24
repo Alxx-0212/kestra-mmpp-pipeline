@@ -25,13 +25,13 @@ inputs:
     required: true
 
   - id: publish
-    type: BOOLEAN
+    type: BOOL
     displayName: "Publish monthly snapshot?"
     description: "false previews the month. true atomically replaces this cluster-month in linkaja_transactions."
     defaults: false
 
   - id: write_gsheet
-    type: BOOLEAN
+    type: BOOL
     displayName: "Write monthly Google Sheet?"
     description: "Render the monthly preview/publication to the shared monitoring spreadsheet."
     defaults: true
@@ -54,11 +54,11 @@ tasks:
       - linkaja_daily_raw_calculation.csv
       - linkaja_unresolved_reversals.csv
     env:
-      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
-      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
-      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
-      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
-      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      LINKAJA_DB_HOST: "{{ secret('LINKAJA_DB_HOST') }}"
+      LINKAJA_DB_PORT: "{{ secret('LINKAJA_DB_PORT') }}"
+      LINKAJA_DB_NAME: "{{ secret('LINKAJA_DB_NAME') }}"
+      LINKAJA_DB_USER: "{{ secret('LINKAJA_DB_USER') }}"
+      LINKAJA_DB_PASSWORD: "{{ secret('LINKAJA_DB_PASSWORD') }}"
       CLUSTER_ID: "{{ inputs.cluster_id }}"
       REPORT_MONTH: "{{ inputs.report_month }}"
       CALCULATION_CUTOFF: "{{ inputs.calculation_cutoff }}"
@@ -162,11 +162,11 @@ tasks:
     env:
       SECRET_GCP_SA_KEY: "{{ secret('GCP_SA_KEY') }}"
       TARGET_SPREADSHEET: "Salinan dari Monitoring Finpay & LinkAja"
-      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
-      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
-      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
-      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
-      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      LINKAJA_DB_HOST: "{{ secret('LINKAJA_DB_HOST') }}"
+      LINKAJA_DB_PORT: "{{ secret('LINKAJA_DB_PORT') }}"
+      LINKAJA_DB_NAME: "{{ secret('LINKAJA_DB_NAME') }}"
+      LINKAJA_DB_USER: "{{ secret('LINKAJA_DB_USER') }}"
+      LINKAJA_DB_PASSWORD: "{{ secret('LINKAJA_DB_PASSWORD') }}"
     script: |
       import json
       import os
@@ -227,11 +227,11 @@ tasks:
       linkaja_google_write_result.json: "{{ outputs.write_linkaja_monthly_google_sheet.outputFiles['linkaja_google_write_result.json'] }}"
       linkaja_monthly_result.json: "{{ outputs.calculate_and_optionally_publish_month.outputFiles['linkaja_monthly_result.json'] }}"
     env:
-      FINPAY_DB_HOST: "{{ secret('FINPAY_DB_HOST') }}"
-      FINPAY_DB_PORT: "{{ secret('FINPAY_DB_PORT') }}"
-      FINPAY_DB_NAME: "{{ secret('FINPAY_DB_NAME') }}"
-      FINPAY_DB_USER: "{{ secret('FINPAY_DB_USER') }}"
-      FINPAY_DB_PASSWORD: "{{ secret('FINPAY_DB_PASSWORD') }}"
+      LINKAJA_DB_HOST: "{{ secret('LINKAJA_DB_HOST') }}"
+      LINKAJA_DB_PORT: "{{ secret('LINKAJA_DB_PORT') }}"
+      LINKAJA_DB_NAME: "{{ secret('LINKAJA_DB_NAME') }}"
+      LINKAJA_DB_USER: "{{ secret('LINKAJA_DB_USER') }}"
+      LINKAJA_DB_PASSWORD: "{{ secret('LINKAJA_DB_PASSWORD') }}"
     script: |
       import json
       import os

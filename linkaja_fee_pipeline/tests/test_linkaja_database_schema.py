@@ -1,5 +1,7 @@
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import linkaja_fee_pipeline
 
@@ -14,6 +16,8 @@ from linkaja_fee_pipeline.migrations import (
 )
 from linkaja_fee_pipeline.sql import (
     AFFECTED_DATES_STATEMENT,
+    CELL_FORMAT_DETECTION_STATEMENT,
+    CELL_FEE_SUMMARY_STATEMENT,
     DAILY_SUMMARY_STATEMENT,
     FEE_SUMMARY_STATEMENT,
     INSERT_MONTHLY_STAGE_STATEMENT,
@@ -29,14 +33,50 @@ from linkaja_fee_pipeline.sql import (
 
 
 class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
+    def test_default_dsn_uses_linkaja_database_variables(self):
+        env = {
+            "LINKAJA_DB_HOST": "linkaja-postgres",
+            "LINKAJA_DB_PORT": "55432",
+            "LINKAJA_DB_NAME": "linkaja",
+            "LINKAJA_DB_USER": "linkaja_app",
+            "LINKAJA_DB_PASSWORD": "test-linkaja-password",
+            "FINPAY_DB_HOST": "finpay-postgres",
+            "FINPAY_DB_NAME": "finpay",
+            "FINPAY_DB_USER": "finpay_app",
+            "FINPAY_DB_PASSWORD": "test-finpay-password",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            dsn = linkaja_fee_pipeline.linkaja_postgres_dsn_from_env()
+
+        self.assertEqual(
+            dsn,
+            "host=linkaja-postgres port=55432 dbname=linkaja "
+            "user=linkaja_app password=test-linkaja-password",
+        )
+
+    def test_daily_and_monthly_flows_use_linkaja_secrets(self):
+        package_root = Path(__file__).parents[1]
+        workflow_paths = (
+            package_root / "workflows" / "linkaja_fee_pipeline.yml",
+            package_root / "workflows" / "linkaja_monthly_materialization.yml",
+        )
+
+        for workflow_path in workflow_paths:
+            source = workflow_path.read_text(encoding="utf-8")
+            for suffix in ("HOST", "PORT", "NAME", "USER", "PASSWORD"):
+                key = f"LINKAJA_DB_{suffix}"
+                self.assertIn(f"{key}: \"{{{{ secret('{key}') }}}}\"", source)
+            self.assertNotIn("secret('FINPAY_DB_", source)
+
     def test_migrations_are_contiguous_and_current(self):
         migrations = _load_migrations()
 
         self.assertEqual(
             [migration.version for migration in migrations],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         )
-        self.assertEqual(latest_linkaja_schema_version(), 12)
+        self.assertEqual(latest_linkaja_schema_version(), 13)
         self.assertTrue(all(len(migration.checksum) == 64 for migration in migrations))
 
     def test_final_transaction_schema_keeps_facts_not_report_amounts(self):
@@ -226,6 +266,42 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
             normalized,
         )
         self.assertIn("or count(distinct finalized_time) > 1", normalized)
+        self.assertIn("company_organizations", normalized)
+        self.assertIn("parent_organization", normalized)
+
+    def test_cell_fee_summary_uses_account_side_by_scenario(self):
+        normalized = " ".join(CELL_FEE_SUMMARY_STATEMENT.lower().split())
+
+        self.assertIn("transactions.company_organization", normalized)
+        self.assertIn("raw.parent_organization", normalized)
+        self.assertIn("linkaja_ledger_versions", normalized)
+        self.assertIn("count(distinct transactions.transaction_id)", normalized)
+        self.assertIn("not transactions.is_reversed", normalized)
+        self.assertIn("cell_organizations as", normalized)
+        self.assertIn("raw.fee > 0", normalized)
+
+    def test_cell_format_detection_checks_source_hierarchy(self):
+        normalized = " ".join(CELL_FORMAT_DETECTION_STATEMENT.lower().split())
+
+        self.assertIn("linkaja_raw_transactions", normalized)
+        self.assertIn("linkaja_ledger_versions", normalized)
+        self.assertIn("parent_organization", normalized)
+        self.assertIn("select exists", normalized)
+
+    def test_cell_purchase_account_scope_is_added_without_editing_applied_views(self):
+        migration_path = (
+            Path(__file__).parents[1]
+            / "migrations"
+            / "013_cell_purchase_account_scope.sql"
+        )
+        normalized = " ".join(
+            migration_path.read_text(encoding="utf-8").lower().split()
+        )
+
+        self.assertIn("create or replace view linkaja_transaction_base_v", normalized)
+        self.assertIn("raw.parent_organization", normalized)
+        self.assertIn("organization mfs purchase account", normalized)
+        self.assertIn("raw.organization = raw.top_organization", normalized)
 
     def test_daily_persistence_does_not_write_monthly_snapshot(self):
         normalized = " ".join(LOAD_COUNTS_STATEMENT.lower().split())
@@ -323,7 +399,7 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
         self.assertIn("linkaja_google_write_result.json", normalized)
         self.assertNotIn("next available withdrawal", normalized)
 
-    def test_daily_workflow_writes_shared_and_cluster_detail_sheets(self):
+    def test_daily_workflow_persists_and_publishes_fee_summary_only(self):
         workflow_path = Path(__file__).parents[2] / "linkaja_fee_pipeline" / "workflows" / "linkaja_fee_pipeline.yml"
         normalized = " ".join(
             workflow_path.read_text(encoding="utf-8").lower().split()
@@ -331,9 +407,11 @@ class LinkAjaDatabaseSchemaContractTest(unittest.TestCase):
 
         self.assertIn("linkaja_database_result.json", normalized)
         self.assertIn("persist_linkaja_normalized_csv", normalized)
+        self.assertIn("include_detail_rows=false", normalized)
         self.assertIn("write_linkaja_daily_sheets", normalized)
         self.assertIn("process_linkaja_fee_sheet_upload", normalized)
-        self.assertIn("process_linkaja_detail_sheet_upload", normalized)
+        self.assertNotIn("process_linkaja_detail_sheet_upload", normalized)
+        self.assertNotIn("detail_worksheet", normalized)
         self.assertIn("target_spreadsheet", normalized)
         self.assertIn("source_filename", normalized)
         self.assertIn("write_gsheet", normalized)

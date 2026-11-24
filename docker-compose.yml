@@ -11,7 +11,7 @@ services:
   # - finpay:      FinPay Top Up + reconciliation data (existing contract DB)
   # - finpay_txn:  FinPay Transaction processing data (new, separate from top-up)
   # - superset/grist: optional dashboard metadata (disabled by default profile)
-  # - linkaja:     LinkAja fee pipeline data (future)
+  # - linkaja:     LinkAja fee pipeline data (separate logical database)
   # - grist:       Grist metadata database
   postgres:
     image: postgres:18.4
@@ -148,10 +148,12 @@ services:
     command:
       - |
         if [ "$${KESTRA_LOCAL_MODE:-true}" = "true" ]; then
-          # The local Docker network is named postgres; env_file may retain a
-          # production hostname. The alert alias keeps the flow contract stable.
-           export SECRET_FINPAY_DB_HOST=cG9zdGdyZXM=
-           export SECRET_TELEGRAM_ALERT_CHAT_ID="$${SECRET_TELEGRAM_ALERT_CHAT_ID:-$${SECRET_TELEGRAM_CHAT_ID:-}}"
+           # The local Docker service is named postgres; env_file may retain
+           # production host aliases for both databases.
+            export SECRET_FINPAY_DB_HOST=cG9zdGdyZXM=
+            export SECRET_LINKAJA_DB_HOST=cG9zdGdyZXM=
+            # Keep the alert secret alias stable in local mode.
+            export SECRET_TELEGRAM_ALERT_CHAT_ID="$${SECRET_TELEGRAM_ALERT_CHAT_ID:-$${SECRET_TELEGRAM_CHAT_ID:-}}"
          fi
          if [ -r /run/secrets/telegram_bot_token ]; then
            export SECRET_FINPAY_TELEGRAM_BOT_TOKEN="$$(tr -d '\r\n' < /run/secrets/telegram_bot_token | base64 | tr -d '\n')"

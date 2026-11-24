@@ -20,8 +20,20 @@ SELECT
     COUNT(DISTINCT COALESCE(NULLIF(BTRIM(original_transaction_id), ''), '<NULL>'))
         AS original_ids,
     COUNT(DISTINCT fee) FILTER (WHERE fee IS NOT NULL) AS fee_values,
+    COUNT(DISTINCT organization) FILTER (
+        WHERE (
+            organization = top_organization
+            OR SUBSTRING(BTRIM(parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+                = SUBSTRING(BTRIM(top_organization) FROM '^([0-9]+)[[:space:]]*-')
+        )
+          AND POSITION('organization mfs purchase account' IN LOWER(account)) > 0
+    ) AS company_organizations,
     COUNT(DISTINCT account) FILTER (
-        WHERE organization = top_organization
+        WHERE (
+            organization = top_organization
+            OR SUBSTRING(BTRIM(parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+                = SUBSTRING(BTRIM(top_organization) FROM '^([0-9]+)[[:space:]]*-')
+        )
           AND POSITION('organization mfs purchase account' IN LOWER(account)) > 0
     ) AS company_accounts
 FROM linkaja_raw_stage
@@ -33,12 +45,183 @@ HAVING COUNT(DISTINCT finalized_date) > 1
     OR COUNT(DISTINCT COALESCE(transaction_type, '<NULL>')) > 1
     OR COUNT(DISTINCT COALESCE(NULLIF(BTRIM(original_transaction_id), ''), '<NULL>')) > 1
     OR COUNT(DISTINCT fee) FILTER (WHERE fee IS NOT NULL) > 1
+    OR COUNT(DISTINCT organization) FILTER (
+        WHERE (
+            organization = top_organization
+            OR SUBSTRING(BTRIM(parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+                = SUBSTRING(BTRIM(top_organization) FROM '^([0-9]+)[[:space:]]*-')
+        )
+          AND POSITION('organization mfs purchase account' IN LOWER(account)) > 0
+    ) > 1
     OR COUNT(DISTINCT account) FILTER (
-        WHERE organization = top_organization
+        WHERE (
+            organization = top_organization
+            OR SUBSTRING(BTRIM(parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+                = SUBSTRING(BTRIM(top_organization) FROM '^([0-9]+)[[:space:]]*-')
+        )
           AND POSITION('organization mfs purchase account' IN LOWER(account)) > 0
     ) > 1
 ORDER BY cluster_id, transaction_id
 LIMIT 20
+"""
+
+
+CELL_ORGANIZATIONS_CTE = """
+cell_source_rows AS (
+    SELECT
+        cluster_id,
+        top_organization,
+        parent_organization,
+        organization,
+        account
+    FROM linkaja_raw_transactions
+    WHERE cluster_id = %(cluster_id)s
+    UNION ALL
+    SELECT
+        cluster_id,
+        top_organization,
+        parent_organization,
+        organization,
+        account
+    FROM linkaja_ledger_versions
+    WHERE cluster_id = %(cluster_id)s
+), cell_organizations AS (
+    SELECT DISTINCT
+        source.cluster_id,
+        SUBSTRING(BTRIM(source.parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+            AS cell_id
+    FROM cell_source_rows AS source
+    WHERE SUBSTRING(BTRIM(source.parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+          <> SUBSTRING(BTRIM(source.top_organization) FROM '^([0-9]+)[[:space:]]*-')
+      AND UPPER(BTRIM(SPLIT_PART(source.parent_organization, '-', 2)))
+          = UPPER(BTRIM(SPLIT_PART(source.top_organization, '-', 2)))
+    UNION
+    SELECT DISTINCT
+        source.cluster_id,
+        SUBSTRING(BTRIM(source.organization) FROM '^([0-9]+)[[:space:]]*-')
+            AS cell_id
+    FROM cell_source_rows AS source
+    WHERE SUBSTRING(BTRIM(source.parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+          = SUBSTRING(BTRIM(source.top_organization) FROM '^([0-9]+)[[:space:]]*-')
+      AND SUBSTRING(BTRIM(source.organization) FROM '^([0-9]+)[[:space:]]*-')
+          <> SUBSTRING(BTRIM(source.top_organization) FROM '^([0-9]+)[[:space:]]*-')
+      AND (
+          UPPER(BTRIM(SPLIT_PART(source.organization, '-', 2)))
+              = UPPER(BTRIM(SPLIT_PART(source.top_organization, '-', 2)))
+          OR POSITION(
+              'organization mfs purchase account' IN LOWER(source.account)
+          ) > 0
+      )
+)
+"""
+
+
+CELL_FORMAT_DETECTION_STATEMENT = """
+WITH source_rows AS (
+    SELECT cluster_id, top_organization, parent_organization, organization, account
+    FROM linkaja_raw_transactions
+    WHERE cluster_id = %(cluster_id)s
+    UNION ALL
+    SELECT cluster_id, top_organization, parent_organization, organization, account
+    FROM linkaja_ledger_versions
+    WHERE cluster_id = %(cluster_id)s
+)
+SELECT EXISTS (
+    SELECT 1
+    FROM source_rows
+    WHERE SUBSTRING(BTRIM(parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+              IS DISTINCT FROM SUBSTRING(BTRIM(top_organization) FROM '^([0-9]+)[[:space:]]*-')
+      AND UPPER(BTRIM(SPLIT_PART(parent_organization, '-', 2)))
+          = UPPER(BTRIM(SPLIT_PART(top_organization, '-', 2)))
+)
+OR EXISTS (
+    SELECT 1
+    FROM source_rows
+    WHERE SUBSTRING(BTRIM(parent_organization) FROM '^([0-9]+)[[:space:]]*-')
+          = SUBSTRING(BTRIM(top_organization) FROM '^([0-9]+)[[:space:]]*-')
+      AND SUBSTRING(BTRIM(organization) FROM '^([0-9]+)[[:space:]]*-')
+              IS DISTINCT FROM SUBSTRING(BTRIM(top_organization) FROM '^([0-9]+)[[:space:]]*-')
+      AND (
+          UPPER(BTRIM(SPLIT_PART(organization, '-', 2)))
+              = UPPER(BTRIM(SPLIT_PART(top_organization, '-', 2)))
+          OR POSITION(
+              'organization mfs purchase account' IN LOWER(account)
+          ) > 0
+      )
+)
+"""
+
+
+CELL_FEE_SUMMARY_STATEMENT = f"""
+WITH {CELL_ORGANIZATIONS_CTE}, report_dates AS (
+    SELECT UNNEST(%(report_dates)s::DATE[]) AS report_date
+), outbound_fees AS (
+    SELECT
+        transactions.report_date,
+        transactions.cluster_id,
+        cells.cell_id,
+        COUNT(DISTINCT transactions.transaction_id)
+            * %(expected_fee_per_transaction)s AS expected_fee
+    FROM linkaja_transactions_current_v AS transactions
+    JOIN cell_organizations AS cells
+      ON cells.cluster_id = transactions.cluster_id
+     AND cells.cell_id = SUBSTRING(
+            BTRIM(transactions.company_organization)
+            FROM '^([0-9]+)[[:space:]]*-'
+         )
+    WHERE transactions.cluster_id = %(cluster_id)s
+      AND transactions.report_date = ANY(%(report_dates)s::DATE[])
+      AND transactions.transaction_scenario = 'Digipos B2B Transfer'
+      AND NOT transactions.is_reversal
+      AND NOT transactions.is_reversed
+      AND transactions.company_credit > 0
+    GROUP BY transactions.report_date, transactions.cluster_id, cells.cell_id
+), in_cluster_fees AS (
+    SELECT
+        transactions.report_date,
+        transactions.cluster_id,
+        cells.cell_id,
+        COUNT(DISTINCT transactions.transaction_id)
+            * %(in_cluster_fee_per_transaction)s AS in_cluster_fee
+    FROM linkaja_transactions_current_v AS transactions
+    JOIN linkaja_raw_transactions AS raw
+      ON raw.cluster_id = transactions.cluster_id
+     AND raw.transaction_id = transactions.transaction_id
+     AND raw.finalized_date = transactions.report_date
+    JOIN cell_organizations AS cells
+      ON cells.cluster_id = raw.cluster_id
+     AND cells.cell_id = SUBSTRING(
+            BTRIM(raw.parent_organization)
+            FROM '^([0-9]+)[[:space:]]*-'
+         )
+    WHERE transactions.cluster_id = %(cluster_id)s
+      AND transactions.report_date = ANY(%(report_dates)s::DATE[])
+      AND transactions.transaction_scenario = 'Digipos B2B Transfer In Cluster'
+      AND NOT transactions.is_reversal
+      AND NOT transactions.is_reversed
+      AND raw.fee > 0
+    GROUP BY transactions.report_date, transactions.cluster_id, cells.cell_id
+), cell_roster AS (
+    SELECT DISTINCT cluster_id, cell_id
+    FROM cell_organizations
+)
+SELECT
+    report_dates.report_date,
+    cells.cluster_id,
+    cells.cell_id,
+    COALESCE(outbound.expected_fee, 0) AS expected_fee,
+    COALESCE(in_cluster.in_cluster_fee, 0) AS in_cluster_fee
+FROM report_dates
+CROSS JOIN cell_roster AS cells
+LEFT JOIN outbound_fees AS outbound
+  ON outbound.report_date = report_dates.report_date
+ AND outbound.cluster_id = cells.cluster_id
+ AND outbound.cell_id = cells.cell_id
+LEFT JOIN in_cluster_fees AS in_cluster
+  ON in_cluster.report_date = report_dates.report_date
+ AND in_cluster.cluster_id = cells.cluster_id
+ AND in_cluster.cell_id = cells.cell_id
+ORDER BY report_dates.report_date, cells.cluster_id, cells.cell_id
 """
 
 

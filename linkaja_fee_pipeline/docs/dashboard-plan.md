@@ -708,8 +708,11 @@ applied migrations 001 through 007.
 - Label all `_local` timestamps as WITA in the UI and convert only at display
   boundaries.
 - Measure query volume before adding materialized summaries or indexes.
-- Rename shared `FINPAY_DB_*` and Docker network configuration only as a
-  coordinated infrastructure change; it is coupling, not a calculation error.
+- Keep the LinkAja database split coordinated: production source currently uses
+  `FINPAY_DB_*`, while the cutover worktree uses `LINKAJA_DB_*`. The requested
+  schema-only cutover leaves any historical LinkAja rows in `finpay`, so
+  dashboards on `linkaja` begin at the cutover boundary unless a separately
+  approved history transfer is completed.
 
 ## Reviewable Delivery Plan
 

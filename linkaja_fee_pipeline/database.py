@@ -15,6 +15,7 @@ from .migrations import (
     assert_linkaja_schema_current,
 )
 from .processing import (
+    CELL_ID_HEADER,
     CLUSTER_ID_HEADER,
     EXPECTED_FEE_HEADER,
     EXPECTED_FEE_PER_ROW,
@@ -31,6 +32,8 @@ from .processing import (
 from .sql import (
     AFFECTED_DATES_STATEMENT,
     CAPTURE_AFFECTED_DATES_STATEMENT,
+    CELL_FORMAT_DETECTION_STATEMENT,
+    CELL_FEE_SUMMARY_STATEMENT,
     CREATE_MONTHLY_STAGE_STATEMENT,
     CREATE_REFRESH_SCOPE_STATEMENTS,
     CREATE_STAGE_STATEMENT,
@@ -123,11 +126,11 @@ DECIMAL_COLUMNS = {"debit", "credit", "balance", "fee"}
 INTEGER_COLUMNS = {"source_row_number", "source_no"}
 
 
-def linkaja_postgres_dsn_from_env(prefix: str = "FINPAY_DB_") -> str:
+def linkaja_postgres_dsn_from_env(prefix: str = "LINKAJA_DB_") -> str:
     host = os.environ.get(f"{prefix}HOST", "localhost")
     port = os.environ.get(f"{prefix}PORT", "5432")
-    dbname = os.environ.get(f"{prefix}NAME", "finpay")
-    user = os.environ.get(f"{prefix}USER", "finpay")
+    dbname = os.environ.get(f"{prefix}NAME", "linkaja")
+    user = os.environ.get(f"{prefix}USER", "linkaja")
     password = os.environ.get(f"{prefix}PASSWORD", "")
     return (
         f"host={host} port={port} dbname={dbname} user={user} "
@@ -237,6 +240,81 @@ def _fee_rows(query_rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _cell_fee_rows(query_rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    rows = []
+    for row in query_rows:
+        expected_fee = Decimal(str(row[3] or 0))
+        in_cluster_fee = Decimal(str(row[4] or 0))
+        rows.append({
+            REPORT_DATE_HEADER: _date_text(row[0]),
+            CLUSTER_ID_HEADER: str(row[1]),
+            CELL_ID_HEADER: str(row[2]),
+            EXPECTED_FEE_HEADER: decimal_to_sheet_value(expected_fee),
+            IN_CLUSTER_FEE_HEADER: decimal_to_sheet_value(in_cluster_fee),
+            TOTAL_FEE_HEADER: decimal_to_sheet_value(expected_fee + in_cluster_fee),
+        })
+    return rows
+
+
+def _validate_cell_fee_reconciliation(
+    fee_rows: list[dict[str, Any]],
+    cell_fee_rows: list[dict[str, Any]],
+    *,
+    require_cell_rows: bool = False,
+) -> None:
+    cell_totals: dict[tuple[str, str], dict[str, Decimal]] = {}
+    for row in cell_fee_rows:
+        key = (
+            str(row[CLUSTER_ID_HEADER]),
+            str(row[REPORT_DATE_HEADER]),
+        )
+        totals = cell_totals.setdefault(key, {
+            EXPECTED_FEE_HEADER: Decimal(0),
+            IN_CLUSTER_FEE_HEADER: Decimal(0),
+        })
+        for header in (EXPECTED_FEE_HEADER, IN_CLUSTER_FEE_HEADER):
+            totals[header] += Decimal(str(row.get(header) or 0))
+
+    if require_cell_rows and not cell_totals:
+        raise ValueError(
+            "LinkAja cell hierarchy was detected but no cell fee rows were produced"
+        )
+
+    cluster_keys = set()
+    for row in fee_rows:
+        key = (
+            str(row[CLUSTER_ID_HEADER]),
+            str(row[REPORT_DATE_HEADER]),
+        )
+        cluster_keys.add(key)
+        if key not in cell_totals:
+            continue
+        for header in (EXPECTED_FEE_HEADER, IN_CLUSTER_FEE_HEADER):
+            cluster_total = Decimal(str(row.get(header) or 0))
+            if cell_totals[key][header] != cluster_total:
+                raise ValueError(
+                    "LinkAja cell fees do not reconcile to the cluster total "
+                    f"for cluster {key[0]} on {key[1]} ({header})"
+                )
+
+    if require_cell_rows:
+        missing_cell_dates = cluster_keys - set(cell_totals)
+        if missing_cell_dates:
+            cluster_id, report_date = sorted(missing_cell_dates)[0]
+            raise ValueError(
+                "LinkAja cell hierarchy was detected but no cell fee rows were "
+                f"produced for cluster {cluster_id} on {report_date}"
+            )
+
+    orphaned_cell_dates = set(cell_totals) - cluster_keys
+    if orphaned_cell_dates:
+        cluster_id, report_date = sorted(orphaned_cell_dates)[0]
+        raise ValueError(
+            "LinkAja cell fee rows have no cluster summary "
+            f"for cluster {cluster_id} on {report_date}"
+        )
+
+
 def _optional_number(value: Any) -> int | float | None:
     if value is None:
         return None
@@ -327,7 +405,8 @@ def _raise_stage_conflicts(conflicts: list[tuple[Any, ...]]) -> None:
             f"{row[0]}/{row[1]} "
             f"(dates={row[2]}, times={row[3]}, scenarios={row[4]}, "
             f"statuses={row[5]}, types={row[6]}, originals={row[7]}, "
-            f"fee_values={row[8]}, company_accounts={row[9]})"
+            f"fee_values={row[8]}, company_organizations={row[9]}, "
+            f"company_accounts={row[10]})"
         )
     raise ValueError(
         "LinkAja staged transactions violate the transaction-grain contract: "
@@ -339,8 +418,10 @@ def persist_linkaja_normalized_csv(
     normalized_path: str | Path,
     manifest: dict[str, Any],
     dsn: str,
+    *,
+    include_detail_rows: bool = True,
 ) -> dict[str, Any]:
-    """Replace affected raw IDs and calculate linked daily summaries atomically."""
+    """Replace affected raw IDs and calculate requested daily summaries atomically."""
     try:
         import psycopg
         from psycopg import sql
@@ -426,13 +507,29 @@ def persist_linkaja_normalized_csv(
                 "report_dates": affected_dates,
             }
             if affected_dates:
-                cursor.execute(DAILY_SUMMARY_STATEMENT, summary_params)
-                detail_rows = _detail_rows(cursor.fetchall())
+                cursor.execute(
+                    CELL_FORMAT_DETECTION_STATEMENT,
+                    {"cluster_id": cluster_id},
+                )
+                cell_format_detected = bool(cursor.fetchone()[0])
+                if include_detail_rows:
+                    cursor.execute(DAILY_SUMMARY_STATEMENT, summary_params)
+                    detail_rows = _detail_rows(cursor.fetchall())
+                else:
+                    detail_rows = []
                 cursor.execute(FEE_SUMMARY_STATEMENT, summary_params)
                 fee_rows = _fee_rows(cursor.fetchall())
+                cursor.execute(CELL_FEE_SUMMARY_STATEMENT, summary_params)
+                cell_fee_rows = _cell_fee_rows(cursor.fetchall())
+                _validate_cell_fee_reconciliation(
+                    fee_rows,
+                    cell_fee_rows,
+                    require_cell_rows=cell_format_detected,
+                )
             else:
                 detail_rows = []
                 fee_rows = []
+                cell_fee_rows = []
 
         connection.commit()
 
@@ -452,6 +549,7 @@ def persist_linkaja_normalized_csv(
         "impacted_transaction_ids": int(impacted_ids or 0),
         "transaction_rows": int(transaction_rows or 0),
         "fee_rows": fee_rows,
+        "cell_fee_rows": cell_fee_rows,
         "detail_rows": detail_rows,
     }
 

@@ -94,7 +94,7 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
         row.update(overrides)
         return row
 
-    def _persist(self, rows, filename, load_id):
+    def _persist(self, rows, filename, load_id, *, include_detail_rows=True):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / filename
             normalized = Path(temp_dir) / "normalized.csv"
@@ -112,7 +112,140 @@ class LinkAjaDatabaseIntegrationTest(unittest.TestCase):
                 normalized,
                 manifest.to_json_dict(),
                 TEST_DSN,
+                include_detail_rows=include_detail_rows,
             )
+
+    def test_cell_format_daily_summary_splits_fees_and_reconciles(self):
+        rows = [
+            self._row(**{
+                "No": "1",
+                "Top Organization": "422220-TEST COMPANY",
+                "Parent Organization": "422220-TEST COMPANY",
+                "Organization": "422221-TEST COMPANY",
+                "Transaction ID": "CELL-OUT-1",
+                "Transaction Scenario": "Digipos B2B Transfer",
+                "Credit": "200",
+                "Debit": "0",
+            }),
+            self._row(**{
+                "No": "2",
+                "Top Organization": "422220-TEST COMPANY",
+                "Parent Organization": "422220-TEST COMPANY",
+                "Organization": "422221-TEST COMPANY",
+                "Transaction ID": "CELL-IN-1",
+                "Transaction Scenario": "Digipos B2B Transfer In Cluster",
+                "Credit": "200",
+                "Debit": "0",
+            }),
+            self._row(**{
+                "No": "3",
+                "Top Organization": "422220-TEST COMPANY",
+                "Parent Organization": "422221-TEST COMPANY",
+                "Organization": "998877-TEST AGENT",
+                "Transaction ID": "CELL-IN-1",
+                "Transaction Scenario": "Digipos B2B Transfer In Cluster",
+                "Account": "7001 - Agent General Account",
+                "Credit": "0",
+                "Debit": "200",
+                "Fee": "20",
+            }),
+            self._row(**{
+                "No": "4",
+                "Top Organization": "422220-TEST COMPANY",
+                "Parent Organization": "422222-TEST COMPANY",
+                "Organization": "998876-OTHER AGENT",
+                "Transaction ID": "CELL-IN-1",
+                "Transaction Scenario": "Digipos B2B Transfer In Cluster",
+                "Account": "7002 - Agent General Account",
+                "Credit": "0",
+                "Debit": "0",
+            }),
+        ]
+
+        result = self._persist(
+            rows,
+            "linkaja-422220-cell-format.csv",
+            "cell-format-daily",
+            include_detail_rows=False,
+        )
+
+        self.assertEqual(result["fee_rows"][0]["TOTAL FEE"], 220)
+        self.assertEqual(result["detail_rows"], [])
+        cell_rows = {row["CELL ID"]: row for row in result["cell_fee_rows"]}
+        self.assertEqual(set(cell_rows), {"422221", "422222"})
+        self.assertEqual(cell_rows["422221"]["EXPECTED RECHARGE OUT CLUSTER FEE"], 200)
+        self.assertEqual(cell_rows["422221"]["DIGIPOS B2B TRANSFER IN CLUSTER FEE"], 20)
+        self.assertEqual(cell_rows["422221"]["TOTAL FEE"], 220)
+        self.assertEqual(cell_rows["422222"]["TOTAL FEE"], 0)
+
+    def test_unmapped_cell_hierarchy_fails_before_persisting(self):
+        row = self._row(**{
+            "Top Organization": "422220-TEST COMPANY",
+            "Parent Organization": "UNMAPPED-TEST COMPANY",
+            "Organization": "998877-TEST AGENT",
+            "Transaction ID": "UNMAPPED-CELL-TX",
+            "Transaction Scenario": "Agent Deposit at Sales Force via API",
+            "Account": "7001 - Agent General Account",
+            "Debit": "0",
+            "Credit": "0",
+        })
+
+        with self.assertRaisesRegex(ValueError, "cell hierarchy was detected"):
+            self._persist([row], "linkaja_422220_unmapped.csv", "unmapped-cell")
+
+        with psycopg.connect(TEST_DSN) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM linkaja_raw_transactions")
+                self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_unrelated_parent_organization_does_not_trigger_cell_mode(self):
+        row = self._row(**{
+            "Top Organization": "422220-TEST COMPANY",
+            "Parent Organization": "998877-OTHER ENTITY",
+            "Organization": "422220-TEST COMPANY",
+            "Transaction ID": "LEGACY-PARENT-TX",
+            "Transaction Scenario": "Digipos B2B Transfer",
+            "Account": "6001 - Organization MFS Purchase Account",
+            "Credit": "200",
+            "Debit": "0",
+        })
+
+        result = self._persist([row], "linkaja_422220_legacy_parent.csv", "legacy-parent")
+
+        self.assertEqual(result["fee_rows"][0]["EXPECTED RECHARGE OUT CLUSTER FEE"], 200)
+        self.assertEqual(result["cell_fee_rows"], [])
+
+    def test_cell_correction_clears_the_previous_cell_date(self):
+        def purchase_row(no, cell_id, transaction_id):
+            return self._row(**{
+                "No": str(no),
+                "Top Organization": "422220-TEST COMPANY",
+                "Parent Organization": "422220-TEST COMPANY",
+                "Organization": f"{cell_id}-TEST COMPANY",
+                "Transaction ID": transaction_id,
+                "Transaction Scenario": "Digipos B2B Transfer",
+                "Credit": "200",
+                "Debit": "0",
+            })
+
+        first = self._persist(
+            [purchase_row(1, "422222", "CELL-MOVED")],
+            "linkaja_422220_2026-11-17_2026-11-17.csv",
+            "cell-source-v1",
+        )
+        replacement = self._persist(
+            [purchase_row(1, "422221", "CELL-MOVED")],
+            "linkaja_422220_2026-11-17_2026-11-17.csv",
+            "cell-source-v2",
+        )
+
+        self.assertEqual(first["fee_rows"][0]["EXPECTED RECHARGE OUT CLUSTER FEE"], 200)
+        self.assertEqual(replacement["fee_rows"][0]["EXPECTED RECHARGE OUT CLUSTER FEE"], 200)
+        cell_fees = {
+            row["CELL ID"]: row["EXPECTED RECHARGE OUT CLUSTER FEE"]
+            for row in replacement["cell_fee_rows"]
+        }
+        self.assertEqual(cell_fees, {"422221": 200, "422222": 0})
 
     def test_corrected_date_rerun_retains_old_date_after_post_commit_failure(self):
         original = self._row(**{

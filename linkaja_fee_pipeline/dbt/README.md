@@ -46,8 +46,7 @@ cp profiles.example.yml profiles.yml
 ```
 
 `profiles.yml` is ignored because it can contain credentials. The example uses
-the same `FINPAY_DB_*` variables as the current LinkAja Python connection and
-adds two dbt-specific options:
+the LinkAja-specific `LINKAJA_DB_*` variables and adds two dbt-specific options:
 
 | Variable | Purpose |
 |---|---|

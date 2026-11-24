@@ -29,6 +29,7 @@ from .database import (
     UNRESOLVED_REVERSAL_HEADERS,
 )
 from .processing import (
+    CELL_ID_HEADER,
     CLUSTER_ID_HEADER,
     EXPECTED_FEE_HEADER,
     IN_CLUSTER_FEE_HEADER,
@@ -115,6 +116,9 @@ DEFAULT_ROW_BUFFER = 100
 DEFAULT_COL_BUFFER = 5
 HEADER_ROW_COUNT = 2
 DATA_START_ROW = HEADER_ROW_COUNT + 1
+CELL_HEADER_ROW_COUNT = 3
+CELL_DATA_START_ROW = CELL_HEADER_ROW_COUNT + 1
+CLUSTER_TOTAL_CELL_ID = "__CLUSTER_TOTAL__"
 TABLE_HEADERS = [
     REPORT_DATE_HEADER,
     EXPECTED_FEE_HEADER,
@@ -122,16 +126,53 @@ TABLE_HEADERS = [
     TOTAL_FEE_HEADER,
 ]
 TABLE_WIDTH = len(TABLE_HEADERS)
+CELL_METRIC_HEADERS = [EXPECTED_FEE_HEADER, IN_CLUSTER_FEE_HEADER]
+PREVIOUS_CELL_METRIC_HEADERS = TABLE_HEADERS[1:]
+CELL_METRIC_WIDTH = len(CELL_METRIC_HEADERS)
 SPACER_WIDTH = 1
 BLOCK_WIDTH = TABLE_WIDTH + SPACER_WIDTH
-KNOWN_CLUSTER_ORDER = ["421306", "421307", "411311", "421315", "421318", "421320"]
-INITIAL_CLUSTER_COUNT = len(KNOWN_CLUSTER_ORDER)
-STATIC_SHEET_COL_COUNT = INITIAL_CLUSTER_COUNT * BLOCK_WIDTH - SPACER_WIDTH
+KNOWN_CLUSTER_ORDER = [
+    "422040",
+    "422140",
+    "422220",
+    "422100",
+    "422090",
+    "422010",
+    "422180",
+    "412110",
+]
+LEGACY_CLUSTER_ORDER = [
+    "421306",
+    "421307",
+    "411311",
+    "421315",
+    "421318",
+    "421320",
+]
+SUPPORTED_CLUSTER_ORDER = [*KNOWN_CLUSTER_ORDER, *LEGACY_CLUSTER_ORDER]
+HISTORICAL_STATIC_CLUSTER_ORDER = [*LEGACY_CLUSTER_ORDER, "422220"]
+STATIC_CLUSTER_ORDER = [
+    *HISTORICAL_STATIC_CLUSTER_ORDER,
+    *(
+        cluster_id
+        for cluster_id in KNOWN_CLUSTER_ORDER
+        if cluster_id not in HISTORICAL_STATIC_CLUSTER_ORDER
+    ),
+]
+STATIC_SHEET_COL_COUNT = len(STATIC_CLUSTER_ORDER) * BLOCK_WIDTH - SPACER_WIDTH
 CLUSTER_START_COLUMNS = {
     cluster_id: index * BLOCK_WIDTH
-    for index, cluster_id in enumerate(KNOWN_CLUSTER_ORDER)
+    for index, cluster_id in enumerate(STATIC_CLUSTER_ORDER)
 }
 CLUSTER_DISPLAY_NAMES = {
+    "422040": "BOLMONG",
+    "422140": "KOTAMOBAGU",
+    "422220": "TNT",
+    "422100": "TDR",
+    "422090": "MRT",
+    "422010": "BGI",
+    "422180": "MRW",
+    "412110": "PKY",
     "421306": "MRT",
     "421307": "TDR",
     "411311": "PKY",
@@ -296,10 +337,23 @@ def process_linkaja_fee_sheet_upload(
     target_worksheet: str,
     rows: list[dict[str, Any]],
     gspread_client,
+    *,
+    cell_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     spreadsheet = _open_or_create_spreadsheet(gspread_client, target_spreadsheet)
     worksheet = _open_or_create_worksheet(spreadsheet, target_worksheet)
     existing_values = worksheet.get_all_values()
+    if cell_rows is not None:
+        return _process_cell_aware_fee_sheet_upload(
+            spreadsheet,
+            worksheet,
+            existing_values,
+            rows,
+            cell_rows,
+            gspread_client,
+            target_worksheet,
+        )
+
     headers_initialized = setup_linkaja_fee_headers(
         gspread_client,
         spreadsheet,
@@ -342,7 +396,7 @@ def process_linkaja_fee_sheet_upload(
         gspread_client,
         spreadsheet,
         worksheet,
-        list(KNOWN_CLUSTER_ORDER),
+        list(STATIC_CLUSTER_ORDER),
         row_count,
         STATIC_SHEET_COL_COUNT,
     )
@@ -355,6 +409,79 @@ def process_linkaja_fee_sheet_upload(
         "insert_row": DATA_START_ROW,
         "block_end": row_count,
         "rows": len(rows),
+        "clusters": changed_clusters,
+    }
+
+
+def _process_cell_aware_fee_sheet_upload(
+    spreadsheet,
+    worksheet,
+    existing_values: list[list[str]],
+    cluster_rows: list[dict[str, Any]],
+    cell_rows: list[dict[str, Any]],
+    gspread_client,
+    worksheet_title: str,
+) -> dict[str, Any]:
+    headers_initialized = _worksheet_is_empty(existing_values)
+    if not cluster_rows and not cell_rows:
+        return {
+            "status": "no_rows",
+            "worksheet": worksheet_title,
+            "headers_initialized": headers_initialized,
+            "replaced_rows": 0,
+            "insert_row": None,
+            "block_end": None,
+            "rows": 0,
+            "cell_rows": 0,
+            "clusters": [],
+        }
+
+    existing_tables = _extract_cell_tables(existing_values)
+    tables, replaced_rows = _merge_cell_replacement_rows(
+        existing_tables,
+        cluster_rows,
+        cell_rows,
+    )
+    changed_clusters = _changed_clusters(cluster_rows + cell_rows)
+    values, layout, _clusters = _build_cell_side_by_side_values(tables)
+    visible_col_count = len(values[0])
+    existing_width = max((len(row) for row in existing_values), default=0)
+    row_count = max(len(values), len(existing_values), CELL_HEADER_ROW_COUNT)
+    col_count = max(visible_col_count, existing_width)
+    values = [
+        row[:col_count] + [""] * max(0, col_count - len(row))
+        for row in values
+    ]
+    values.extend(
+        [[""] * col_count for _ in range(row_count - len(values))]
+    )
+
+    _ensure_grid_capacity(spreadsheet, worksheet, row_count, col_count)
+    _unmerge_all_cells(spreadsheet, worksheet)
+    worksheet.update(
+        values=uppercase_sheet_rows(values),
+        range_name=sheet_range(1, row_count, 1, col_count),
+        value_input_option="USER_ENTERED",
+    )
+    _format_cell_aware_linkaja_sheet(
+        gspread_client,
+        spreadsheet,
+        worksheet,
+        layout,
+        row_count,
+        col_count,
+        visible_col_count,
+    )
+
+    return {
+        "status": "success",
+        "worksheet": worksheet_title,
+        "headers_initialized": headers_initialized,
+        "replaced_rows": replaced_rows,
+        "insert_row": CELL_DATA_START_ROW,
+        "block_end": row_count,
+        "rows": len(cluster_rows),
+        "cell_rows": len(cell_rows),
         "clusters": changed_clusters,
     }
 
@@ -391,7 +518,7 @@ def setup_linkaja_fee_headers(
         gspread_client,
         spreadsheet,
         worksheet,
-        list(KNOWN_CLUSTER_ORDER),
+        list(STATIC_CLUSTER_ORDER),
         HEADER_ROW_COUNT,
         STATIC_SHEET_COL_COUNT,
     )
@@ -400,7 +527,14 @@ def setup_linkaja_fee_headers(
 
 def detail_worksheet_for_cluster(cluster_id: str) -> str:
     _validate_known_cluster_id(cluster_id)
-    return f"{CLUSTER_DISPLAY_NAMES[cluster_id]}{DETAIL_WORKSHEET_SUFFIX}"
+    display_name = CLUSTER_DISPLAY_NAMES.get(cluster_id, cluster_id)
+    legacy_display_names = {
+        CLUSTER_DISPLAY_NAMES.get(legacy_id, legacy_id)
+        for legacy_id in LEGACY_CLUSTER_ORDER
+    }
+    if cluster_id in KNOWN_CLUSTER_ORDER and display_name in legacy_display_names:
+        return f"{display_name} {cluster_id}{DETAIL_WORKSHEET_SUFFIX}"
+    return f"{display_name}{DETAIL_WORKSHEET_SUFFIX}"
 
 
 def _normalized_label(value: Any) -> str:
@@ -1185,6 +1319,197 @@ def _extract_cluster_tables(existing_rows: list[list[str]]) -> dict[str, list[di
     return _extract_static_side_by_side_tables(existing_rows)
 
 
+def _extract_cell_tables(
+    existing_rows: list[list[str]],
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    tables = _empty_cell_tables()
+    if not existing_rows:
+        return tables
+
+    legacy_tables = _extract_legacy_single_table(existing_rows)
+    if legacy_tables:
+        for cluster_id, rows in legacy_tables.items():
+            tables[cluster_id][CLUSTER_TOTAL_CELL_ID] = rows
+        return tables
+
+    if len(existing_rows) >= CELL_HEADER_ROW_COUNT:
+        nested_tables = _extract_nested_cell_tables(existing_rows)
+        if nested_tables is not None:
+            return nested_tables
+
+    if len(existing_rows) < 2:
+        return tables
+
+    for cluster_id, start_column in _static_cluster_columns(existing_rows):
+        rows = []
+        for row in existing_rows[2:]:
+            report_date = _cell_value(row, start_column)
+            if not report_date:
+                continue
+            rows.append({
+                REPORT_DATE_HEADER: report_date,
+                CLUSTER_ID_HEADER: cluster_id,
+                EXPECTED_FEE_HEADER: _cell_value(row, start_column + 1),
+                IN_CLUSTER_FEE_HEADER: _cell_value(row, start_column + 2),
+                TOTAL_FEE_HEADER: _cell_value(row, start_column + 3),
+            })
+        tables[cluster_id][CLUSTER_TOTAL_CELL_ID] = rows
+    return tables
+
+
+def _extract_nested_cell_tables(
+    existing_rows: list[list[str]],
+) -> dict[str, dict[str, list[dict[str, Any]]]] | None:
+    tables = _empty_cell_tables()
+    row_width = max((len(row) for row in existing_rows[:CELL_HEADER_ROW_COUNT]), default=0)
+    if row_width < TABLE_WIDTH:
+        return None
+
+    current_cluster_id: str | None = None
+    column = 0
+    found_header = False
+    while column < row_width:
+        title = _cell_value(existing_rows[0], column)
+        if title:
+            current_cluster_id = _cluster_id_from_title(title)
+
+        if (
+            _cell_value(existing_rows[2], column).upper() == REPORT_DATE_HEADER
+            and not _cell_value(existing_rows[1], column)
+        ):
+            if not current_cluster_id:
+                raise ValueError("Could not identify a cluster header in LinkAja cell layout")
+            _validate_known_cluster_id(current_cluster_id)
+            date_column = column
+            cell_column = date_column + 1
+            shared_date_metrics = _row_cell_headers_match(
+                existing_rows[2],
+                cell_column,
+            )
+            if not shared_date_metrics:
+                cell_column = date_column + 2
+                if not _row_metric_headers_match(
+                    existing_rows[2],
+                    cell_column,
+                    PREVIOUS_CELL_METRIC_HEADERS,
+                ):
+                    raise ValueError("No cell metric blocks follow the shared report date")
+            metric_headers = (
+                CELL_METRIC_HEADERS
+                if shared_date_metrics
+                else PREVIOUS_CELL_METRIC_HEADERS
+            )
+            found_cells = 0
+            while _row_metric_headers_match(existing_rows[2], cell_column, metric_headers):
+                cell_id = _cell_id_from_title(_cell_value(existing_rows[1], cell_column))
+                if not cell_id:
+                    raise ValueError("Could not identify a cell header in LinkAja cell layout")
+                rows = []
+                for row in existing_rows[CELL_HEADER_ROW_COUNT:]:
+                    report_date = _cell_value(row, date_column)
+                    if not report_date:
+                        continue
+                    rows.append({
+                        REPORT_DATE_HEADER: report_date,
+                        CLUSTER_ID_HEADER: current_cluster_id,
+                        CELL_ID_HEADER: cell_id,
+                        EXPECTED_FEE_HEADER: _cell_value(row, cell_column),
+                        IN_CLUSTER_FEE_HEADER: _cell_value(row, cell_column + 1),
+                        TOTAL_FEE_HEADER: (
+                            _cell_value(row, cell_column + 2)
+                            if len(metric_headers) == len(PREVIOUS_CELL_METRIC_HEADERS)
+                            else ""
+                        ),
+                    })
+                tables[current_cluster_id][cell_id] = rows
+                found_cells += 1
+                found_header = True
+                next_cell_column = cell_column + len(metric_headers)
+                if shared_date_metrics and _row_cell_headers_match(
+                    existing_rows[2],
+                    next_cell_column + 1,
+                ):
+                    cell_column = next_cell_column + 1
+                    continue
+                cell_column = next_cell_column
+                break
+            if not found_cells:
+                raise ValueError("No cell metric blocks follow the shared report date")
+            column = cell_column
+            if column < row_width and not any(
+                _cell_value(row, column)
+                for row in existing_rows[:CELL_HEADER_ROW_COUNT]
+            ):
+                current_cluster_id = None
+                column += 1
+            continue
+
+        if _row_headers_match(existing_rows[2], column):
+            found_header = True
+            cell_title = _cell_value(existing_rows[1], column)
+            cell_id = _cell_id_from_title(cell_title)
+            if not current_cluster_id:
+                raise ValueError("Could not identify a cluster header in LinkAja cell layout")
+            if not cell_id:
+                raise ValueError("Could not identify a cell header in LinkAja cell layout")
+            _validate_known_cluster_id(current_cluster_id)
+            rows = []
+            for row in existing_rows[CELL_HEADER_ROW_COUNT:]:
+                report_date = _cell_value(row, column)
+                if not report_date:
+                    continue
+                rows.append({
+                    REPORT_DATE_HEADER: report_date,
+                    CLUSTER_ID_HEADER: current_cluster_id,
+                    CELL_ID_HEADER: cell_id,
+                    EXPECTED_FEE_HEADER: _cell_value(row, column + 1),
+                    IN_CLUSTER_FEE_HEADER: _cell_value(row, column + 2),
+                    TOTAL_FEE_HEADER: _cell_value(row, column + 3),
+                })
+            tables[current_cluster_id][cell_id] = rows
+            column += TABLE_WIDTH
+            continue
+
+        if not any(
+            _cell_value(row, column)
+            for row in existing_rows[:CELL_HEADER_ROW_COUNT]
+        ):
+            current_cluster_id = None
+        column += 1
+
+    return tables if found_header else None
+
+
+def _row_headers_match(row: list[str], start_column: int) -> bool:
+    return [
+        _cell_value(row, start_column + offset).upper()
+        for offset in range(TABLE_WIDTH)
+    ] == TABLE_HEADERS
+
+
+def _row_cell_headers_match(row: list[str], start_column: int) -> bool:
+    return _row_metric_headers_match(row, start_column, CELL_METRIC_HEADERS)
+
+
+def _row_metric_headers_match(
+    row: list[str],
+    start_column: int,
+    headers: list[str],
+) -> bool:
+    return [
+        _cell_value(row, start_column + offset).upper()
+        for offset in range(len(headers))
+    ] == headers
+
+
+def _cell_id_from_title(value: str) -> str | None:
+    normalized = str(value or "").strip()
+    if normalized.upper() in {"CLUSTER TOTAL", "CLUSTER"}:
+        return CLUSTER_TOTAL_CELL_ID
+    match = re.match(r"\s*(?:CELL\s+)?(\d+)(?:\s*-|\s*$)", normalized, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def _extract_legacy_single_table(existing_rows: list[list[str]]) -> dict[str, list[dict[str, Any]]]:
     headers = [str(value).strip().upper() for value in existing_rows[0]]
     required_headers = [
@@ -1220,8 +1545,7 @@ def _extract_static_side_by_side_tables(existing_rows: list[list[str]]) -> dict[
         return _empty_known_cluster_tables()
 
     tables = _empty_known_cluster_tables()
-    for cluster_id in KNOWN_CLUSTER_ORDER:
-        start_column = CLUSTER_START_COLUMNS[cluster_id]
+    for cluster_id, start_column in _static_cluster_columns(existing_rows):
         cluster_rows = []
         for row in existing_rows[2:]:
             report_date = _cell_value(row, start_column)
@@ -1237,6 +1561,22 @@ def _extract_static_side_by_side_tables(existing_rows: list[list[str]]) -> dict[
         tables[cluster_id] = cluster_rows
 
     return _sort_cluster_table_rows(tables)
+
+
+def _static_cluster_columns(existing_rows: list[list[str]]) -> list[tuple[str, int]]:
+    columns = []
+    row_width = max((len(row) for row in existing_rows[:2]), default=0)
+    for start_column in range(row_width):
+        if not _row_headers_match(existing_rows[1], start_column):
+            continue
+        cluster_id = _cluster_id_from_title(_cell_value(existing_rows[0], start_column))
+        if not cluster_id:
+            raise ValueError(
+                "Could not identify a cluster header in the LinkAja summary sheet"
+            )
+        _validate_known_cluster_id(cluster_id)
+        columns.append((cluster_id, start_column))
+    return columns
 
 
 def _cluster_id_from_title(value: str) -> str | None:
@@ -1280,6 +1620,224 @@ def _merge_replacement_rows(
     return _sort_cluster_table_rows(tables), replaced_rows
 
 
+def _merge_cell_replacement_rows(
+    existing_tables: dict[str, dict[str, list[dict[str, Any]]]],
+    cluster_rows: list[dict[str, Any]],
+    cell_rows: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, list[dict[str, Any]]]], int]:
+    tables = _normalize_cell_tables(deepcopy(existing_tables))
+    replaced_rows = 0
+    seen_keys: set[tuple[str, str, str]] = set()
+
+    for row in cluster_rows:
+        cluster_id = str(row.get(CLUSTER_ID_HEADER, "")).strip()
+        report_date = str(row.get(REPORT_DATE_HEADER, "")).strip()
+        if not cluster_id or not report_date:
+            raise ValueError("LinkAja cluster fee row is missing its cluster or date")
+        _validate_known_cluster_id(cluster_id)
+        key = (cluster_id, CLUSTER_TOTAL_CELL_ID, report_date)
+        if key in seen_keys:
+            raise ValueError("Duplicate LinkAja cluster fee row for one report date")
+        seen_keys.add(key)
+        replaced_rows += _replace_cell_table_date(
+            tables[cluster_id],
+            CLUSTER_TOTAL_CELL_ID,
+            report_date,
+            _visible_cell_row(row, cluster_id, CLUSTER_TOTAL_CELL_ID, report_date),
+        )
+
+    for row in cell_rows:
+        cluster_id = str(row.get(CLUSTER_ID_HEADER, "")).strip()
+        cell_id = str(row.get(CELL_ID_HEADER, "")).strip()
+        report_date = str(row.get(REPORT_DATE_HEADER, "")).strip()
+        if not cluster_id or not cell_id or not report_date:
+            raise ValueError("LinkAja cell fee row is missing its cluster, cell, or date")
+        if cell_id == CLUSTER_TOTAL_CELL_ID:
+            raise ValueError("LinkAja cell fee row uses the reserved cluster-total ID")
+        _validate_known_cluster_id(cluster_id)
+        key = (cluster_id, cell_id, report_date)
+        if key in seen_keys:
+            raise ValueError("Duplicate LinkAja cell fee row for one cell and report date")
+        seen_keys.add(key)
+        replaced_rows += _replace_cell_table_date(
+            tables[cluster_id],
+            cell_id,
+            report_date,
+            _visible_cell_row(row, cluster_id, cell_id, report_date),
+        )
+
+    for cluster_id, cell_tables in tables.items():
+        tables[cluster_id] = {
+            cell_id: sorted(
+                rows,
+                key=lambda item: date_sort_key(str(item[REPORT_DATE_HEADER])),
+            )
+            for cell_id, rows in cell_tables.items()
+        }
+    return tables, replaced_rows
+
+
+def _replace_cell_table_date(
+    cluster_tables: dict[str, list[dict[str, Any]]],
+    cell_id: str,
+    report_date: str,
+    replacement_row: dict[str, Any],
+) -> int:
+    rows = cluster_tables.setdefault(cell_id, [])
+    kept_rows = [
+        row for row in rows
+        if str(row.get(REPORT_DATE_HEADER, "")).strip() != report_date
+    ]
+    replaced = len(rows) - len(kept_rows)
+    kept_rows.append(replacement_row)
+    cluster_tables[cell_id] = kept_rows
+    return replaced
+
+
+def _visible_cell_row(
+    row: dict[str, Any],
+    cluster_id: str,
+    cell_id: str,
+    report_date: str,
+) -> dict[str, Any]:
+    return {
+        REPORT_DATE_HEADER: report_date,
+        CLUSTER_ID_HEADER: cluster_id,
+        CELL_ID_HEADER: cell_id,
+        EXPECTED_FEE_HEADER: row.get(EXPECTED_FEE_HEADER, ""),
+        IN_CLUSTER_FEE_HEADER: row.get(IN_CLUSTER_FEE_HEADER, ""),
+        TOTAL_FEE_HEADER: row.get(TOTAL_FEE_HEADER, ""),
+    }
+
+
+def _empty_cell_tables() -> dict[str, dict[str, list[dict[str, Any]]]]:
+    return {cluster_id: {} for cluster_id in SUPPORTED_CLUSTER_ORDER}
+
+
+def _normalize_cell_tables(
+    tables: dict[str, dict[str, list[dict[str, Any]]]],
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    normalized = _empty_cell_tables()
+    for cluster_id, cell_tables in tables.items():
+        _validate_known_cluster_id(cluster_id)
+        normalized[cluster_id] = {
+            str(cell_id): rows
+            for cell_id, rows in cell_tables.items()
+        }
+    return normalized
+
+
+def _build_cell_side_by_side_values(
+    tables: dict[str, dict[str, list[dict[str, Any]]]],
+) -> tuple[list[list[Any]], list[dict[str, Any]], list[str]]:
+    tables = _normalize_cell_tables(tables)
+    cluster_order = [
+        *KNOWN_CLUSTER_ORDER,
+        *(
+            cluster_id
+            for cluster_id in LEGACY_CLUSTER_ORDER
+            if any(tables[cluster_id].values())
+        ),
+    ]
+    cell_ids_by_cluster = {}
+    report_dates_by_cluster = {}
+    for cluster_id in cluster_order:
+        cell_ids = sorted(
+            (
+                cell_id for cell_id in tables[cluster_id]
+                if cell_id != CLUSTER_TOTAL_CELL_ID
+            ),
+            key=lambda value: (not value.isdigit(), int(value) if value.isdigit() else value),
+        )
+        if not cell_ids:
+            cell_ids = [CLUSTER_TOTAL_CELL_ID]
+        cell_ids_by_cluster[cluster_id] = cell_ids
+        report_dates = {
+            str(row[REPORT_DATE_HEADER])
+            for cell_id in cell_ids
+            for row in tables[cluster_id].get(cell_id, [])
+        }
+        report_dates_by_cluster[cluster_id] = sorted(
+            report_dates,
+            key=date_sort_key,
+        )
+
+    max_data_rows = max(
+        (len(report_dates) for report_dates in report_dates_by_cluster.values()),
+        default=0,
+    )
+    cluster_layouts = []
+    column_count = 0
+    for cluster_index, cluster_id in enumerate(cluster_order):
+        cell_ids = cell_ids_by_cluster[cluster_id]
+        start_column = column_count
+        cell_blocks = []
+        report_date_column = column_count
+        column_count += 1
+        cell_divider_columns = []
+        for cell_index, cell_id in enumerate(cell_ids):
+            cell_start = column_count
+            values_end = cell_start + CELL_METRIC_WIDTH
+            cell_blocks.append({
+                "cell_id": cell_id,
+                "start_column": cell_start,
+                "end_column": values_end,
+            })
+            column_count = values_end
+            if cell_index < len(cell_ids) - 1:
+                cell_divider_columns.append(column_count)
+        cluster_layouts.append({
+            "cluster_id": cluster_id,
+            "start_column": start_column,
+            "end_column": column_count,
+            "cell_blocks": cell_blocks,
+            "cluster_index": cluster_index,
+            "uses_shared_date_layout": True,
+            "report_date_column": report_date_column,
+            "cell_divider_columns": cell_divider_columns,
+        })
+        if cluster_index < len(cluster_order) - 1:
+            column_count += SPACER_WIDTH
+
+    row_count = CELL_HEADER_ROW_COUNT + max_data_rows
+    values = [["" for _ in range(column_count)] for _ in range(row_count)]
+    for cluster_layout in cluster_layouts:
+        cluster_id = cluster_layout["cluster_id"]
+        values[0][cluster_layout["start_column"]] = _cluster_title(cluster_id)
+        report_date_column = cluster_layout["report_date_column"]
+        values[2][report_date_column] = REPORT_DATE_HEADER
+        for cell_block in cluster_layout["cell_blocks"]:
+            cell_id = cell_block["cell_id"]
+            cell_start = cell_block["start_column"]
+            values[1][cell_start] = (
+                "CLUSTER" if cell_id == CLUSTER_TOTAL_CELL_ID else f"CELL {cell_id}"
+            )
+            for header_offset, header in enumerate(CELL_METRIC_HEADERS):
+                values[2][cell_start + header_offset] = header
+
+        rows_by_cell_and_date = {
+            cell_block["cell_id"]: {
+                str(row[REPORT_DATE_HEADER]): row
+                for row in tables[cluster_id].get(cell_block["cell_id"], [])
+            }
+            for cell_block in cluster_layout["cell_blocks"]
+        }
+        for row_offset, report_date in enumerate(report_dates_by_cluster[cluster_id]):
+            sheet_row = CELL_HEADER_ROW_COUNT + row_offset
+            values[sheet_row][report_date_column] = report_date
+            for cell_block in cluster_layout["cell_blocks"]:
+                row = rows_by_cell_and_date[cell_block["cell_id"]].get(report_date)
+                if row is None:
+                    continue
+                for header_offset, header in enumerate(CELL_METRIC_HEADERS):
+                    values[sheet_row][cell_block["start_column"] + header_offset] = row.get(
+                        header,
+                        "",
+                    )
+
+    return values, cluster_layouts, cluster_order
+
+
 def _visible_cluster_row(
     row: dict[str, Any],
     cluster_id: str,
@@ -1304,7 +1862,7 @@ def _sort_cluster_table_rows(
 
 
 def _empty_known_cluster_tables() -> dict[str, list[dict[str, Any]]]:
-    return {cluster_id: [] for cluster_id in KNOWN_CLUSTER_ORDER}
+    return {cluster_id: [] for cluster_id in SUPPORTED_CLUSTER_ORDER}
 
 
 def _normalize_known_cluster_tables(
@@ -1318,8 +1876,8 @@ def _normalize_known_cluster_tables(
 
 
 def _validate_known_cluster_id(cluster_id: str) -> None:
-    if cluster_id not in KNOWN_CLUSTER_ORDER:
-        known_clusters = ", ".join(KNOWN_CLUSTER_ORDER)
+    if cluster_id not in SUPPORTED_CLUSTER_ORDER:
+        known_clusters = ", ".join(SUPPORTED_CLUSTER_ORDER)
         raise ValueError(
             f"Unknown LinkAja cluster ID {cluster_id!r}; expected one of: {known_clusters}"
         )
@@ -1334,7 +1892,7 @@ def _changed_clusters(rows: list[dict[str, Any]]) -> list[str]:
         _validate_known_cluster_id(cluster_id)
     return [
         cluster_id
-        for cluster_id in KNOWN_CLUSTER_ORDER
+        for cluster_id in SUPPORTED_CLUSTER_ORDER
         if cluster_id in cluster_ids
     ]
 
@@ -1350,7 +1908,7 @@ def _worksheet_is_empty(existing_values: list[list[str]]) -> bool:
 def _build_static_header_values() -> list[list[Any]]:
     values = [["" for _ in range(STATIC_SHEET_COL_COUNT)] for _ in range(HEADER_ROW_COUNT)]
 
-    for cluster_id in KNOWN_CLUSTER_ORDER:
+    for cluster_id in STATIC_CLUSTER_ORDER:
         start_column = CLUSTER_START_COLUMNS[cluster_id]
         values[0][start_column] = _cluster_title(cluster_id)
         for header_offset, header in enumerate(TABLE_HEADERS):
@@ -1401,9 +1959,9 @@ def _build_side_by_side_values(
     tables: dict[str, list[dict[str, Any]]],
 ) -> tuple[list[list[Any]], list[str]]:
     tables = _normalize_known_cluster_tables(tables)
-    clusters = list(KNOWN_CLUSTER_ORDER)
+    clusters = list(STATIC_CLUSTER_ORDER)
     max_data_rows = max((len(rows) for rows in tables.values()), default=0)
-    col_count = INITIAL_CLUSTER_COUNT * BLOCK_WIDTH - SPACER_WIDTH
+    col_count = STATIC_SHEET_COL_COUNT
     row_count = max(2 + max_data_rows, 2)
     values = [["" for _ in range(col_count)] for _ in range(row_count)]
 
@@ -1520,6 +2078,343 @@ def _format_linkaja_sheet(
     )
     requests.append(protected_sheet_request)
 
+    spreadsheet.batch_update({"requests": requests})
+
+
+def _format_cell_aware_linkaja_sheet(
+    gspread_client,
+    spreadsheet,
+    worksheet,
+    cluster_layouts: list[dict[str, Any]],
+    row_count: int,
+    col_count: int,
+    visible_col_count: int,
+) -> None:
+    requests = [
+        *_delete_all_protected_range_requests(spreadsheet, worksheet),
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": worksheet.id,
+                    "gridProperties": {"frozenRowCount": CELL_HEADER_ROW_COUNT},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+    ]
+
+    for cluster_layout in cluster_layouts:
+        cluster_id = cluster_layout["cluster_id"]
+        start_column = cluster_layout["start_column"]
+        end_column = cluster_layout["end_column"]
+        palette = CLUSTER_PALETTES[
+            cluster_layout["cluster_index"] % len(CLUSTER_PALETTES)
+        ]
+        requests.extend([
+            {
+                "mergeCells": {
+                    "range": _grid_range(
+                        worksheet,
+                        1,
+                        1,
+                        start_column + 1,
+                        end_column,
+                    ),
+                    "mergeType": "MERGE_ALL",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": _grid_range(
+                        worksheet,
+                        1,
+                        1,
+                        start_column + 1,
+                        end_column,
+                    ),
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": palette["title"],
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                            "textFormat": {
+                                "foregroundColor": WHITE_COLOR,
+                                "bold": True,
+                            },
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                        "verticalAlignment,textFormat)"
+                    ),
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": _grid_range(
+                        worksheet,
+                        1,
+                        3,
+                        start_column + 1,
+                        end_column,
+                    ),
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                            "wrapStrategy": "WRAP",
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat(horizontalAlignment,verticalAlignment,"
+                        "wrapStrategy)"
+                    ),
+                }
+            },
+            {
+                "updateBorders": {
+                    "range": _grid_range(
+                        worksheet,
+                        1,
+                        max(row_count, CELL_HEADER_ROW_COUNT),
+                        start_column + 1,
+                        end_column,
+                    ),
+                    "top": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
+                    "bottom": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
+                    "left": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
+                    "right": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
+                    "innerHorizontal": {"style": "SOLID", "color": BORDER_COLOR},
+                    "innerVertical": {"style": "SOLID", "color": BORDER_COLOR},
+                }
+            },
+        ])
+
+        if cluster_layout["uses_shared_date_layout"]:
+            date_column = cluster_layout["report_date_column"]
+            requests.append({
+                "repeatCell": {
+                    "range": _grid_range(
+                        worksheet,
+                        2,
+                        3,
+                        date_column + 1,
+                        date_column + 1,
+                    ),
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": palette["header"],
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                            "textFormat": {"bold": True},
+                            "wrapStrategy": "WRAP",
+                        }
+                    },
+                    "fields": (
+                        "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                        "verticalAlignment,textFormat,wrapStrategy)"
+                    ),
+                }
+            })
+            requests.append(
+                _column_width_request(
+                    worksheet,
+                    date_column,
+                    date_column + 1,
+                    REPORT_DATE_COLUMN_WIDTH,
+                )
+            )
+            if row_count >= CELL_DATA_START_ROW:
+                requests.append({
+                    "repeatCell": {
+                        "range": _grid_range(
+                            worksheet,
+                            CELL_DATA_START_ROW,
+                            row_count,
+                            date_column + 1,
+                            date_column + 1,
+                        ),
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": palette["body"],
+                                "horizontalAlignment": "CENTER",
+                                "verticalAlignment": "MIDDLE",
+                            }
+                        },
+                        "fields": (
+                            "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                            "verticalAlignment)"
+                        ),
+                    }
+                })
+
+            for cell_block in cluster_layout["cell_blocks"]:
+                cell_start = cell_block["start_column"]
+                cell_end = cell_block["end_column"]
+                requests.extend([
+                    {
+                        "mergeCells": {
+                            "range": _grid_range(
+                                worksheet,
+                                2,
+                                2,
+                                cell_start + 1,
+                                cell_end,
+                            ),
+                            "mergeType": "MERGE_ALL",
+                        }
+                    },
+                    {
+                        "repeatCell": {
+                            "range": _grid_range(
+                                worksheet,
+                                2,
+                                3,
+                                cell_start + 1,
+                                cell_end,
+                            ),
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "backgroundColor": palette["header"],
+                                    "horizontalAlignment": "CENTER",
+                                    "verticalAlignment": "MIDDLE",
+                                    "textFormat": {"bold": True},
+                                    "wrapStrategy": "WRAP",
+                                }
+                            },
+                            "fields": (
+                                "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                                "verticalAlignment,textFormat,wrapStrategy)"
+                            ),
+                        }
+                    },
+                ])
+                if row_count >= CELL_DATA_START_ROW:
+                    requests.extend([
+                        {
+                            "repeatCell": {
+                                "range": _grid_range(
+                                    worksheet,
+                                    CELL_DATA_START_ROW,
+                                    row_count,
+                                    cell_start + 1,
+                                    cell_end,
+                                ),
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "backgroundColor": palette["body"],
+                                        "horizontalAlignment": "CENTER",
+                                        "verticalAlignment": "MIDDLE",
+                                    }
+                                },
+                                "fields": (
+                                    "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                                    "verticalAlignment)"
+                                ),
+                            }
+                        },
+                        {
+                            "repeatCell": {
+                                "range": _grid_range(
+                                    worksheet,
+                                    CELL_DATA_START_ROW,
+                                    row_count,
+                                    cell_start + 1,
+                                    cell_end,
+                                ),
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "numberFormat": {
+                                            "type": "NUMBER",
+                                            "pattern": "#,##0",
+                                        }
+                                    }
+                                },
+                                "fields": "userEnteredFormat.numberFormat",
+                            }
+                        },
+                    ])
+
+                for offset, width in enumerate((
+                    EXPECTED_FEE_COLUMN_WIDTH,
+                    IN_CLUSTER_FEE_COLUMN_WIDTH,
+                )):
+                    requests.append(
+                        _column_width_request(
+                            worksheet,
+                            cell_start + offset,
+                            cell_start + offset + 1,
+                            width,
+                        )
+                    )
+            for divider_column in cluster_layout["cell_divider_columns"]:
+                requests.append({
+                    "updateBorders": {
+                        "range": _grid_range(
+                            worksheet,
+                            2,
+                            max(row_count, CELL_HEADER_ROW_COUNT),
+                            divider_column + 1,
+                            divider_column + 1,
+                        ),
+                        "left": {
+                            "style": "SOLID_MEDIUM",
+                            "color": BORDER_COLOR,
+                        },
+                    }
+                })
+        if cluster_layout["cluster_index"] < len(cluster_layouts) - 1:
+            requests.append(
+                _column_width_request(
+                    worksheet,
+                    end_column,
+                    end_column + SPACER_WIDTH,
+                    SPACER_COLUMN_WIDTH,
+                )
+            )
+
+    if visible_col_count < col_count:
+        tail_range = _grid_range(
+            worksheet,
+            1,
+            row_count,
+            visible_col_count + 1,
+            col_count,
+        )
+        requests.extend([
+            {
+                "repeatCell": {
+                    "range": tail_range,
+                    "cell": {"userEnteredFormat": {}},
+                    "fields": "userEnteredFormat",
+                }
+            },
+            {
+                "updateBorders": {
+                    "range": tail_range,
+                    "top": {"style": "NONE"},
+                    "bottom": {"style": "NONE"},
+                    "left": {"style": "NONE"},
+                    "right": {"style": "NONE"},
+                    "innerHorizontal": {"style": "NONE"},
+                    "innerVertical": {"style": "NONE"},
+                }
+            },
+            _column_width_request(
+                worksheet,
+                visible_col_count,
+                col_count,
+                SPACER_COLUMN_WIDTH,
+            ),
+        ])
+
+    requests.append(
+        _add_protected_sheet_request(
+            gspread_client,
+            worksheet,
+            "LinkAja protected cell-aware fee summary sheet",
+        )
+    )
     spreadsheet.batch_update({"requests": requests})
 
 

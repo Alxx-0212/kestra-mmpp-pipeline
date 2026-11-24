@@ -68,6 +68,61 @@ docker build -f Dockerfile.linkaja -t linkaja-fee-pipeline:3.11 .
 The PostgreSQL integration tests require a dedicated disposable
 `LINKAJA_TEST_DSN`; they truncate LinkAja-owned test tables.
 
+## Production Database Configuration
+
+The target architecture is one shared PostgreSQL instance with a separate
+`linkaja` database. Production source inspection found the active LinkAja
+workflows still use `FINPAY_DB_*`; a sanitized secret-name check resolved
+`FINPAY_DB_NAME` to `finpay`. The live database catalog and LinkAja relation
+locations were not verified. The current worktree's `LINKAJA_DB_*` wiring is a
+cutover change, not evidence that production has already moved.
+
+### Database Provisioning
+
+The shared Compose provisioner (`docker/provision/01-provision-databases.sh`)
+creates missing databases/roles but also reapplies passwords and ownership for
+FinPay and every other configured database. FinPay is already provisioned in
+production; do not run the shared provisioner just to add LinkAja. If `linkaja`
+and its role exist, only the LinkAja schema migrations are needed. If they do
+not exist, use a separately reviewed LinkAja-only DBA/provisioning action.
+
+### Kestra Secrets
+
+Production LinkAja workflows require these Kestra secrets (namespace `finance.linkaja`):
+
+- `LINKAJA_DB_HOST`
+- `LINKAJA_DB_PORT`
+- `LINKAJA_DB_NAME` (default: `linkaja`)
+- `LINKAJA_DB_USER` (default: `linkaja`)
+- `LINKAJA_DB_PASSWORD`
+
+The Compose environment secret provider resolves these from base64
+`SECRET_LINKAJA_DB_*` entries in protected `.env_encoded`. The inspected
+production file had no `SECRET_LINKAJA_DB_NAME` entry, so the current worktree
+flow is not deployable there until the LinkAja secrets are provisioned. Never
+commit `.env_encoded` or real secret values.
+
+The DSN helper defaults to the `LINKAJA_DB_` prefix:
+```python
+from linkaja_fee_pipeline import linkaja_postgres_dsn_from_env
+dsn = linkaja_postgres_dsn_from_env()  # uses LINKAJA_DB_*
+```
+
+### Cutover from FinPay Database
+
+The active production source points LinkAja at `finpay`, but the live catalog
+and row counts were not verified. The current requested rollout is schema-only:
+existing LinkAja history, if present in `finpay`, remains there and the new
+`linkaja` database starts at cutover. State this history boundary explicitly.
+If continuity requirements change, stop and obtain approval for a backup and
+tested transfer/replay plan. The former wildcard `pg_dump | psql` example was
+removed because it was not validated against production dependencies/ownership.
+
+After a reviewed transfer (or an explicit fresh-start decision), provision and
+verify the `linkaja` target, configure `LINKAJA_DB_*` Kestra secrets, deploy
+only the LinkAja flows, and run dry-run plus a full canary before switching the
+active writer.
+
 ## Kestra API Trigger Guide
 
 LinkAja flows are manual. They have no schedule trigger and are executed through
@@ -111,8 +166,8 @@ Inputs:
 |---|---|---:|---|---|
 | `source_file` | FILE | yes | - | One LinkAja CSV export for one cluster. |
 | `source_filename` | STRING | no | empty | Original basename when Kestra stores the upload as a temporary `.upl` path. |
-| `dry_run` | BOOLEAN | no | `false` | Validate and normalize without PostgreSQL persistence. |
-| `write_gsheet` | BOOLEAN | no | `true` | After PostgreSQL succeeds, update the shared `LinkAja` summary and cluster detail worksheet. |
+| `dry_run` | BOOL | no | `false` | Validate and normalize without PostgreSQL persistence. |
+| `write_gsheet` | BOOL | no | `true` | After PostgreSQL succeeds, update the shared `LinkAja` fee summary only. |
 
 Filename contract:
 
@@ -177,11 +232,12 @@ The daily backfill does not finalize monthly fees or waive unresolved reversals.
 Keep monthly `publish=false` until source coverage, close cutoffs, and Finance
 waiver approval have been reviewed.
 
-The daily flow validates the CSV, writes normalized artifacts, applies pending
-schema migrations, replaces affected current transaction IDs, refreshes daily
-fee/detail facts, and records append-only source evidence after the versioned
-source migration is deployed. Submit chronological source generations one at a
-time when replacement order matters.
+The daily fee flow validates the CSV, writes normalized artifacts, applies
+pending schema migrations, replaces affected current transaction IDs, refreshes
+daily fee facts, and records append-only source evidence after the versioned
+source migration is deployed. It does not calculate or publish the cluster
+detail worksheet; that belongs to a separate detail workflow. Submit
+chronological source generations one at a time when replacement order matters.
 
 ### Monthly flow
 
@@ -198,8 +254,8 @@ Current inputs:
 | `cluster_id` | STRING | yes | - | LinkAja cluster. |
 | `report_month` | STRING | yes | - | `YYYY-MM` or `YYYY-MM-01`. |
 | `calculation_cutoff` | STRING | yes | - | Exclusive local Asia/Makassar cutoff, on or after the next month. |
-| `publish` | BOOLEAN | no | `false` | Preview when false; replace one cluster-month snapshot when true. |
-| `write_gsheet` | BOOLEAN | no | `true` | Write/update the month-and-cluster worksheet after calculation. |
+| `publish` | BOOL | no | `false` | Preview when false; replace one cluster-month snapshot when true. |
+| `write_gsheet` | BOOL | no | `true` | Write/update the month-and-cluster worksheet after calculation. |
 
 Preview a month:
 
