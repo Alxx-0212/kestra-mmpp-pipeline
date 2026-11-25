@@ -62,9 +62,11 @@ host bind mount `/tmp/finpay inbox/<cluster>/<date>/<inbox_generation_sha256>/<c
 filename inside each cell directory retains the previous convention:
 `finpay-<cluster>(<DD-MM-YYYY>to<DD-MM-YYYY>).xlsx`. Each cohort is
 checksum-verified and promoted as one content-addressed directory; changed sources
-create a new generation rather than mixing versions. The key is derived from the
-cluster/date/cell identities and source checksums, and is exposed as the acquisition
-task's `inbox_generation_sha256` output. No inbox cleanup is scheduled.
+create a new generation rather than mixing versions. The scraper normalizes XLSX
+core and ZIP metadata, so repeated exports with identical workbook contents produce
+byte-identical files and reuse the same source generation. The key is derived from
+the cluster/date/cell identities and source checksums, and is exposed as the
+acquisition task's `inbox_generation_sha256` output. No inbox cleanup is scheduled.
 Create the host directory before running the flow, and keep it restricted because
 it contains raw financial source data.
 

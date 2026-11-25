@@ -219,6 +219,40 @@ class DigiPosXhrFallbackTest(unittest.TestCase):
             **overrides,
         }
 
+    def test_identical_rows_create_byte_identical_xlsx_files(self):
+        from datetime import datetime
+        import time
+        from openpyxl import Workbook
+        from zipfile import ZipFile
+
+        rows = [_datatables_row_to_cells(self.source_row(), 1)]
+        with TemporaryDirectory() as tmp_dir:
+            first_path = Path(tmp_dir) / "first.xlsx"
+            second_path = Path(tmp_dir) / "second.xlsx"
+            first_workbook = Workbook()
+            first_workbook.properties.created = datetime(2026, 11, 24, 10, 0, 0)
+            first_workbook.properties.modified = datetime(2026, 11, 24, 10, 0, 0)
+            second_workbook = Workbook()
+            second_workbook.properties.created = datetime(2026, 11, 25, 5, 0, 0)
+            second_workbook.properties.modified = datetime(2026, 11, 25, 5, 0, 0)
+            first_zip_time = time.struct_time((2026, 11, 24, 10, 0, 0, 1, 328, -1))
+            second_zip_time = time.struct_time((2026, 11, 25, 5, 0, 0, 2, 329, -1))
+
+            with patch("openpyxl.Workbook", return_value=first_workbook), \
+                    patch("zipfile.time.localtime", return_value=first_zip_time):
+                _write_xhr_export(first_path, rows)
+            with patch("openpyxl.Workbook", return_value=second_workbook), \
+                    patch("zipfile.time.localtime", return_value=second_zip_time):
+                _write_xhr_export(second_path, rows)
+
+            self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+            with ZipFile(first_path) as archive:
+                self.assertTrue(all(
+                    item.date_time == (1980, 1, 1, 0, 0, 0)
+                    for item in archive.infolist()
+                ))
+            self.assertEqual(_read_xlsx_rows(first_path), _read_xlsx_rows(second_path))
+
     def test_exact_identifiers_and_phone_survive_xlsx_and_daily_loading(self):
         cases = (
             ["000123", "123", "000123FEE", "12345678901234567890"],

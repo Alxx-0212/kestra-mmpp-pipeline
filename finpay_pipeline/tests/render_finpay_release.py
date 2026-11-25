@@ -20,6 +20,7 @@ IMAGE_ARGUMENTS = {
     "finpay-cell-reporting:dev-cell-range-20261115": "report_image",
     "finpay-digipos-cell-scraper:2.0": "cell_scraper_image",
     "finpay-digipos-cell-scraper:dev-cell-range-20261115": "cell_scraper_image",
+    "finpay-digipos-cell-scraper:dedupe-xlsx-20261125-r1": "cell_scraper_image",
     "finpay-digipos-scraper:1.0": "legacy_scraper_image",
 }
 IMAGE_LINE = re.compile(r"(?m)^([ \t]*(?:-[ \t]+)?containerImage:[ \t]*)([^#\r\n]+?)([ \t]*(?:#.*)?)$")

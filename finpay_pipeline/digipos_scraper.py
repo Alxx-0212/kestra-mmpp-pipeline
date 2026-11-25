@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
@@ -33,6 +35,8 @@ XLSX_WIDTHS = {
     "A": 6.0, "B": 25.65, "C": 37.8, "D": 14.85, "E": 13.5, "F": 14.85,
     "G": 14.85, "H": 21.6, "I": 18.9, "J": 27.0, "K": 54.0,
 }
+XLSX_EXPORT_TIMESTAMP = datetime(2000, 1, 1, 0, 0, 0)
+XLSX_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
 def parse_report_date(value: str) -> date:
@@ -151,10 +155,45 @@ def _rows_from_datatables_response(payload: dict, expected_total: int) -> list[l
     return [_datatables_row_to_cells(row, index) for index, row in enumerate(data, 1)]
 
 
+def _canonicalize_xlsx_zip_metadata(path: Path) -> None:
+    """Make identical worksheet content produce identical XLSX bytes."""
+    temporary_path = None
+    try:
+        with zipfile.ZipFile(path, "r") as source:
+            entries = [
+                (item, source.read(item.filename))
+                for item in source.infolist()
+            ]
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
+        with zipfile.ZipFile(
+            temporary_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as destination:
+            for original, content in sorted(entries, key=lambda item: item[0].filename):
+                info = zipfile.ZipInfo(original.filename, date_time=XLSX_ZIP_TIMESTAMP)
+                info.compress_type = original.compress_type
+                info.create_system = original.create_system
+                info.external_attr = original.external_attr
+                info.internal_attr = original.internal_attr
+                info.extra = b""
+                info.comment = b""
+                destination.writestr(
+                    info, content, compress_type=info.compress_type, compresslevel=6
+                )
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _write_xhr_export(path: Path, rows: list[list]) -> None:
     from openpyxl import Workbook
 
     workbook = Workbook()
+    workbook.properties.created = XLSX_EXPORT_TIMESTAMP
+    workbook.properties.modified = XLSX_EXPORT_TIMESTAMP
     worksheet = workbook.active
     worksheet.title = "Sheet1"
     worksheet.cell(row=1, column=1, value=XLSX_TITLE)
@@ -177,8 +216,11 @@ def _write_xhr_export(path: Path, rows: list[list]) -> None:
     for column, width in XLSX_WIDTHS.items():
         worksheet.column_dimensions[column].width = width
 
-    workbook.save(path)
-    workbook.close()
+    try:
+        workbook.save(path)
+    finally:
+        workbook.close()
+    _canonicalize_xlsx_zip_metadata(path)
 
 
 def validate_export_rows(rows, report_date: str, expected_total: int) -> int:

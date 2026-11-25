@@ -126,7 +126,7 @@ tasks:
   - id: acquire_cell_cluster_day
     type: io.kestra.plugin.scripts.python.Script
     logLevel: INFO
-    containerImage: finpay-digipos-cell-scraper:dev-cell-range-20261115
+    containerImage: finpay-digipos-cell-scraper:dedupe-xlsx-20261125-r1
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
       networkMode: host

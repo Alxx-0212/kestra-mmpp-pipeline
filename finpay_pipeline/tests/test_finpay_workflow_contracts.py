@@ -359,7 +359,7 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         self.assertIn("write_gsheet: true", trigger)
         self.assertIn("send_telegram: false", trigger)
 
-        previous_day = "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+        previous_day = "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd', timeZone='Asia/Makassar') }}"
         task = _task_block(daily_flow, "invoke_finpay_cell_range")
         self.assertIn("type: io.kestra.plugin.core.flow.Subflow", task)
         self.assertIn("namespace: finance.finpay", task)
@@ -450,6 +450,7 @@ class FinPayWorkflowContractTest(unittest.TestCase):
         flow = (REPOSITORY_ROOT / "finpay_pipeline/workflows/finpay_cell_day_v1.yml").read_text()
         task = _task_block(flow, "acquire_cell_cluster_day")
 
+        self.assertIn("containerImage: finpay-digipos-cell-scraper:dedupe-xlsx-20261125-r1", task)
         self.assertIn('"/tmp/finpay inbox:/tmp/finpay inbox"', task)
         self.assertIn('CELL_INBOX_DIR: "/tmp/finpay inbox"', task)
         self.assertIn("copy_cell_sources_to_inbox(", task)

@@ -41,8 +41,8 @@ tasks:
     wait: true
     transmitFailed: true
     inputs:
-      start_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
-      end_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd') }}"
+      start_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd', timeZone='Asia/Makassar') }}"
+      end_date: "{{ trigger.date | dateAdd(-1, 'DAYS') | date('yyyy-MM-dd', timeZone='Asia/Makassar') }}"
       cluster_id: "{{ inputs.cluster_id }}"
       dry_run: "{{ inputs.dry_run }}"
       write_gsheet: "{{ inputs.write_gsheet }}"

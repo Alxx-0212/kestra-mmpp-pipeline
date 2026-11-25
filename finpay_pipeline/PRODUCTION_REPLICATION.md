@@ -265,8 +265,8 @@ For `--pipeline legacy`, supply `--base-image` and `--legacy-scraper-image`
 instead. `--pipeline both` requires all four. The source-to-image mapping is
 `finpay-pipeline:3.11` to base, `finpay-cell-reporting:2.0` and
 `finpay-cell-reporting:dev-cell-range-20261115` to reporting,
-`finpay-digipos-cell-scraper:2.0` and
-`finpay-digipos-cell-scraper:dev-cell-range-20261115` to cell scraper, and
+`finpay-digipos-cell-scraper:2.0`, `finpay-digipos-cell-scraper:dev-cell-range-20261115`,
+and `finpay-digipos-cell-scraper:dedupe-xlsx-20261125-r1` to cell scraper, and
 `finpay-digipos-scraper:1.0` to legacy scraper. Development aliases use the same
 immutable release digest as their corresponding stable source image. Only the
 three primary cell flows or three primary legacy flows are rendered;
