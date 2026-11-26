@@ -1249,13 +1249,293 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
             [21_400, 3_260],
         )
         next_cluster = next(item for item in layout if item["cluster_id"] == "422100")
-        self.assertEqual(next_cluster["start_column"] - cluster["end_column"], 1)
+        self.assertEqual(next_cluster["start_column"], cluster["end_column"])
         self.assertEqual(
             _extract_cell_tables(values)["422220"]["422221"][0][EXPECTED_FEE_HEADER],
             "75000",
         )
         for row in values:
             self.assertNotIn(TOTAL_FEE_HEADER, row)
+
+    def test_compact_cell_parser_preserves_neighboring_cluster_during_rewrite(self):
+        report_date = "01/10/2026"
+        initial_cells = [
+            ("422040", "422041", 100, 10),
+            ("422040", "422042", 200, 20),
+            ("422040", "422043", 300, 30),
+            ("422140", "422141", 400, 40),
+            ("422140", "422142", 500, 50),
+        ]
+        cell_rows = [
+            {
+                REPORT_DATE_HEADER: report_date,
+                CLUSTER_ID_HEADER: cluster_id,
+                CELL_ID_HEADER: cell_id,
+                EXPECTED_FEE_HEADER: expected,
+                IN_CLUSTER_FEE_HEADER: in_cluster,
+                TOTAL_FEE_HEADER: expected + in_cluster,
+            }
+            for cluster_id, cell_id, expected, in_cluster in initial_cells
+        ]
+        tables, _ = _merge_cell_replacement_rows({}, [], cell_rows)
+        values, layout, _ = _build_cell_side_by_side_values(tables)
+
+        replacement_cells = [
+            {
+                REPORT_DATE_HEADER: report_date,
+                CLUSTER_ID_HEADER: "422140",
+                CELL_ID_HEADER: cell_id,
+                EXPECTED_FEE_HEADER: expected,
+                IN_CLUSTER_FEE_HEADER: in_cluster,
+                TOTAL_FEE_HEADER: expected + in_cluster,
+            }
+            for cell_id, expected, in_cluster in (
+                ("422141", 450, 45),
+                ("422142", 550, 55),
+            )
+        ]
+        rewritten, replaced_rows = _merge_cell_replacement_rows(
+            _extract_cell_tables(values),
+            [{
+                REPORT_DATE_HEADER: report_date,
+                CLUSTER_ID_HEADER: "422140",
+                EXPECTED_FEE_HEADER: 1_000,
+                IN_CLUSTER_FEE_HEADER: 100,
+            }],
+            replacement_cells,
+        )
+        rewritten_values, rewritten_layout, _ = _build_cell_side_by_side_values(rewritten)
+        parsed = _extract_cell_tables(rewritten_values)
+
+        self.assertEqual(replaced_rows, 2)
+        self.assertEqual(
+            {
+                (cluster_id, cell_id): (
+                    rows[0][EXPECTED_FEE_HEADER],
+                    rows[0][IN_CLUSTER_FEE_HEADER],
+                )
+                for cluster_id, cell_tables in parsed.items()
+                for cell_id, rows in cell_tables.items()
+                if rows and cell_id != CLUSTER_TOTAL_CELL_ID
+            },
+            {
+                ("422040", "422041"): ("100", "10"),
+                ("422040", "422042"): ("200", "20"),
+                ("422040", "422043"): ("300", "30"),
+                ("422140", "422141"): ("450", "45"),
+                ("422140", "422142"): ("550", "55"),
+            },
+        )
+        for left, right in zip(rewritten_layout, rewritten_layout[1:]):
+            self.assertEqual(right["start_column"], left["end_column"])
+
+    def test_cell_parser_reads_spaced_legacy_layout_and_renders_compact_layout(self):
+        existing_values = [[""] * 18 for _ in range(4)]
+        for cluster_id, cluster_start, cells in (
+            (
+                "422040",
+                0,
+                (("422041", 100, 10), ("422042", 200, 20), ("422043", 300, 30)),
+            ),
+            (
+                "422140",
+                10,
+                (("422141", 400, 40), ("422142", 500, 50)),
+            ),
+        ):
+            existing_values[0][cluster_start] = (
+                f"{CLUSTER_DISPLAY_NAMES[cluster_id]} - {cluster_id}"
+            )
+            existing_values[2][cluster_start] = REPORT_DATE_HEADER
+            existing_values[3][cluster_start] = "01/10/2026"
+            for index, (cell_id, expected, in_cluster) in enumerate(cells):
+                cell_column = cluster_start + 1 + index * 3
+                existing_values[1][cell_column] = f"CELL {cell_id}"
+                existing_values[2][cell_column:cell_column + 2] = CELL_METRIC_HEADERS
+                existing_values[3][cell_column:cell_column + 2] = [
+                    str(expected),
+                    str(in_cluster),
+                ]
+
+        spreadsheet = self.FakeSpreadsheet()
+        worksheet = self.FakeWorksheet(existing_values)
+        with patch(
+            "linkaja_fee_pipeline.sheets._open_or_create_spreadsheet",
+            return_value=spreadsheet,
+        ), patch(
+            "linkaja_fee_pipeline.sheets._open_or_create_worksheet",
+            return_value=worksheet,
+        ):
+            result = process_linkaja_fee_sheet_upload(
+                "synthetic",
+                "LinkAja",
+                [{
+                    REPORT_DATE_HEADER: "01/10/2026",
+                    CLUSTER_ID_HEADER: "422140",
+                    EXPECTED_FEE_HEADER: 950,
+                    IN_CLUSTER_FEE_HEADER: 95,
+                    TOTAL_FEE_HEADER: 1_045,
+                }],
+                self.FakeClient(),
+                cell_rows=[{
+                    REPORT_DATE_HEADER: "01/10/2026",
+                    CLUSTER_ID_HEADER: "422140",
+                    CELL_ID_HEADER: "422141",
+                    EXPECTED_FEE_HEADER: 450,
+                    IN_CLUSTER_FEE_HEADER: 45,
+                    TOTAL_FEE_HEADER: 495,
+                }],
+            )
+
+        compact_values = worksheet.updates[0][1]
+        parsed = _extract_cell_tables(compact_values)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["replaced_rows"], 1)
+        self.assertEqual(
+            {
+                (cluster_id, cell_id): (
+                    rows[0][EXPECTED_FEE_HEADER],
+                    rows[0][IN_CLUSTER_FEE_HEADER],
+                )
+                for cluster_id, cell_tables in parsed.items()
+                for cell_id, rows in cell_tables.items()
+                if rows and cell_id != CLUSTER_TOTAL_CELL_ID
+            },
+            {
+                ("422040", "422041"): ("100", "10"),
+                ("422040", "422042"): ("200", "20"),
+                ("422040", "422043"): ("300", "30"),
+                ("422140", "422141"): ("450", "45"),
+                ("422140", "422142"): ("500", "50"),
+            },
+        )
+        first_cluster_start = compact_values[0].index("BOLMONG - 422040")
+        next_cluster_start = compact_values[0].index(
+            f"{CLUSTER_DISPLAY_NAMES['422140']} - 422140"
+        )
+        self.assertEqual(next_cluster_start, first_cluster_start + 7)
+        self.assertEqual(
+            compact_values[3][first_cluster_start + 1],
+            "100",
+        )
+
+    def test_cell_aware_rewrite_preserves_aggregate_only_history_alongside_cells(self):
+        historical_date = "01/10/2026"
+        cell_date = "02/10/2026"
+        cluster_rows = [{
+            REPORT_DATE_HEADER: historical_date,
+            CLUSTER_ID_HEADER: "422040",
+            EXPECTED_FEE_HEADER: 600,
+            IN_CLUSTER_FEE_HEADER: 60,
+            TOTAL_FEE_HEADER: 660,
+        }]
+        existing_cell_rows = [
+            {
+                REPORT_DATE_HEADER: cell_date,
+                CLUSTER_ID_HEADER: cluster_id,
+                CELL_ID_HEADER: cell_id,
+                EXPECTED_FEE_HEADER: expected,
+                IN_CLUSTER_FEE_HEADER: in_cluster,
+                TOTAL_FEE_HEADER: expected + in_cluster,
+            }
+            for cluster_id, cell_id, expected, in_cluster in (
+                ("422040", "422041", 100, 10),
+                ("422040", "422042", 200, 20),
+                ("422040", "422043", 300, 30),
+                ("422140", "422141", 400, 40),
+                ("422140", "422142", 500, 50),
+            )
+        ]
+        tables, _ = _merge_cell_replacement_rows(
+            {}, cluster_rows, existing_cell_rows
+        )
+        existing_values, _layout, _clusters = _build_cell_side_by_side_values(tables)
+        spreadsheet = self.FakeSpreadsheet()
+        worksheet = self.FakeWorksheet(existing_values)
+        replacement_cluster_rows = [{
+            REPORT_DATE_HEADER: cell_date,
+            CLUSTER_ID_HEADER: "422140",
+            EXPECTED_FEE_HEADER: 1_000,
+            IN_CLUSTER_FEE_HEADER: 100,
+            TOTAL_FEE_HEADER: 1_100,
+        }]
+        replacement_cell_rows = [
+            {
+                REPORT_DATE_HEADER: cell_date,
+                CLUSTER_ID_HEADER: "422140",
+                CELL_ID_HEADER: cell_id,
+                EXPECTED_FEE_HEADER: expected,
+                IN_CLUSTER_FEE_HEADER: in_cluster,
+                TOTAL_FEE_HEADER: expected + in_cluster,
+            }
+            for cell_id, expected, in_cluster in (
+                ("422141", 450, 45),
+                ("422142", 550, 55),
+            )
+        ]
+
+        with patch(
+            "linkaja_fee_pipeline.sheets._open_or_create_spreadsheet",
+            return_value=spreadsheet,
+        ), patch(
+            "linkaja_fee_pipeline.sheets._open_or_create_worksheet",
+            return_value=worksheet,
+        ):
+            result = process_linkaja_fee_sheet_upload(
+                "synthetic",
+                "LinkAja",
+                replacement_cluster_rows,
+                self.FakeClient(),
+                cell_rows=replacement_cell_rows,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["replaced_rows"], 2)
+        values = worksheet.updates[0][1]
+        cluster_start = values[0].index("BOLMONG - 422040")
+        next_cluster_start = values[0].index(
+            f"{CLUSTER_DISPLAY_NAMES['422140']} - 422140"
+        )
+        group_titles = [
+            values[1][column]
+            for column in range(cluster_start + 1, next_cluster_start, 2)
+        ]
+        self.assertEqual(
+            group_titles,
+            ["CLUSTER", "CELL 422041", "CELL 422042", "CELL 422043"],
+        )
+        date_column = cluster_start
+        aggregate_column = cluster_start + 1
+        history_row = next(
+            index
+            for index, row in enumerate(values[CELL_DATA_START_ROW - 1:], start=CELL_DATA_START_ROW - 1)
+            if row[date_column] == historical_date
+        )
+        cell_row = next(
+            index
+            for index, row in enumerate(values[CELL_DATA_START_ROW - 1:], start=CELL_DATA_START_ROW - 1)
+            if row[date_column] == cell_date
+        )
+        self.assertEqual(
+            values[history_row][aggregate_column:aggregate_column + 2],
+            ["600", "60"],
+        )
+        self.assertEqual(values[cell_row][aggregate_column:aggregate_column + 2], ["", ""])
+
+        parsed = _extract_cell_tables(values)
+        self.assertEqual(
+            parsed["422040"][CLUSTER_TOTAL_CELL_ID][0][EXPECTED_FEE_HEADER],
+            "600",
+        )
+        self.assertEqual(
+            parsed["422040"]["422043"][0][EXPECTED_FEE_HEADER],
+            "300",
+        )
+        self.assertEqual(
+            parsed["422140"]["422141"][0][EXPECTED_FEE_HEADER],
+            "450",
+        )
 
     def test_cell_layout_drops_previously_published_cluster_total_block(self):
         existing_values = [[""] * 42 for _ in range(4)]
@@ -1427,7 +1707,9 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
         self.assertEqual(values[3][cluster_start], "17/11/2026")
         self.assertEqual(values[3][cluster_start + 1:cluster_start + 3], [75_000, 15_020])
         self.assertEqual(values[3][cluster_start + 3:cluster_start + 5], [21_400, 3_260])
-        self.assertEqual(values[3][cluster_start + 5], "")
+        next_cluster_start = values[0].index("TDR - 422100")
+        self.assertEqual(next_cluster_start, cluster_start + 5)
+        self.assertEqual(values[3][next_cluster_start], "")
         self.assertTrue(all(TOTAL_FEE_HEADER not in row for row in values))
 
         format_requests = spreadsheet.batch_updates[-1]["requests"]
@@ -1475,6 +1757,8 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
         )
         _values, layout, _clusters = _build_cell_side_by_side_values(tables)
         cluster = next(item for item in layout if item["cluster_id"] == "422220")
+        next_cluster = next(item for item in layout if item["cluster_id"] == "422100")
+        self.assertEqual(next_cluster["start_column"], cluster["end_column"])
         spreadsheet = self.FakeSpreadsheet()
 
         _format_cell_aware_linkaja_sheet(
@@ -1508,6 +1792,15 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
             and request["updateBorders"]["range"].get("startRowIndex")
             == CELL_HEADER_ROW_COUNT - 2
         )
+        cluster_border = next(
+            request["updateBorders"]
+            for request in requests
+            if request.get("updateBorders", {}).get("range", {}).get("startColumnIndex")
+            == next_cluster["start_column"]
+            and request["updateBorders"]["range"].get("endColumnIndex")
+            == next_cluster["start_column"] + 1
+            and request["updateBorders"]["range"].get("startRowIndex") == 0
+        )
         body_format_range = next(
             request["repeatCell"]["range"]
             for request in requests
@@ -1527,6 +1820,7 @@ class LinkAjaFeePipelineTest(unittest.TestCase):
         self.assertEqual(number_format_range["endColumnIndex"], cluster["cell_blocks"][0]["end_column"])
         self.assertEqual(body_format_range["startColumnIndex"], cluster["start_column"])
         self.assertEqual(divider_border["left"]["style"], "SOLID_MEDIUM")
+        self.assertEqual(cluster_border["left"]["style"], "SOLID_THICK")
         tail_clear = next(
             request["repeatCell"]["range"]
             for request in requests

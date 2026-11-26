@@ -59,10 +59,10 @@ Use [shared validation](../docs/validation.md), [security](../docs/security.md),
 ## Validation
 
 ```bash
-python3 -m compileall -q linkaja_pipeline.py linkaja_fee_pipeline tests
-python3 -m unittest discover -s tests
+python3.11 -m compileall -q linkaja_fee_pipeline tests
+python3.11 -m unittest discover -s linkaja_fee_pipeline/tests
 git diff --check
-docker build -f Dockerfile.linkaja -t linkaja-fee-pipeline:3.11 .
+docker build -f linkaja_fee_pipeline/Dockerfile -t linkaja-fee-pipeline:3.11 .
 ```
 
 The PostgreSQL integration tests require a dedicated disposable

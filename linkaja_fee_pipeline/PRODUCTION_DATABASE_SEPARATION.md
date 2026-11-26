@@ -3,9 +3,15 @@
 ## Status
 
 **Target cutover is staged in this worktree; it is not deployed.** No production
-database migration, workflow update, or write was performed during review.
+database migration, production flow deployment, or production database write was
+performed. The authorized isolated replay on 2026-11-26 did rewrite the shared
+LinkAja worksheet; its values matched the pre-run digest and its tab was retained.
 
-## Verified Production Configuration (2026-11-24)
+## Last Verified Production Configuration (2026-11-24)
+
+These are the last successful production observations. A read-only SSH reconnect
+attempt on 2026-11-26 timed out, so current production configuration remains
+unverified.
 
 - The SSH `prod` profile reached `~/projects/kestra-mmpp-pipeline`.
 - Docker metadata showed PostgreSQL 18.4 and Kestra 1.3.26 under Compose project
@@ -25,6 +31,26 @@ database catalog, presence of the `linkaja` database, LinkAja relation
 inventory, schema version, row counts, and backup/restore state remain
 **unverified**. The SSH policy denied `docker exec`, and host `psql` is not
 installed.
+
+## Isolated Two-Pass Replay Evidence (2026-11-26)
+
+- The retained local Kestra/PostgreSQL volumes were used with the isolated
+  `linkaja_test` database at schema version 13. Eight cluster CSVs covering
+  2026-10-01 through 2026-10-10 were each run twice; all 16 daily executions
+  completed validation, persistence, and Sheet writing successfully.
+- Current raw storage remained at 462,430 ledger rows and 297,113 distinct
+  `(cluster_id, transaction_id)` identities; the current view had no duplicate
+  identities. The monthly snapshot and refresh audit remained empty.
+- Append-only history grew by 918,178 ledger-version rows and 589,808 impact
+  rows, as expected for two new source generations. Each input file had one
+  current generation afterward.
+- The existing shared workbook retained both `LinkAja` and `Sheet75`; its 180
+  cell/date keys had no duplicates and the value digest was unchanged.
+
+This verifies identical-file replay against an isolated database, not production
+database selection, secret provisioning, full-month source completeness,
+corrected-file deletion semantics, or monthly finalization. It is not a
+production canary and does not establish that the `linkaja` database is ready.
 
 ## Target Architecture
 
@@ -102,14 +128,15 @@ recorded.
 ## Current Worktree Status
 
 - The worktree DSN helper and daily/monthly flows use `LINKAJA_DB_*`.
-- Local Kestra validation, unit/schema tests, compilation, diff checks, and the
-  runtime image build passed in the previous implementation turn.
-- The production `.env_encoded` file was inspected only through sanitized
-  presence/value matching; no secret bytes were printed or changed.
+- The isolated two-pass daily replay is recorded above. The production
+  `.env_encoded` file was last inspected on 2026-11-24 using sanitized
+  presence/value matching; no secret bytes were printed or changed. The
+  2026-11-26 SSH reconnect timed out.
 - Production database contents, migrations, backup, target database existence,
   LinkAja row counts, secret provisioning, flow registration, and cutover have
-  **not** been changed or verified. No production SQL query, migration, or data
-  write was executed.
+  **not** been changed or verified. No production SQL query, migration, database
+  write, or flow deployment was executed. The shared Google Sheet write was the
+  authorized isolated replay described above.
 
 ## Rollback
 

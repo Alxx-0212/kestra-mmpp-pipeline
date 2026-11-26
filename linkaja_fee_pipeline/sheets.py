@@ -1407,14 +1407,16 @@ def _extract_nested_cell_tables(
                 rows = []
                 for row in existing_rows[CELL_HEADER_ROW_COUNT:]:
                     report_date = _cell_value(row, date_column)
-                    if not report_date:
+                    expected_fee = _cell_value(row, cell_column)
+                    in_cluster_fee = _cell_value(row, cell_column + 1)
+                    if not report_date or (not expected_fee and not in_cluster_fee):
                         continue
                     rows.append({
                         REPORT_DATE_HEADER: report_date,
                         CLUSTER_ID_HEADER: current_cluster_id,
                         CELL_ID_HEADER: cell_id,
-                        EXPECTED_FEE_HEADER: _cell_value(row, cell_column),
-                        IN_CLUSTER_FEE_HEADER: _cell_value(row, cell_column + 1),
+                        EXPECTED_FEE_HEADER: expected_fee,
+                        IN_CLUSTER_FEE_HEADER: in_cluster_fee,
                         TOTAL_FEE_HEADER: (
                             _cell_value(row, cell_column + 2)
                             if len(metric_headers) == len(PREVIOUS_CELL_METRIC_HEADERS)
@@ -1425,12 +1427,38 @@ def _extract_nested_cell_tables(
                 found_cells += 1
                 found_header = True
                 next_cell_column = cell_column + len(metric_headers)
-                if shared_date_metrics and _row_cell_headers_match(
-                    existing_rows[2],
-                    next_cell_column + 1,
-                ):
-                    cell_column = next_cell_column + 1
-                    continue
+                if shared_date_metrics:
+                    next_cluster = (
+                        _cell_value(existing_rows[2], next_cell_column).upper()
+                        == REPORT_DATE_HEADER
+                        and not _cell_value(existing_rows[1], next_cell_column)
+                        and bool(_cluster_id_from_title(
+                            _cell_value(existing_rows[0], next_cell_column)
+                        ))
+                    )
+                    if not next_cluster:
+                        next_cell_id = _cell_id_from_title(
+                            _cell_value(existing_rows[1], next_cell_column)
+                        )
+                        if (
+                            next_cell_id
+                            and next_cell_id != CLUSTER_TOTAL_CELL_ID
+                            and _row_cell_headers_match(existing_rows[2], next_cell_column)
+                        ):
+                            cell_column = next_cell_column
+                            continue
+
+                        spaced_cell_column = next_cell_column + SPACER_WIDTH
+                        spaced_cell_id = _cell_id_from_title(
+                            _cell_value(existing_rows[1], spaced_cell_column)
+                        )
+                        if (
+                            spaced_cell_id
+                            and spaced_cell_id != CLUSTER_TOTAL_CELL_ID
+                            and _row_cell_headers_match(existing_rows[2], spaced_cell_column)
+                        ):
+                            cell_column = spaced_cell_column
+                            continue
                 cell_column = next_cell_column
                 break
             if not found_cells:
@@ -1740,6 +1768,7 @@ def _build_cell_side_by_side_values(
         ),
     ]
     cell_ids_by_cluster = {}
+    rows_by_cluster_cell = {}
     report_dates_by_cluster = {}
     for cluster_id in cluster_order:
         cell_ids = sorted(
@@ -1749,13 +1778,36 @@ def _build_cell_side_by_side_values(
             ),
             key=lambda value: (not value.isdigit(), int(value) if value.isdigit() else value),
         )
+        rows_by_cell = {
+            cell_id: tables[cluster_id].get(cell_id, [])
+            for cell_id in cell_ids
+        }
+        cell_report_dates = {
+            str(row[REPORT_DATE_HEADER])
+            for rows in rows_by_cell.values()
+            for row in rows
+        }
+        aggregate_only_rows = [
+            row
+            for row in tables[cluster_id].get(CLUSTER_TOTAL_CELL_ID, [])
+            if str(row[REPORT_DATE_HEADER]) not in cell_report_dates
+        ]
         if not cell_ids:
             cell_ids = [CLUSTER_TOTAL_CELL_ID]
+            rows_by_cell = {
+                CLUSTER_TOTAL_CELL_ID: tables[cluster_id].get(CLUSTER_TOTAL_CELL_ID, [])
+            }
+        elif aggregate_only_rows:
+            # Retain legacy totals only for dates without cell attribution.
+            cell_ids.insert(0, CLUSTER_TOTAL_CELL_ID)
+            rows_by_cell[CLUSTER_TOTAL_CELL_ID] = aggregate_only_rows
+
         cell_ids_by_cluster[cluster_id] = cell_ids
+        rows_by_cluster_cell[cluster_id] = rows_by_cell
         report_dates = {
             str(row[REPORT_DATE_HEADER])
             for cell_id in cell_ids
-            for row in tables[cluster_id].get(cell_id, [])
+            for row in rows_by_cell.get(cell_id, [])
         }
         report_dates_by_cluster[cluster_id] = sorted(
             report_dates,
@@ -1796,8 +1848,6 @@ def _build_cell_side_by_side_values(
             "report_date_column": report_date_column,
             "cell_divider_columns": cell_divider_columns,
         })
-        if cluster_index < len(cluster_order) - 1:
-            column_count += SPACER_WIDTH
 
     row_count = CELL_HEADER_ROW_COUNT + max_data_rows
     values = [["" for _ in range(column_count)] for _ in range(row_count)]
@@ -1818,7 +1868,10 @@ def _build_cell_side_by_side_values(
         rows_by_cell_and_date = {
             cell_block["cell_id"]: {
                 str(row[REPORT_DATE_HEADER]): row
-                for row in tables[cluster_id].get(cell_block["cell_id"], [])
+                for row in rows_by_cluster_cell[cluster_id].get(
+                    cell_block["cell_id"],
+                    [],
+                )
             }
             for cell_block in cluster_layout["cell_blocks"]
         }
@@ -2182,8 +2235,16 @@ def _format_cell_aware_linkaja_sheet(
                     ),
                     "top": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
                     "bottom": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
-                    "left": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
-                    "right": {"style": "SOLID_MEDIUM", "color": BORDER_COLOR},
+                    "left": (
+                        {"style": "SOLID_MEDIUM", "color": BORDER_COLOR}
+                        if cluster_layout["cluster_index"] == 0
+                        else {"style": "NONE"}
+                    ),
+                    "right": (
+                        {"style": "SOLID_MEDIUM", "color": BORDER_COLOR}
+                        if cluster_layout["cluster_index"] == len(cluster_layouts) - 1
+                        else {"style": "NONE"}
+                    ),
                     "innerHorizontal": {"style": "SOLID", "color": BORDER_COLOR},
                     "innerVertical": {"style": "SOLID", "color": BORDER_COLOR},
                 }
@@ -2363,15 +2424,23 @@ def _format_cell_aware_linkaja_sheet(
                         },
                     }
                 })
-        if cluster_layout["cluster_index"] < len(cluster_layouts) - 1:
-            requests.append(
-                _column_width_request(
+    for cluster_layout in cluster_layouts[1:]:
+        divider_column = cluster_layout["start_column"]
+        requests.append({
+            "updateBorders": {
+                "range": _grid_range(
                     worksheet,
-                    end_column,
-                    end_column + SPACER_WIDTH,
-                    SPACER_COLUMN_WIDTH,
-                )
-            )
+                    1,
+                    max(row_count, CELL_HEADER_ROW_COUNT),
+                    divider_column + 1,
+                    divider_column + 1,
+                ),
+                "left": {
+                    "style": "SOLID_THICK",
+                    "color": BORDER_COLOR,
+                },
+            }
+        })
 
     if visible_col_count < col_count:
         tail_range = _grid_range(
