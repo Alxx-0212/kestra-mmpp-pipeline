@@ -106,9 +106,10 @@ stale until the same file is retried. The writer is idempotent by report date,
 cluster, and cell. The summary uses a three-row header: cluster, cells for
 multi-cell clusters (or the cluster block for legacy clusters), then metric
 headings. A multi-cell cluster has one shared report-date column and the
-expected/in-cluster fee columns per cell. Adjacent cell groups have no blank
-column; a medium vertical border separates them below the cluster title. One
-blank column remains between cluster groups. The aggregate cluster fee is
+expected/in-cluster fee columns per cell. The cell-aware daily layout has no
+blank columns between cells or cluster groups; medium borders separate cells
+and heavier borders separate clusters. The legacy static writer retains its old
+layout only when called without cell rows. The aggregate cluster fee is
 reconciled against the cells before commit but is not published as a separate
 block. No cluster or cell `TOTAL FEE` column is shown.
 When historical aggregate rows have no cell attribution, the writer preserves
@@ -610,6 +611,31 @@ including the remaining reversal-reference case, were self-reviewed and tested
 by the lead, not independently approved. See [shared verification evidence](../docs/validation.md#local-verification-2026-10-08)
 for remaining operational limitations.
 
+### Isolated two-pass daily replay (2026-11-26)
+
+The retained isolated Kestra `v1.3.26` stack replayed the same eight cluster
+CSVs for 2026-10-01 through 2026-10-10 twice. All 16 executions completed CSV
+validation, PostgreSQL persistence, and the daily Google Sheet write. This used
+the isolated `linkaja_test` database at schema version 13, not production.
+
+| Check | Before | After both passes |
+|---|---:|---:|
+| `linkaja_raw_transactions` rows | 462,430 | 462,430 |
+| Distinct `(cluster_id, transaction_id)` identities | 297,113 | 297,113 |
+| Duplicate identities in `linkaja_transactions_current_v` | 0 | 0 |
+| Current source loads | 9 | 9 |
+| `linkaja_transactions` / `linkaja_monthly_refreshes` rows | 0 / 0 | 0 / 0 |
+
+Append-only `linkaja_ledger_versions` grew by 918,178 rows and
+`linkaja_monthly_impacts` by 589,808 rows across the two passes; this is source
+and impact history, not duplicate current facts. Each of the eight logical
+source files had four generations afterward, with one current. The existing
+shared workbook kept its `LinkAja` and `Sheet75` tabs, retained 180 cell/date
+keys with no duplicates, and had the same value digest before and after the
+replay. The monthly workflow was not run. This validates repeated identical
+files against an isolated database, not production configuration, a full-month
+coverage claim, or corrected files that omit previously stored transaction IDs.
+
 ## Schema Migration Process
 
 Schema DDL belongs only in the immutable SQL files under
@@ -776,10 +802,12 @@ ORDER BY report_month, refreshed_at DESC;
 ## Production Database Setup
 
 The target deployment uses a dedicated `linkaja` database on the existing
-PostgreSQL instance; it does not add another container or volume. SSH source/
-config inspection on 2026-11-24 found the remote daily and monthly LinkAja flows
-still use `FINPAY_DB_*`, and a sanitized check matched `SECRET_FINPAY_DB_NAME`
-to `finpay`. The live database catalog, schema version, and LinkAja data
+PostgreSQL instance; it does not add another container or volume. The last
+successful SSH source/config inspection, on 2026-11-24, found the remote daily
+and monthly LinkAja flows still use `FINPAY_DB_*`, and a sanitized check matched
+`SECRET_FINPAY_DB_NAME` to `finpay`. A read-only SSH reconnect attempt on
+2026-11-26 timed out, so that remains last-known configuration, not a current
+verification. The live database catalog, schema version, and LinkAja data
 location were not verified. The SSH target's Compose project is named
 `kestra-mmpp-local-20261020` and a `dev`-tagged task container was present, so
 confirm environment identity before production writes.
@@ -815,7 +843,7 @@ The LinkAja workflows read these Kestra secrets (namespace: `finance.linkaja`):
 | `LINKAJA_DB_PASSWORD` | Role password |
 
 The daily workflow `linkaja_fee_pipeline_v1` and monthly workflow `linkaja_monthly_materialization_v1` both use these secrets.
-With the Compose `env` secret provider, configure them as base64 `SECRET_LINKAJA_DB_*` variables in the protected `.env_encoded` file. The production `.env_encoded` inspected for this review has no `SECRET_LINKAJA_DB_NAME` entry; the actual file was not modified. The Kestra password and Docker secret `/run/secrets/linkaja_db_password` must decode to the same value.
+With the Compose `env` secret provider, configure them as base64 `SECRET_LINKAJA_DB_*` variables in the protected `.env_encoded` file. The last sanitized inspection, on 2026-11-24, found no `SECRET_LINKAJA_DB_NAME` entry; the actual file was not modified, and its present state is unverified. The Kestra password and Docker secret `/run/secrets/linkaja_db_password` must decode to the same value.
 
 ### Connection Helper
 
@@ -829,9 +857,9 @@ Tests use a dedicated disposable `LINKAJA_TEST_DSN`; they must not use the produ
 
 ### Cutover from FinPay Database
 
-The checked-in production source and encoded DB-name setting direct the active
-LinkAja flow to `finpay`; the registered Kestra revision and relation presence
-were not queried. The requested initial rollout is schema-only: existing
+The last inspected production source and encoded DB-name setting direct the
+active LinkAja flow to `finpay`; the registered Kestra revision and relation
+presence were not queried. The requested initial rollout is schema-only: existing
 LinkAja history, if present in `finpay`, remains there and the new `linkaja`
 database starts its reporting history at cutover. Historical continuity is not
 included; if it becomes a requirement, stop and approve a separate inventory,
